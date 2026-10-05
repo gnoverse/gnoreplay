@@ -36,7 +36,7 @@ func newServer(cfg *Config, q *Queue, gh GitHub, logger *slog.Logger) *Server {
 
 func (s *Server) reportsDir() string { return filepath.Join(s.cfg.DataDir, "reports") }
 
-// enqueue queues j, creates its (queued) check run, and cancels the jobs it
+// enqueue queues j, marks its commit pending, and cancels the jobs it
 // supersedes.
 func (s *Server) enqueue(ctx context.Context, j *Job) error {
 	superseded, err := s.queue.Enqueue(j)
@@ -47,27 +47,11 @@ func (s *Server) enqueue(ctx context.Context, j *Job) error {
 
 	for _, old := range superseded {
 		s.cancel(old.ID)
-		if old.CheckRunID != 0 {
-			s.updateCheck(ctx, old, checkUpdate{
-				Status: "completed", Conclusion: "cancelled",
-				Title:   "Superseded",
-				Summary: fmt.Sprintf("Superseded by a replay of %s.", j.SHA),
-			})
+		if old.SHA != j.SHA {
+			s.setStatus(ctx, old, "error", "Not checked: superseded by "+shortSHA(j.SHA))
 		}
 	}
-
-	id, err := s.gh.CreateCheck(ctx, j.InstallationID, j.Repo, j.SHA, checkUpdate{
-		Status: "queued", Title: "Queued", Summary: fmt.Sprintf("Waiting for a replay slot (priority %d).", j.Priority),
-	})
-	if err != nil {
-		// The replay still runs; its result is posted as a new check run.
-		s.logger.Error("create check run", "job", j.ID, "err", err)
-	} else {
-		j.CheckRunID = id
-		if err := s.queue.SetCheckRun(j.ID, id); err != nil {
-			return err
-		}
-	}
+	s.setStatus(ctx, j, "pending", fmt.Sprintf("Queued for a replay (priority %d)", j.Priority))
 
 	select {
 	case s.wake <- struct{}{}:
@@ -75,6 +59,8 @@ func (s *Server) enqueue(ctx context.Context, j *Job) error {
 	}
 	return nil
 }
+
+func shortSHA(sha string) string { return sha[:min(len(sha), 9)] }
 
 func (s *Server) cancel(id int64) {
 	s.mu.Lock()
@@ -84,21 +70,12 @@ func (s *Server) cancel(id int64) {
 	}
 }
 
-func (s *Server) updateCheck(ctx context.Context, j *Job, u checkUpdate) {
-	if j.CheckRunID == 0 {
-		id, err := s.gh.CreateCheck(ctx, j.InstallationID, j.Repo, j.SHA, u)
-		if err != nil {
-			s.logger.Error("create check run", "job", j.ID, "err", err)
-			return
-		}
-		j.CheckRunID = id
-		if err := s.queue.SetCheckRun(j.ID, id); err != nil {
-			s.logger.Error("save check run", "job", j.ID, "err", err)
-		}
-		return
-	}
-	if err := s.gh.UpdateCheck(ctx, j.InstallationID, j.Repo, j.CheckRunID, u); err != nil {
-		s.logger.Error("update check run", "job", j.ID, "err", err)
+// setStatus sets j's commit status, linking to the job's page. A failure is
+// only logged: the replay result is still on the page.
+func (s *Server) setStatus(ctx context.Context, j *Job, state, description string) {
+	st := Status{State: state, Description: description, TargetURL: s.jobURL(j)}
+	if err := s.gh.SetStatus(ctx, j.Repo, j.SHA, st); err != nil {
+		s.logger.Error("set commit status", "job", j.ID, "err", err)
 	}
 }
 
@@ -135,7 +112,7 @@ func (s *Server) runJob(ctx context.Context, j *Job) {
 
 	logger := s.logger.With("job", j.ID, "key", j.Key, "sha", j.SHA)
 	logger.Info("replay started")
-	s.updateCheck(ctx, j, checkUpdate{Status: "in_progress", Title: "Replaying", Summary: "Replaying the chain's history with this commit's binary."})
+	s.setStatus(ctx, j, "pending", "Replaying mainnet history (started "+time.Now().UTC().Format("15:04")+" UTC)")
 
 	// The baseline is read before this job finishes, so a push job compares
 	// against the previous commit on its branch.
@@ -146,7 +123,7 @@ func (s *Server) runJob(ctx context.Context, j *Job) {
 
 	report, reportPath, err := s.replay(jobCtx, j, logger)
 	if jobCtx.Err() != nil && ctx.Err() == nil {
-		// Superseded: its check run was already closed.
+		// Superseded or closed: whatever replaced it owns the status now.
 		logger.Info("replay cancelled")
 		return
 	}
@@ -155,17 +132,7 @@ func (s *Server) runJob(ctx context.Context, j *Job) {
 		if _, ferr := s.queue.Finish(j.ID, stateFailed, "", err.Error()); ferr != nil {
 			logger.Error("finish job", "err", ferr)
 		}
-		s.updateCheck(ctx, j, checkUpdate{
-			Status: "completed", Conclusion: "neutral",
-			Title:   "Replay could not run",
-			Summary: "The replay did not complete, so nothing was checked.\n\n```\n" + truncateStr(err.Error(), 60000) + "\n```\n",
-		})
-		return
-	}
-
-	recorded, err := s.queue.Finish(j.ID, stateDone, reportPath, "")
-	if err != nil || !recorded {
-		logger.Info("result discarded", "recorded", recorded, "err", err)
+		s.setStatus(ctx, j, "error", "Replay could not run: see details")
 		return
 	}
 
@@ -176,19 +143,23 @@ func (s *Server) runJob(ctx context.Context, j *Job) {
 		}
 	}
 	c := classify(report, baseReport)
-	conclusion, title, summary, text := checkOutput(j, report, c, s.reportURL(j))
-	s.updateCheck(ctx, j, checkUpdate{
-		Status: "completed", Conclusion: conclusion,
-		Title: title, Summary: summary, Text: text, DetailsURL: s.reportURL(j),
-	})
-	logger.Info("replay done", "conclusion", conclusion, "new", len(c.New), "inherited", len(c.Inherited), "fixed", len(c.Fixed))
+	out := render(j, report, c, s.reportURL(j))
+	// The job page shows this body; write it before marking the job done.
+	if err := os.WriteFile(bodyPath(reportPath), []byte(out.Body), 0o644); err != nil {
+		logger.Error("write job page", "err", err)
+	}
+	recorded, err := s.queue.Finish(j.ID, stateDone, reportPath, "")
+	if err != nil || !recorded {
+		logger.Info("result discarded", "recorded", recorded, "err", err)
+		return
+	}
+	s.setStatus(ctx, j, out.State, out.Description)
+	logger.Info("replay done", "state", out.State, "new", len(c.New), "inherited", len(c.Inherited), "fixed", len(c.Fixed))
 }
 
-func (s *Server) reportURL(j *Job) string {
-	if s.cfg.PublicURL == "" || !s.cfg.Repos[j.Repo].PublicReports {
-		return ""
-	}
-	return fmt.Sprintf("%s/reports/%d", strings.TrimRight(s.cfg.PublicURL, "/"), j.ID)
+// bodyPath is where a job's rendered page body is stored, next to its report.
+func bodyPath(reportPath string) string {
+	return strings.TrimSuffix(reportPath, ".json") + ".md"
 }
 
 // replay fetches the commit, builds gnoreplay from it and runs it against a
@@ -228,29 +199,24 @@ func (s *Server) replay(ctx context.Context, j *Job, logger *slog.Logger) (*Repo
 		return nil, "", fmt.Errorf("checkout: %w", err)
 	}
 
-	// 2. Tool. Commits older than gnoreplay get the server's copy.
+	// 2. Tool: the server's copy, built against the commit's tree. (Not the
+	// commit's own contribs/gnoreplay, if it ever has one: the commit is
+	// what is being checked.)
 	step("build")
 	toolDir := filepath.Join(src, "contribs", "gnoreplay")
-	overlaid := false
-	if _, err := os.Stat(filepath.Join(toolDir, "main.go")); err != nil {
-		if s.cfg.Job.GnoreplayOverlay == "" {
-			return nil, "", errors.New("commit has no contribs/gnoreplay and no job.gnoreplay_overlay is configured")
-		}
-		if err := copyDir(s.cfg.Job.GnoreplayOverlay, toolDir); err != nil {
-			return nil, "", fmt.Errorf("overlay gnoreplay: %w", err)
-		}
-		overlaid = true
-		fmt.Fprintf(logFile, "overlaid contribs/gnoreplay from %s\n", s.cfg.Job.GnoreplayOverlay)
+	if err := os.RemoveAll(toolDir); err != nil {
+		return nil, "", err
+	}
+	if err := copyDir(s.cfg.Job.GnoreplayOverlay, toolDir); err != nil {
+		return nil, "", fmt.Errorf("copy gnoreplay: %w", err)
 	}
 	bin := filepath.Join(jobDir, "gnoreplay")
 	buildCtx, cancel := context.WithTimeout(ctx, s.cfg.Job.BuildTimeout.Duration)
 	defer cancel()
-	if overlaid {
-		// The overlay's go.sum was resolved against a different tree.
-		// go -C, not the process's dir: a VM sandbox doesn't inherit it.
-		if err := s.run(buildCtx, sandbox(s.cfg.Job.BuildSandbox, j, src), toolDir, nil, logFile, "go", "-C", toolDir, "mod", "tidy"); err != nil {
-			return nil, "", fmt.Errorf("go mod tidy: %w", err)
-		}
+	// The tool's go.sum was resolved against another tree. go -C rather than
+	// the process's dir: a VM sandbox doesn't inherit it.
+	if err := s.run(buildCtx, sandbox(s.cfg.Job.BuildSandbox, j, src), toolDir, nil, logFile, "go", "-C", toolDir, "mod", "tidy"); err != nil {
+		return nil, "", fmt.Errorf("go mod tidy: %w", err)
 	}
 	if err := s.run(buildCtx, sandbox(s.cfg.Job.BuildSandbox, j, src), toolDir, nil, logFile, "go", "-C", toolDir, "build", "-o", bin, "."); err != nil {
 		return nil, "", fmt.Errorf("build: %w", err)
@@ -311,11 +277,7 @@ func (s *Server) checkout(ctx context.Context, j *Job, dst string, log io.Writer
 			return err
 		}
 	}
-	token, err := s.gh.Token(ctx, j.InstallationID)
-	if err != nil {
-		return fmt.Errorf("installation token: %w", err)
-	}
-	auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+	auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + s.gh.Token()))
 	// The token goes through the environment, never argv (visible in ps).
 	env := []string{
 		"GIT_CONFIG_COUNT=1",

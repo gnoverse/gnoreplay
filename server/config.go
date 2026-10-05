@@ -3,16 +3,17 @@ package main
 import (
 	"fmt"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
 )
 
 type Config struct {
-	// Listen is the address of the webhook + report HTTP server.
+	// Listen is the address of the HTTP server serving job pages and reports.
 	Listen string `toml:"listen"`
-	// PublicURL is how GitHub users reach this server; report links in check
-	// runs are built from it. Empty disables report links.
+	// PublicURL is how GitHub users reach this server; commit statuses link
+	// to job pages built from it. Empty disables the links.
 	PublicURL string `toml:"public_url"`
 	// DataDir holds the job DB, git mirrors, job work dirs and reports.
 	DataDir string `toml:"data_dir"`
@@ -23,20 +24,22 @@ type Config struct {
 	Chain  ChainConfig  `toml:"chain"`
 	Job    JobConfig    `toml:"job"`
 
-	// Rules map events to queue priorities: the first matching rule wins,
-	// and its position is the priority (earlier runs first). Events that
-	// match no rule are ignored.
+	// Rules select what is replayed and its priority: the first matching rule
+	// wins, and its position is the priority (earlier runs first). Branches
+	// and PRs that match no rule are ignored.
 	Rules []Rule `toml:"rules"`
 	// Repos lists per-repository settings, keyed by "owner/name".
 	Repos map[string]RepoConfig `toml:"repos"`
 }
 
 type GitHubConfig struct {
-	AppID             int64  `toml:"app_id"`
-	PrivateKeyFile    string `toml:"private_key_file"`
-	WebhookSecretFile string `toml:"webhook_secret_file"`
-	// CheckName is the name of the check run posted on commits.
-	CheckName string `toml:"check_name"`
+	// TokenFile holds a GitHub token that can read the tracked repos'
+	// contents and pull requests, and write their commit statuses.
+	TokenFile string `toml:"token_file"`
+	// StatusContext names the commit status posted on commits.
+	StatusContext string `toml:"status_context"`
+	// PollInterval is how often tracked branches and open PRs are polled.
+	PollInterval Duration `toml:"poll_interval"`
 	// GitURL is prefixed to "owner/name.git" to fetch commits.
 	GitURL string `toml:"git_url"`
 }
@@ -51,8 +54,8 @@ type ChainConfig struct {
 }
 
 type JobConfig struct {
-	// GnoreplayOverlay is a contribs/gnoreplay source tree copied into
-	// checkouts that do not have one (commits older than the tool).
+	// GnoreplayOverlay is the gnoreplay source tree (gnoreplay/ in this
+	// repo), copied into each checkout at contribs/gnoreplay and built there.
 	GnoreplayOverlay string `toml:"gnoreplay_overlay"`
 	// BuildSandbox and RunSandbox prefix the build and replay commands, e.g.
 	// ["bwrap", "--unshare-net", ...] or ["msb", "run", ...]. PR code is
@@ -75,16 +78,17 @@ type JobConfig struct {
 
 type Rule struct {
 	Repo string `toml:"repo"` // "owner/name"
-	// Event is "push" (commits on Branch) or "pull_request" (PRs whose base
-	// is Branch).
+	// Event is "push" (commits on Branch) or "pull_request" (open PRs whose
+	// base is Branch).
 	Event  string `toml:"event"`
 	Branch string `toml:"branch"`
 }
 
 type RepoConfig struct {
-	// PublicReports serves this repo's full JSON reports without auth. Keep
-	// false for private repos: their check runs are only visible to repo
-	// members, the report endpoint is not.
+	// PublicReports serves this repo's job pages and reports to anyone, and
+	// lists its jobs on /queue. Otherwise a job's page and report need the
+	// job's secret, which only its commit status links to: keep false for
+	// private repos.
 	PublicReports bool `toml:"public_reports"`
 }
 
@@ -136,8 +140,11 @@ func (c *Config) setDefaults() {
 	if c.GitHub.GitURL == "" {
 		c.GitHub.GitURL = "https://github.com/"
 	}
-	if c.GitHub.CheckName == "" {
-		c.GitHub.CheckName = "mainnet-replay"
+	if c.GitHub.StatusContext == "" {
+		c.GitHub.StatusContext = "mainnet-replay"
+	}
+	if c.GitHub.PollInterval.Duration == 0 {
+		c.GitHub.PollInterval.Duration = 2 * time.Minute
 	}
 	if len(c.Rules) == 0 {
 		c.Rules = defaultRules
@@ -161,10 +168,10 @@ func (c *Config) validate() error {
 		return fmt.Errorf("chain.golden_dir is required")
 	case c.Chain.Genesis == "":
 		return fmt.Errorf("chain.genesis is required")
-	case c.GitHub.AppID == 0 || c.GitHub.PrivateKeyFile == "":
-		return fmt.Errorf("github.app_id and github.private_key_file are required")
-	case c.GitHub.WebhookSecretFile == "":
-		return fmt.Errorf("github.webhook_secret_file is required")
+	case c.GitHub.TokenFile == "":
+		return fmt.Errorf("github.token_file is required")
+	case c.Job.GnoreplayOverlay == "":
+		return fmt.Errorf("job.gnoreplay_overlay is required")
 	}
 	for i, r := range c.Rules {
 		if r.Event != eventPush && r.Event != eventPullRequest {
@@ -175,6 +182,17 @@ func (c *Config) validate() error {
 		}
 	}
 	return nil
+}
+
+// repos lists the repos the rules track, in rule order.
+func (c *Config) repos() []string {
+	var out []string
+	for _, r := range c.Rules {
+		if !slices.Contains(out, r.Repo) {
+			out = append(out, r.Repo)
+		}
+	}
+	return out
 }
 
 // priority returns the priority for an event (lower runs first), and false

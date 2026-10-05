@@ -37,19 +37,20 @@ func TestClassify(t *testing.T) {
 	assert.Equal(t, pr.Diffs, c.New)
 }
 
-func TestCheckOutput(t *testing.T) {
+func TestRender(t *testing.T) {
 	job := &Job{Event: eventPullRequest, Branch: "master"}
 	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 100, Blocks: 100, Txs: 5}
 
-	concl, title, _, _ := checkOutput(job, clean, classify(clean, clean), "")
-	assert.Equal(t, "success", concl)
-	assert.Contains(t, title, "replays identically")
+	out := render(job, clean, classify(clean, clean), "")
+	assert.Equal(t, "success", out.State)
+	assert.Contains(t, out.Description, "replays identically")
 
+	// Gas-only changes don't fail the status, but are reported.
 	gasOnly := &Report{ChainID: "gnoland-1", ToHeight: 100, Diffs: []Diff{{Kind: "gas", Height: 3, Index: 0, Detail: "gas_used 1 -> 2"}}}
-	concl, title, _, text := checkOutput(job, gasOnly, classify(gasOnly, clean), "")
-	assert.Equal(t, "neutral", concl)
-	assert.Contains(t, title, "different gas")
-	assert.Contains(t, text, "gas_used 1 -> 2")
+	out = render(job, gasOnly, classify(gasOnly, clean), "")
+	assert.Equal(t, "success", out.State)
+	assert.Contains(t, out.Description, "1 tx(s) use different gas")
+	assert.Contains(t, out.Body, "gas_used 1 -> 2")
 
 	broken := &Report{ChainID: "gnoland-1", ToHeight: 100, FirstAppHashMismatch: 7, Diffs: []Diff{
 		{Kind: "result", Height: 9, Index: 0, AfterDivergence: true},
@@ -58,19 +59,19 @@ func TestCheckOutput(t *testing.T) {
 			Recorded: &Result{GasUsed: 10}, Replayed: &Result{Error: "vm.VMError: boom\nstack", GasUsed: 12},
 		},
 	}}
-	concl, title, summary, text := checkOutput(job, broken, classify(broken, clean), "https://replay.example/reports/1")
-	assert.Equal(t, "neutral", concl, "the check is advisory, never failure")
-	assert.Contains(t, title, "2 new divergent result(s)")
-	assert.Contains(t, summary, "First app hash mismatch at height **7**")
-	assert.Contains(t, summary, "https://replay.example/reports/1")
+	out = render(job, broken, classify(broken, clean), "https://replay.example/reports/1")
+	assert.Equal(t, "failure", out.State)
+	assert.Contains(t, out.Description, "2 new divergence(s) from gnoland-1 history (advisory)")
+	assert.Contains(t, out.Body, "First app hash mismatch at height **7**")
+	assert.Contains(t, out.Body, "https://replay.example/reports/1")
 	// Root causes are listed before diffs after the divergence.
-	assert.Less(t, indexOf(text, "height 7"), indexOf(text, "height 9"))
-	assert.Contains(t, text, "`vm.VMError: boom stack` (gas 12)")
+	assert.Less(t, indexOf(out.Body, "height 7"), indexOf(out.Body, "height 9"))
+	assert.Contains(t, out.Body, "`vm.VMError: boom stack` (gas 12)")
 
 	// Inherited-only divergences don't flag the PR.
-	concl, title, _, _ = checkOutput(job, broken, classify(broken, broken), "")
-	assert.Equal(t, "success", concl)
-	assert.Contains(t, title, "2 inherited from master")
+	out = render(job, broken, classify(broken, broken), "")
+	assert.Equal(t, "success", out.State)
+	assert.Contains(t, out.Description, "2 inherited from master")
 }
 
 func indexOf(s, sub string) int {

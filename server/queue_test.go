@@ -17,7 +17,7 @@ func newTestQueue(t *testing.T) *Queue {
 	return q
 }
 
-// testJob builds the job the webhook handler would enqueue for an event.
+// testJob builds the job the poller would enqueue for a new head.
 func testJob(t *testing.T, cfg *Config, repo, event, branch string, pr int, sha string, at time.Time) *Job {
 	t.Helper()
 	prio, ok := cfg.priority(repo, event, branch)
@@ -151,6 +151,30 @@ func TestRequeueAndBaseline(t *testing.T) {
 	none, err := q.Baseline("gnolang/gno", "chain/mainnet")
 	require.NoError(t, err)
 	assert.Nil(t, none)
+}
+
+func TestCancelKey(t *testing.T) {
+	cfg := &Config{}
+	cfg.setDefaults()
+	q := newTestQueue(t)
+	now := time.Now()
+
+	pr := testJob(t, cfg, "gnolang/gno", eventPullRequest, "master", 9, "a", now)
+	_, err := q.Enqueue(pr)
+	require.NoError(t, err)
+	other := testJob(t, cfg, "gnolang/gno", eventPullRequest, "master", 10, "b", now)
+	_, err = q.Enqueue(other)
+	require.NoError(t, err)
+	assert.NotEmpty(t, pr.Secret)
+	assert.NotEqual(t, pr.Secret, other.Secret)
+
+	cancelled, err := q.CancelKey(pr.Key)
+	require.NoError(t, err)
+	require.Len(t, cancelled, 1)
+	assert.Equal(t, pr.ID, cancelled[0].ID)
+	next, err := q.Claim()
+	require.NoError(t, err)
+	assert.Equal(t, other.ID, next.ID)
 }
 
 func TestPriorityIgnoresUnknown(t *testing.T) {

@@ -3,17 +3,15 @@ module github.com/gnoverse/gnoreplay/server
 go 1.26.1
 
 require (
-	github.com/bradleyfalzon/ghinstallation/v2 v2.19.0
 	github.com/google/go-github/v89 v89.0.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/stretchr/testify v1.12.1
+	github.com/yuin/goldmark v1.8.6
 	modernc.org/sqlite v1.59.0
 )
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
-	github.com/google/go-github/v88 v88.0.0 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect

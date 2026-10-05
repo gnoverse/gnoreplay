@@ -3,66 +3,47 @@ package main
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"strings"
-	"sync"
-	"time"
 
-	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/google/go-github/v89/github"
 )
 
-type checkUpdate struct {
-	Status     string // "queued", "in_progress" or "completed"
-	Conclusion string // with "completed": "success", "neutral", "cancelled", ...
-	Title      string
-	Summary    string
-	Text       string
-	DetailsURL string
+type PullRequest struct {
+	Number  int
+	Base    string // base branch
+	HeadSHA string
 }
 
-// GitHub is what the server needs from the GitHub API, as the app
-// installation of the repo concerned.
+type Status struct {
+	State       string // "pending", "success", "failure" or "error"
+	Description string
+	TargetURL   string
+}
+
+// GitHub is what the server needs from the GitHub API.
 type GitHub interface {
-	CreateCheck(ctx context.Context, installation int64, repo, sha string, u checkUpdate) (int64, error)
-	UpdateCheck(ctx context.Context, installation int64, repo string, checkRunID int64, u checkUpdate) error
-	// Token is a short-lived installation token, used to fetch private repos.
-	Token(ctx context.Context, installation int64) (string, error)
+	BranchHead(ctx context.Context, repo, branch string) (string, error)
+	OpenPulls(ctx context.Context, repo string) ([]PullRequest, error)
+	Pull(ctx context.Context, repo string, number int) (PullRequest, error)
+	SetStatus(ctx context.Context, repo, sha string, st Status) error
+	// Token authenticates git fetches.
+	Token() string
 }
 
-type ghApp struct {
-	appID     int64
-	key       []byte
-	checkName string
-
-	mu         sync.Mutex
-	transports map[int64]*ghinstallation.Transport
+// tokenClient talks to GitHub with a personal access token. Check runs are
+// reserved to GitHub Apps, so results are reported as commit statuses.
+type tokenClient struct {
+	c       *github.Client
+	token   string
+	context string // status context
 }
 
-func newGHApp(appID int64, key []byte, checkName string) *ghApp {
-	return &ghApp{appID: appID, key: key, checkName: checkName, transports: map[int64]*ghinstallation.Transport{}}
-}
-
-func (g *ghApp) transport(installation int64) (*ghinstallation.Transport, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if tr, ok := g.transports[installation]; ok {
-		return tr, nil
-	}
-	tr, err := ghinstallation.New(http.DefaultTransport, g.appID, installation, g.key)
+func newTokenClient(token, statusContext string) (*tokenClient, error) {
+	c, err := github.NewClient(github.WithAuthToken(token))
 	if err != nil {
 		return nil, err
 	}
-	g.transports[installation] = tr
-	return tr, nil
-}
-
-func (g *ghApp) client(installation int64) (*github.Client, error) {
-	tr, err := g.transport(installation)
-	if err != nil {
-		return nil, err
-	}
-	return github.NewClient(github.WithTransport(tr))
+	return &tokenClient{c: c, token: token, context: statusContext}, nil
 }
 
 func splitRepo(repo string) (owner, name string, err error) {
@@ -73,79 +54,78 @@ func splitRepo(repo string) (owner, name string, err error) {
 	return owner, name, nil
 }
 
-func (u checkUpdate) output() *github.CheckRunOutput {
-	if u.Title == "" {
-		return nil
-	}
-	return &github.CheckRunOutput{
-		Title:   github.Ptr(u.Title),
-		Summary: github.Ptr(u.Summary),
-		Text:    optional(u.Text),
-	}
-}
-
-func optional(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
-}
-
-func completedAt(u checkUpdate) *github.Timestamp {
-	if u.Status != "completed" {
-		return nil
-	}
-	return &github.Timestamp{Time: time.Now()}
-}
-
-func (g *ghApp) CreateCheck(ctx context.Context, installation int64, repo, sha string, u checkUpdate) (int64, error) {
-	c, err := g.client(installation)
-	if err != nil {
-		return 0, err
-	}
+func (t *tokenClient) BranchHead(ctx context.Context, repo, branch string) (string, error) {
 	owner, name, err := splitRepo(repo)
-	if err != nil {
-		return 0, err
-	}
-	run, _, err := c.Checks.CreateCheckRun(ctx, owner, name, github.CreateCheckRunOptions{
-		Name:        g.checkName,
-		HeadSHA:     sha,
-		Status:      optional(u.Status),
-		Conclusion:  optional(u.Conclusion),
-		CompletedAt: completedAt(u),
-		DetailsURL:  optional(u.DetailsURL),
-		Output:      u.output(),
-	})
-	if err != nil {
-		return 0, err
-	}
-	return run.GetID(), nil
-}
-
-func (g *ghApp) UpdateCheck(ctx context.Context, installation int64, repo string, checkRunID int64, u checkUpdate) error {
-	c, err := g.client(installation)
-	if err != nil {
-		return err
-	}
-	owner, name, err := splitRepo(repo)
-	if err != nil {
-		return err
-	}
-	_, _, err = c.Checks.UpdateCheckRun(ctx, owner, name, checkRunID, github.UpdateCheckRunOptions{
-		Name:        g.checkName,
-		Status:      optional(u.Status),
-		Conclusion:  optional(u.Conclusion),
-		CompletedAt: completedAt(u),
-		DetailsURL:  optional(u.DetailsURL),
-		Output:      u.output(),
-	})
-	return err
-}
-
-func (g *ghApp) Token(ctx context.Context, installation int64) (string, error) {
-	tr, err := g.transport(installation)
 	if err != nil {
 		return "", err
 	}
-	return tr.Token(ctx)
+	b, _, err := t.c.Repositories.GetBranch(ctx, owner, name, branch, 0)
+	if err != nil {
+		return "", err
+	}
+	return b.GetCommit().GetSHA(), nil
 }
+
+func (t *tokenClient) OpenPulls(ctx context.Context, repo string) ([]PullRequest, error) {
+	owner, name, err := splitRepo(repo)
+	if err != nil {
+		return nil, err
+	}
+	opts := &github.PullRequestListOptions{State: "open", ListOptions: github.ListOptions{PerPage: 100}}
+	var out []PullRequest
+	for {
+		prs, res, err := t.c.PullRequests.List(ctx, owner, name, opts)
+		if err != nil {
+			return nil, err
+		}
+		for _, pr := range prs {
+			out = append(out, toPullRequest(pr))
+		}
+		if res.NextPage == 0 {
+			return out, nil
+		}
+		opts.Page = res.NextPage
+	}
+}
+
+func (t *tokenClient) Pull(ctx context.Context, repo string, number int) (PullRequest, error) {
+	owner, name, err := splitRepo(repo)
+	if err != nil {
+		return PullRequest{}, err
+	}
+	pr, _, err := t.c.PullRequests.Get(ctx, owner, name, number)
+	if err != nil {
+		return PullRequest{}, err
+	}
+	return toPullRequest(pr), nil
+}
+
+func toPullRequest(pr *github.PullRequest) PullRequest {
+	return PullRequest{Number: pr.GetNumber(), Base: pr.GetBase().GetRef(), HeadSHA: pr.GetHead().GetSHA()}
+}
+
+// maxDescriptionLen is GitHub's limit for a commit status description.
+const maxDescriptionLen = 140
+
+func (t *tokenClient) SetStatus(ctx context.Context, repo, sha string, st Status) error {
+	owner, name, err := splitRepo(repo)
+	if err != nil {
+		return err
+	}
+	desc := st.Description
+	if r := []rune(desc); len(r) > maxDescriptionLen {
+		desc = string(r[:maxDescriptionLen-1]) + "…"
+	}
+	status := github.RepoStatus{
+		State:       github.Ptr(st.State),
+		Description: github.Ptr(desc),
+		Context:     github.Ptr(t.context),
+	}
+	if st.TargetURL != "" {
+		status.TargetURL = github.Ptr(st.TargetURL)
+	}
+	_, _, err = t.c.Repositories.CreateStatus(ctx, owner, name, sha, status)
+	return err
+}
+
+func (t *tokenClient) Token() string { return t.token }

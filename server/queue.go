@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
 	"fmt"
 	"time"
@@ -20,19 +21,20 @@ type Job struct {
 	ID int64
 	// Key identifies what the job checks: a branch or a PR. A newer job with
 	// the same key supersedes older ones.
-	Key            string
-	Repo           string // "owner/name"
-	Event          string // eventPush or eventPullRequest
-	Branch         string // pushed branch, or the PR's base branch
-	PR             int
-	SHA            string
-	InstallationID int64
-	Priority       int
-	State          string
-	EnqueuedAt     time.Time
-	CheckRunID     int64
-	ReportPath     string
-	Error          string
+	Key        string
+	Repo       string // "owner/name"
+	Event      string // eventPush or eventPullRequest
+	Branch     string // pushed branch, or the PR's base branch
+	PR         int
+	SHA        string
+	Priority   int
+	State      string
+	EnqueuedAt time.Time
+	// Secret authorizes access to the job's page and report when its repo's
+	// reports are not public.
+	Secret     string
+	ReportPath string
+	Error      string
 }
 
 func jobKey(repo, event, branch string, pr int) string {
@@ -48,24 +50,32 @@ type Queue struct {
 
 const schema = `
 CREATE TABLE IF NOT EXISTS jobs (
-	id              INTEGER PRIMARY KEY AUTOINCREMENT,
-	key             TEXT    NOT NULL,
-	repo            TEXT    NOT NULL,
-	event           TEXT    NOT NULL,
-	branch          TEXT    NOT NULL,
-	pr              INTEGER NOT NULL DEFAULT 0,
-	sha             TEXT    NOT NULL,
-	installation_id INTEGER NOT NULL,
-	priority        INTEGER NOT NULL,
-	state           TEXT    NOT NULL,
-	enqueued_at     INTEGER NOT NULL,
-	finished_at     INTEGER NOT NULL DEFAULT 0,
-	check_run_id    INTEGER NOT NULL DEFAULT 0,
-	report_path     TEXT    NOT NULL DEFAULT '',
-	error           TEXT    NOT NULL DEFAULT ''
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	key         TEXT    NOT NULL,
+	repo        TEXT    NOT NULL,
+	event       TEXT    NOT NULL,
+	branch      TEXT    NOT NULL,
+	pr          INTEGER NOT NULL DEFAULT 0,
+	sha         TEXT    NOT NULL,
+	priority    INTEGER NOT NULL,
+	state       TEXT    NOT NULL,
+	enqueued_at INTEGER NOT NULL,
+	finished_at INTEGER NOT NULL DEFAULT 0,
+	secret      TEXT    NOT NULL,
+	report_path TEXT    NOT NULL DEFAULT '',
+	error       TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state, priority, enqueued_at);
 CREATE INDEX IF NOT EXISTS jobs_key ON jobs (key, state);
+
+-- The last head seen by the poller for each tracked branch and open PR.
+CREATE TABLE IF NOT EXISTS heads (
+	key  TEXT PRIMARY KEY,
+	repo TEXT NOT NULL,
+	sha  TEXT NOT NULL
+);
+-- Repos the poller has completed a first pass on.
+CREATE TABLE IF NOT EXISTS synced (repo TEXT PRIMARY KEY);
 `
 
 func openQueue(path string) (*Queue, error) {
@@ -94,33 +104,55 @@ func (q *Queue) Enqueue(j *Job) (superseded []*Job, err error) {
 	}
 	defer tx.Rollback()
 
-	superseded, err = scanJobs(tx.Query(`SELECT `+jobColumns+` FROM jobs
-		WHERE key = ? AND state IN (?, ?)`, j.Key, stateQueued, stateRunning))
-	if err != nil {
+	if superseded, err = supersede(tx, j.Key); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(`UPDATE jobs SET state = ?, finished_at = ? WHERE key = ? AND state IN (?, ?)`,
-		stateSuperseded, time.Now().UnixNano(), j.Key, stateQueued, stateRunning); err != nil {
-		return nil, err
-	}
-
 	if j.EnqueuedAt.IsZero() {
 		j.EnqueuedAt = time.Now()
 	}
 	j.State = stateQueued
-	res, err := tx.Exec(`INSERT INTO jobs (key, repo, event, branch, pr, sha, installation_id, priority, state, enqueued_at, check_run_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		j.Key, j.Repo, j.Event, j.Branch, j.PR, j.SHA, j.InstallationID, j.Priority, j.State, j.EnqueuedAt.UnixNano(), j.CheckRunID)
+	j.Secret = rand.Text()
+	res, err := tx.Exec(`INSERT INTO jobs (key, repo, event, branch, pr, sha, priority, state, enqueued_at, secret)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		j.Key, j.Repo, j.Event, j.Branch, j.PR, j.SHA, j.Priority, j.State, j.EnqueuedAt.UnixNano(), j.Secret)
 	if err != nil {
 		return nil, err
 	}
 	if j.ID, err = res.LastInsertId(); err != nil {
 		return nil, err
 	}
-	for _, s := range superseded {
-		s.State = stateSuperseded
-	}
 	return superseded, tx.Commit()
+}
+
+// CancelKey supersedes the queued or running jobs for key (e.g. a PR that was
+// closed), and returns them.
+func (q *Queue) CancelKey(key string) ([]*Job, error) {
+	tx, err := q.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	jobs, err := supersede(tx, key)
+	if err != nil {
+		return nil, err
+	}
+	return jobs, tx.Commit()
+}
+
+func supersede(tx *sql.Tx, key string) ([]*Job, error) {
+	jobs, err := scanJobs(tx.Query(`SELECT `+jobColumns+` FROM jobs
+		WHERE key = ? AND state IN (?, ?)`, key, stateQueued, stateRunning))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`UPDATE jobs SET state = ?, finished_at = ? WHERE key = ? AND state IN (?, ?)`,
+		stateSuperseded, time.Now().UnixNano(), key, stateQueued, stateRunning); err != nil {
+		return nil, err
+	}
+	for _, j := range jobs {
+		j.State = stateSuperseded
+	}
+	return jobs, nil
 }
 
 // Claim marks the next job as running and returns it: lowest priority value
@@ -157,11 +189,6 @@ func (q *Queue) Finish(id int64, state, reportPath, errMsg string) (bool, error)
 	return n == 1, err
 }
 
-func (q *Queue) SetCheckRun(id, checkRunID int64) error {
-	_, err := q.db.Exec(`UPDATE jobs SET check_run_id = ? WHERE id = ?`, checkRunID, id)
-	return err
-}
-
 // Baseline returns the latest successful push job on repo/branch, or nil.
 func (q *Queue) Baseline(repo, branch string) (*Job, error) {
 	jobs, err := scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs
@@ -175,19 +202,6 @@ func (q *Queue) Baseline(repo, branch string) (*Job, error) {
 
 func (q *Queue) Get(id int64) (*Job, error) {
 	jobs, err := scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE id = ?`, id))
-	if err != nil {
-		return nil, err
-	}
-	if len(jobs) == 0 {
-		return nil, sql.ErrNoRows
-	}
-	return jobs[0], nil
-}
-
-// ByCheckRun finds the job that owns a check run.
-func (q *Queue) ByCheckRun(checkRunID int64) (*Job, error) {
-	jobs, err := scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE check_run_id = ?
-		ORDER BY id DESC LIMIT 1`, checkRunID))
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +226,47 @@ func (q *Queue) Pending() ([]*Job, error) {
 		ORDER BY state = ? DESC, priority, enqueued_at, id`, stateRunning, stateQueued, stateRunning))
 }
 
-const jobColumns = `id, key, repo, event, branch, pr, sha, installation_id, priority, state, enqueued_at, check_run_id, report_path, error`
+// Heads returns the last seen head of each tracked key of repo.
+func (q *Queue) Heads(repo string) (map[string]string, error) {
+	rows, err := q.db.Query(`SELECT key, sha FROM heads WHERE repo = ?`, repo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	heads := map[string]string{}
+	for rows.Next() {
+		var key, sha string
+		if err := rows.Scan(&key, &sha); err != nil {
+			return nil, err
+		}
+		heads[key] = sha
+	}
+	return heads, rows.Err()
+}
+
+func (q *Queue) SetHead(key, repo, sha string) error {
+	_, err := q.db.Exec(`INSERT INTO heads (key, repo, sha) VALUES (?, ?, ?)
+		ON CONFLICT (key) DO UPDATE SET sha = excluded.sha`, key, repo, sha)
+	return err
+}
+
+func (q *Queue) DeleteHead(key string) error {
+	_, err := q.db.Exec(`DELETE FROM heads WHERE key = ?`, key)
+	return err
+}
+
+func (q *Queue) Synced(repo string) (bool, error) {
+	var n int
+	err := q.db.QueryRow(`SELECT COUNT(*) FROM synced WHERE repo = ?`, repo).Scan(&n)
+	return n > 0, err
+}
+
+func (q *Queue) MarkSynced(repo string) error {
+	_, err := q.db.Exec(`INSERT OR IGNORE INTO synced (repo) VALUES (?)`, repo)
+	return err
+}
+
+const jobColumns = `id, key, repo, event, branch, pr, sha, priority, state, enqueued_at, secret, report_path, error`
 
 func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 	if err != nil {
@@ -223,8 +277,8 @@ func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 	for rows.Next() {
 		j := &Job{}
 		var enq int64
-		if err := rows.Scan(&j.ID, &j.Key, &j.Repo, &j.Event, &j.Branch, &j.PR, &j.SHA, &j.InstallationID,
-			&j.Priority, &j.State, &enq, &j.CheckRunID, &j.ReportPath, &j.Error); err != nil {
+		if err := rows.Scan(&j.ID, &j.Key, &j.Repo, &j.Event, &j.Branch, &j.PR, &j.SHA,
+			&j.Priority, &j.State, &enq, &j.Secret, &j.ReportPath, &j.Error); err != nil {
 			return nil, err
 		}
 		j.EnqueuedAt = time.Unix(0, enq)

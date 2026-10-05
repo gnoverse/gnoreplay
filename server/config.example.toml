@@ -1,7 +1,7 @@
 # gnoreplay-server configuration. Paths are on the replay box.
 
 listen = ":8080"
-# How GitHub users reach this server (report links in check runs).
+# How GitHub users reach this server: commit statuses link to job pages here.
 public_url = "https://replay.example.org"
 data_dir = "/var/lib/gnoreplay"
 # Replays run concurrently. Each needs a 9G VM (see run_sandbox) and uses
@@ -9,10 +9,13 @@ data_dir = "/var/lib/gnoreplay"
 workers = 2
 
 [github]
-app_id = 123456
-private_key_file = "/etc/gnoreplay/app.pem"
-webhook_secret_file = "/etc/gnoreplay/webhook-secret"
-check_name = "mainnet-replay"
+# A token that can read the tracked repos' contents and pull requests and
+# write their commit statuses (see README.md).
+token_file = "/etc/gnoreplay/github-token"
+status_context = "mainnet-replay"
+# Each poll costs one API call per tracked branch, plus one per 100 open PRs
+# per repo.
+poll_interval = "2m"
 
 [chain]
 # Stopped copy of the reference node's data dir, refreshed by
@@ -21,8 +24,9 @@ golden_dir = "/var/lib/gnoreplay/golden"
 genesis = "/var/lib/gnoreplay/genesis.json"
 
 [job]
-# contribs/gnoreplay from gnolang/gno master, for commits that predate it.
-gnoreplay_overlay = "/opt/gnoreplay/overlay"
+# The gnoreplay/ directory of this repo: copied into each checkout at
+# contribs/gnoreplay and built there.
+gnoreplay_overlay = "/opt/gnoreplay/gnoreplay"
 # PR code is untrusted: build and replay each run in a microsandbox VM
 # (https://microsandbox.dev) with the job dir mounted at the same path, so
 # no host secret is reachable and a runaway job can't OOM the host.
@@ -54,7 +58,8 @@ run_timeout = "4h"
 public_reports = true
 
 [repos."gnolang/gno-fixes"]
-# Private repo: results only in its check runs, never on /reports.
+# Private repo: a job's page and report are only reachable through the
+# secret link in its commit status, and /queue hides its jobs' details.
 public_reports = false
 
 # Priority rules (first match wins; earlier runs first). These are the

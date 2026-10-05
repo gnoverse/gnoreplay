@@ -1,11 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,55 +19,82 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type fakeCheck struct {
-	repo, sha string
-	updates   []checkUpdate
-}
-
+// fakeGitHub serves branch heads and open PRs from memory and records the
+// commit statuses set.
 type fakeGitHub struct {
-	mu     sync.Mutex
-	checks []*fakeCheck
+	mu       sync.Mutex
+	branches map[string]string // "repo@branch" -> sha
+	pulls    map[string][]PullRequest
+	statuses map[string][]Status // sha -> statuses, in order
 }
 
-func (f *fakeGitHub) CreateCheck(_ context.Context, _ int64, repo, sha string, u checkUpdate) (int64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.checks = append(f.checks, &fakeCheck{repo: repo, sha: sha, updates: []checkUpdate{u}})
-	return int64(len(f.checks)), nil
+func newFakeGitHub() *fakeGitHub {
+	return &fakeGitHub{branches: map[string]string{}, pulls: map[string][]PullRequest{}, statuses: map[string][]Status{}}
 }
 
-func (f *fakeGitHub) UpdateCheck(_ context.Context, _ int64, _ string, id int64, u checkUpdate) error {
+func (f *fakeGitHub) BranchHead(_ context.Context, repo, branch string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	c := f.checks[id-1]
-	c.updates = append(c.updates, u)
+	sha, ok := f.branches[repo+"@"+branch]
+	if !ok {
+		return "", fmt.Errorf("no branch %s", branch)
+	}
+	return sha, nil
+}
+
+func (f *fakeGitHub) OpenPulls(_ context.Context, repo string) ([]PullRequest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]PullRequest(nil), f.pulls[repo]...), nil
+}
+
+func (f *fakeGitHub) Pull(_ context.Context, repo string, number int) (PullRequest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, pr := range f.pulls[repo] {
+		if pr.Number == number {
+			return pr, nil
+		}
+	}
+	return PullRequest{}, fmt.Errorf("no PR %d", number)
+}
+
+func (f *fakeGitHub) SetStatus(_ context.Context, _, sha string, st Status) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.statuses[sha] = append(f.statuses[sha], st)
 	return nil
 }
 
-func (f *fakeGitHub) Token(context.Context, int64) (string, error) { return "token", nil }
+func (f *fakeGitHub) Token() string { return "token" }
 
-func (f *fakeGitHub) last(sha string) checkUpdate {
+func (f *fakeGitHub) last(sha string) Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for i := len(f.checks) - 1; i >= 0; i-- {
-		if f.checks[i].sha == sha {
-			return f.checks[i].updates[len(f.checks[i].updates)-1]
-		}
+	if s := f.statuses[sha]; len(s) > 0 {
+		return s[len(s)-1]
 	}
-	return checkUpdate{}
+	return Status{}
 }
 
-// fakeTool is a stand-in contribs/gnoreplay: it checks it was given a copy
-// of the chain data, then writes a canned report.
+func (f *fakeGitHub) setPulls(repo string, prs ...PullRequest) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pulls[repo] = prs
+}
+
+// fakeTool stands in for gnoreplay/: it checks it was given a copy of the
+// chain data and a sandbox prefix, then outputs the report the commit under
+// test carries (in fake-report.json, with the exit code in fake-exit).
 const fakeTool = `package main
 
 import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
-
-const report = %q
 
 func main() {
 	dataDir := flag.String("data-dir", "", "")
@@ -84,14 +107,21 @@ func main() {
 	if _, err := os.Stat(filepath.Join(*dataDir, "db", "state.db", "MARKER")); err != nil {
 		panic(err)
 	}
-	if os.Getenv("GNOROOT") == "" || os.Getenv("SANDBOX_SRC") != os.Getenv("GNOROOT") {
+	root := os.Getenv("GNOROOT")
+	if root == "" || os.Getenv("SANDBOX_SRC") != root {
 		panic("GNOROOT not set, or {src} not substituted in the sandbox prefix")
 	}
 	if os.Getenv("SANDBOX_JOB") == "" || os.Getenv("SANDBOX_JOB") == "{job}" {
 		panic("{job} not substituted in the sandbox prefix")
 	}
-	os.WriteFile(*out, []byte(report), 0o644)
-	os.Exit(%d)
+	report, err := os.ReadFile(filepath.Join(root, "fake-report.json"))
+	if err != nil {
+		panic(err)
+	}
+	code, _ := os.ReadFile(filepath.Join(root, "fake-exit"))
+	exit, _ := strconv.Atoi(strings.TrimSpace(string(code)))
+	os.WriteFile(*out, report, 0o644)
+	os.Exit(exit)
 }
 `
 
@@ -105,17 +135,20 @@ func git(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// commitTool commits a fake gnoreplay that outputs report (with exit code).
-func commitTool(t *testing.T, repo string, report *Report, exit int) string {
+var commits int
+
+// commitReport commits a tree whose replay yields report (with exit code).
+func commitReport(t *testing.T, repo string, report *Report, exit int) string {
 	t.Helper()
 	bz, err := json.Marshal(report)
 	require.NoError(t, err)
-	dir := filepath.Join(repo, "contribs", "gnoreplay")
-	require.NoError(t, os.MkdirAll(dir, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module fake\n\ngo 1.22\n"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), fmt.Appendf(nil, fakeTool, bz, exit), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "fake-report.json"), bz, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "fake-exit"), fmt.Appendf(nil, "%d", exit), 0o644))
 	git(t, repo, "add", ".")
-	git(t, repo, "commit", "-q", "-m", "tool")
+	// A unique message: identical trees committed in the same second in two
+	// repos would otherwise get the same SHA.
+	commits++
+	git(t, repo, "commit", "-q", "--allow-empty", "-m", fmt.Sprintf("commit %d", commits))
 	return git(t, repo, "rev-parse", "HEAD")
 }
 
@@ -125,36 +158,49 @@ func TestServerEndToEnd(t *testing.T) {
 	}
 	root := t.TempDir()
 
-	// The "GitHub" remote: file:///<root>/remote/gnolang/gno.git
-	repo := filepath.Join(root, "remote", "gnolang", "gno.git")
-	require.NoError(t, os.MkdirAll(repo, 0o755))
-	git(t, repo, "init", "-q")
-	git(t, repo, "config", "uploadpack.allowAnySHA1InWant", "true")
+	// The "GitHub" remotes: file:///<root>/remote/<owner>/<name>.git
+	newRemote := func(name string) string {
+		dir := filepath.Join(root, "remote", name+".git")
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		git(t, dir, "init", "-q")
+		git(t, dir, "config", "uploadpack.allowAnySHA1InWant", "true")
+		return dir
+	}
+	gno, fixes := newRemote("gnolang/gno"), newRemote("gnolang/gno-fixes")
 
 	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
-	shaBase := commitTool(t, repo, clean, 0)
 	broken := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, FirstAppHashMismatch: 12}
 	broken.Counts.Result = 1
 	broken.Diffs = []Diff{{
 		Kind: "result", Height: 12, Index: 0, TxHash: "AB12", Msgs: []string{"vm/exec gno.land/r/demo/foo.Bar"},
-		Recorded: &Result{GasUsed: 100}, Replayed: &Result{Error: "vm.VMError: unexpected", GasUsed: 90},
+		Recorded: &Result{GasUsed: 100}, Replayed: &Result{Error: "vm.VMError: <script>unexpected</script>", GasUsed: 90},
 	}}
-	shaPR := commitTool(t, repo, broken, 2)
+	shaMaster := commitReport(t, gno, clean, 0)
+	shaOldPR := commitReport(t, gno, clean, 0)
+	shaPR := commitReport(t, gno, broken, 2)
+	shaPR2 := commitReport(t, gno, broken, 2)
+	shaFixes := commitReport(t, fixes, clean, 0)
+	shaFixesPR := commitReport(t, fixes, broken, 2)
 
 	golden := filepath.Join(root, "golden")
 	for _, name := range []string{"blockstore.db", "state.db"} {
 		require.NoError(t, os.MkdirAll(filepath.Join(golden, "db", name), 0o755))
 		require.NoError(t, os.WriteFile(filepath.Join(golden, "db", name, "MARKER"), nil, 0o644))
 	}
+	overlay := filepath.Join(root, "overlay")
+	require.NoError(t, os.MkdirAll(overlay, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(overlay, "go.mod"), []byte("module fake\n\ngo 1.22\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(overlay, "main.go"), []byte(fakeTool), 0o644))
 
 	cfg := &Config{
 		DataDir: filepath.Join(root, "data"),
 		// Fake tool, fake chain: nothing but paths.
 		Chain:     ChainConfig{GoldenDir: golden, Genesis: filepath.Join(root, "genesis.json")},
-		GitHub:    GitHubConfig{AppID: 1, GitURL: "file://" + filepath.Join(root, "remote") + "/"},
+		GitHub:    GitHubConfig{GitURL: "file://" + filepath.Join(root, "remote") + "/"},
 		PublicURL: "https://replay.example",
 		Repos:     map[string]RepoConfig{"gnolang/gno": {PublicReports: true}},
 		Job: JobConfig{
+			GnoreplayOverlay: overlay,
 			// A stand-in for a VM sandbox: it must get the job and checkout.
 			RunSandbox:     []string{"env", "SANDBOX_JOB={job}", "SANDBOX_SRC={src}"},
 			CleanupCommand: []string{"touch", filepath.Join(root, "cleaned-{job}")},
@@ -164,92 +210,167 @@ func TestServerEndToEnd(t *testing.T) {
 	q, err := openQueue(filepath.Join(t.TempDir(), "jobs.db"))
 	require.NoError(t, err)
 	defer q.Close()
-	gh := &fakeGitHub{}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := newServer(cfg, q, gh, logger)
-
-	secret := []byte("s3cret")
-	httpSrv := httptest.NewServer(srv.routes(secret))
+	gh := newFakeGitHub()
+	srv := newServer(cfg, q, gh, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	httpSrv := httptest.NewServer(srv.routes())
 	defer httpSrv.Close()
-	deliver := func(event string, payload any, sign bool) int {
-		bz, err := json.Marshal(payload)
-		require.NoError(t, err)
-		req, err := http.NewRequest(http.MethodPost, httpSrv.URL+"/webhook", bytes.NewReader(bz))
-		require.NoError(t, err)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-GitHub-Event", event)
-		if sign {
-			mac := hmac.New(sha256.New, secret)
-			mac.Write(bz)
-			req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+
+	ctx := context.Background()
+	poll := func() {
+		t.Helper()
+		for _, repo := range cfg.repos() {
+			require.NoError(t, srv.pollRepo(ctx, repo))
 		}
-		res, err := http.DefaultClient.Do(req)
-		require.NoError(t, err)
-		res.Body.Close()
-		return res.StatusCode
 	}
 	runNext := func() *Job {
+		t.Helper()
 		j, err := q.Claim()
 		require.NoError(t, err)
 		require.NotNil(t, j)
-		srv.runJob(context.Background(), j)
+		srv.runJob(ctx, j)
 		return j
 	}
-
-	push := map[string]any{
-		"ref": "refs/heads/master", "after": shaBase,
-		"repository":   map[string]any{"full_name": "gnolang/gno"},
-		"installation": map[string]any{"id": 42},
+	get := func(url string) (int, string) {
+		t.Helper()
+		res, err := http.Get(strings.Replace(url, "https://replay.example", httpSrv.URL, 1))
+		require.NoError(t, err)
+		defer res.Body.Close()
+		bz, err := io.ReadAll(res.Body)
+		require.NoError(t, err)
+		return res.StatusCode, string(bz)
 	}
-	assert.Equal(t, http.StatusUnauthorized, deliver("push", push, false), "unsigned deliveries are rejected")
-	require.Equal(t, http.StatusNoContent, deliver("push", push, true))
-	assert.Equal(t, "queued", gh.last(shaBase).Status)
 
-	// Not matched by any rule: ignored.
-	require.Equal(t, http.StatusNoContent, deliver("push", map[string]any{
-		"ref": "refs/heads/feature", "after": shaPR,
-		"repository": map[string]any{"full_name": "gnolang/gno"}, "installation": map[string]any{"id": 42},
-	}, true))
-	assert.Empty(t, gh.last(shaPR).Status)
-
-	baseJob := runNext()
-	u := gh.last(shaBase)
-	assert.Equal(t, "completed", u.Status)
-	assert.Equal(t, "success", u.Conclusion, "%s\n%s", u.Title, u.Summary)
-	assert.Contains(t, u.Title, "replays identically")
-
-	require.Equal(t, http.StatusNoContent, deliver("pull_request", map[string]any{
-		"action": "opened",
-		"pull_request": map[string]any{
-			"number": 7,
-			"base":   map[string]any{"ref": "master"},
-			"head":   map[string]any{"sha": shaPR},
-		},
-		"repository":   map[string]any{"full_name": "gnolang/gno"},
-		"installation": map[string]any{"id": 42},
-	}, true))
-	prJob := runNext()
-	u = gh.last(shaPR)
-	assert.Equal(t, "completed", u.Status)
-	assert.Equal(t, "neutral", u.Conclusion, "advisory: divergences are neutral")
-	assert.Contains(t, u.Title, "1 new divergent result")
-	assert.Contains(t, u.Text, "gno.land/r/demo/foo.Bar")
-	assert.Contains(t, u.Text, "vm.VMError: unexpected")
-	assert.Equal(t, fmt.Sprintf("https://replay.example/reports/%d", prJob.ID), u.DetailsURL)
-
-	// The full report is served for public repos.
-	res, err := http.Get(fmt.Sprintf("%s/reports/%d", httpSrv.URL, prJob.ID))
+	// First pass: tracked branches are replayed (they are the baselines);
+	// PRs already open are only recorded.
+	gh.branches["gnolang/gno@chain/mainnet"] = shaMaster
+	gh.branches["gnolang/gno@master"] = shaMaster
+	gh.branches["gnolang/gno-fixes@develop"] = shaFixes
+	gh.setPulls("gnolang/gno",
+		PullRequest{Number: 5, Base: "master", HeadSHA: shaOldPR},
+		PullRequest{Number: 6, Base: "some-feature", HeadSHA: shaOldPR}, // untracked base
+	)
+	poll()
+	pending, err := q.Pending()
 	require.NoError(t, err)
+	require.Len(t, pending, 3, "the three tracked branches")
+	assert.Equal(t, "pending", gh.last(shaMaster).State)
+	assert.Empty(t, gh.statuses[shaOldPR], "PRs open before the first pass are not replayed")
+
+	// Nothing changed: nothing new.
+	poll()
+	pending, _ = q.Pending()
+	assert.Len(t, pending, 3)
+
+	mainnetJob, masterJob, fixesJob := runNext(), runNext(), runNext()
+	assert.Equal(t, "gnolang/gno#branch/chain/mainnet", mainnetJob.Key, "priority 1 first")
+	assert.Equal(t, "gnolang/gno#branch/master", masterJob.Key)
+	assert.Equal(t, "gnolang/gno-fixes#branch/develop", fixesJob.Key)
+	st := gh.last(shaMaster)
+	assert.Equal(t, "success", st.State, st.Description)
+	assert.Contains(t, st.Description, "replays identically")
+	assert.Equal(t, fmt.Sprintf("https://replay.example/jobs/%d", masterJob.ID), st.TargetURL, "public repo: no secret in the link")
+
+	// A PR is opened, then pushed to before its replay starts: the newer
+	// head supersedes the first.
+	gh.setPulls("gnolang/gno",
+		PullRequest{Number: 5, Base: "master", HeadSHA: shaOldPR},
+		PullRequest{Number: 7, Base: "master", HeadSHA: shaPR},
+	)
+	poll()
+	assert.Equal(t, "pending", gh.last(shaPR).State)
+	gh.setPulls("gnolang/gno",
+		PullRequest{Number: 5, Base: "master", HeadSHA: shaOldPR},
+		PullRequest{Number: 7, Base: "master", HeadSHA: shaPR2},
+	)
+	poll()
+	assert.Equal(t, "error", gh.last(shaPR).State)
+	assert.Contains(t, gh.last(shaPR).Description, "superseded by "+shaPR2[:9])
+
+	prJob := runNext()
+	assert.Equal(t, shaPR2, prJob.SHA)
+	st = gh.last(shaPR2)
+	assert.Equal(t, "failure", st.State, "a new result divergence fails the (non-required) status")
+	assert.Contains(t, st.Description, "1 new divergence(s) from gnoland-1 history")
+	assert.LessOrEqual(t, len([]rune(st.Description)), maxDescriptionLen)
+
+	code, page := get(st.TargetURL)
+	require.Equal(t, http.StatusOK, code)
+	assert.Contains(t, page, "Replay of gnolang/gno PR #7 (into master)")
+	assert.Contains(t, page, "gno.land/r/demo/foo.Bar")
+	assert.Contains(t, page, "vm.VMError:")
+	assert.NotContains(t, page, "<script>", "tx errors are not rendered as HTML")
+	code, report := get(fmt.Sprintf("https://replay.example/reports/%d", prJob.ID))
+	require.Equal(t, http.StatusOK, code)
 	var served Report
-	require.NoError(t, json.NewDecoder(res.Body).Decode(&served))
-	res.Body.Close()
+	require.NoError(t, json.Unmarshal([]byte(report), &served))
 	assert.Len(t, served.Diffs, 1)
 
-	// Job dirs are removed; reports are kept.
-	_, err = os.Stat(filepath.Join(cfg.DataDir, "jobs", fmt.Sprint(baseJob.ID)))
-	assert.True(t, os.IsNotExist(err))
-	// The cleanup command ran for each job.
-	for _, j := range []*Job{baseJob, prJob} {
+	// A PR of the private repo: its page needs the job's secret, which only
+	// its status links to.
+	gh.setPulls("gnolang/gno-fixes", PullRequest{Number: 3, Base: "develop", HeadSHA: shaFixesPR})
+	poll()
+	fixesPR := runNext()
+	st = gh.last(shaFixesPR)
+	assert.Equal(t, "failure", st.State)
+	assert.Contains(t, st.TargetURL, "?k="+fixesPR.Secret)
+	code, _ = get(st.TargetURL)
+	assert.Equal(t, http.StatusOK, code)
+	code, _ = get(fmt.Sprintf("https://replay.example/jobs/%d", fixesPR.ID))
+	assert.Equal(t, http.StatusNotFound, code)
+	code, _ = get(fmt.Sprintf("https://replay.example/jobs/%d?k=wrong", fixesPR.ID))
+	assert.Equal(t, http.StatusNotFound, code)
+	code, _ = get(fmt.Sprintf("https://replay.example/reports/%d", fixesPR.ID))
+	assert.Equal(t, http.StatusNotFound, code)
+
+	// A PR closed while queued is cancelled.
+	gh.setPulls("gnolang/gno",
+		PullRequest{Number: 5, Base: "master", HeadSHA: shaOldPR},
+		PullRequest{Number: 8, Base: "master", HeadSHA: shaPR},
+	)
+	poll()
+	pending, _ = q.Pending()
+	require.Len(t, pending, 1)
+	gh.setPulls("gnolang/gno", PullRequest{Number: 5, Base: "master", HeadSHA: shaOldPR})
+	poll()
+	pending, _ = q.Pending()
+	assert.Empty(t, pending)
+
+	// A PR open since before the first pass can be replayed on demand.
+	require.NoError(t, srv.enqueueFor(ctx, "gnolang/gno", eventPullRequest, "master", 5, shaOldPR))
+	oldPR := runNext()
+	assert.Equal(t, "gnolang/gno#pr/5", oldPR.Key)
+	assert.Equal(t, "success", gh.last(shaOldPR).State)
+
+	// Job dirs are removed; reports are kept; cleanup ran for every job.
+	for _, j := range []*Job{mainnetJob, masterJob, fixesJob, prJob, fixesPR, oldPR} {
+		_, err = os.Stat(filepath.Join(cfg.DataDir, "jobs", fmt.Sprint(j.ID)))
+		assert.True(t, os.IsNotExist(err))
 		assert.FileExists(t, filepath.Join(root, fmt.Sprintf("cleaned-%d", j.ID)))
 	}
+}
+
+func TestPollErrorKeepsHeads(t *testing.T) {
+	cfg := &Config{DataDir: t.TempDir()}
+	cfg.setDefaults()
+	cfg.Rules = []Rule{{Repo: "gnolang/gno", Event: eventPush, Branch: "master"}, {Repo: "gnolang/gno", Event: eventPullRequest, Branch: "master"}}
+	q := newTestQueue(t)
+	gh := newFakeGitHub()
+	srv := newServer(cfg, q, gh, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+
+	gh.branches["gnolang/gno@master"] = "aaa"
+	gh.setPulls("gnolang/gno", PullRequest{Number: 1, Base: "master", HeadSHA: "bbb"})
+	require.NoError(t, srv.pollRepo(ctx, "gnolang/gno"))
+	gh.setPulls("gnolang/gno", PullRequest{Number: 1, Base: "master", HeadSHA: "ccc"})
+	require.NoError(t, srv.pollRepo(ctx, "gnolang/gno"))
+
+	// The branch lookup fails: nothing may be treated as gone.
+	delete(gh.branches, "gnolang/gno@master")
+	require.Error(t, srv.pollRepo(ctx, "gnolang/gno"))
+	heads, err := q.Heads("gnolang/gno")
+	require.NoError(t, err)
+	assert.Len(t, heads, 2)
+	pending, err := q.Pending()
+	require.NoError(t, err)
+	assert.Len(t, pending, 2, "the branch and the PR push stay queued")
 }
