@@ -3,16 +3,19 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/digitalocean/godo"
 )
 
 // Machine is a worker machine the provisioner created.
 type Machine struct {
-	ID   string
-	Name string
+	ID      string
+	Name    string
+	Created time.Time // as reported by the provider
 }
 
 // Provisioner creates and deletes the disposable machines replays run on.
@@ -56,7 +59,15 @@ func (p *doProvisioner) Create(ctx context.Context, name, userData string) (Mach
 	if err != nil {
 		return Machine{}, err
 	}
-	return Machine{ID: strconv.Itoa(d.ID), Name: d.Name}, nil
+	return toMachine(d)
+}
+
+func toMachine(d *godo.Droplet) (Machine, error) {
+	created, err := time.Parse(time.RFC3339, d.Created)
+	if err != nil {
+		return Machine{}, fmt.Errorf("droplet %d: created_at %q: %w", d.ID, d.Created, err)
+	}
+	return Machine{ID: strconv.Itoa(d.ID), Name: d.Name, Created: created}, nil
 }
 
 func (p *doProvisioner) Delete(ctx context.Context, id string) error {
@@ -80,8 +91,12 @@ func (p *doProvisioner) List(ctx context.Context) ([]Machine, error) {
 		if err != nil {
 			return nil, err
 		}
-		for _, d := range droplets {
-			out = append(out, Machine{ID: strconv.Itoa(d.ID), Name: d.Name})
+		for i := range droplets {
+			m, err := toMachine(&droplets[i])
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, m)
 		}
 		if res.Links == nil || res.Links.IsLastPage() {
 			return out, nil

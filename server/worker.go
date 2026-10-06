@@ -33,14 +33,14 @@ type Server struct {
 	wake chan struct{}
 
 	mu       sync.Mutex
-	running  map[int64]context.CancelFunc
+	running  map[int64]context.CancelCauseFunc
 	sessions map[int64]*session // remote jobs waiting for their worker
 }
 
 func newServer(cfg *Config, q *Queue, gh GitHub, logger *slog.Logger) *Server {
 	return &Server{
 		cfg: cfg, queue: q, gh: gh, logger: logger,
-		wake: make(chan struct{}, 1), running: map[int64]context.CancelFunc{}, sessions: map[int64]*session{},
+		wake: make(chan struct{}, 1), running: map[int64]context.CancelCauseFunc{}, sessions: map[int64]*session{},
 	}
 }
 
@@ -65,11 +65,19 @@ func (s *Server) enqueue(j *Job) error {
 
 func shortSHA(sha string) string { return sha[:min(len(sha), 9)] }
 
-func (s *Server) cancel(id int64) {
+var errSuperseded = errors.New("superseded by a newer push, or the PR was closed")
+
+// cancel stops a running job, superseded or closed: the queue already
+// marked it so.
+func (s *Server) cancel(id int64) { s.cancelCause(id, errSuperseded) }
+
+// cancelCause stops a running job for cause, recorded as its failure unless
+// the queue already marked it otherwise.
+func (s *Server) cancelCause(id int64, cause error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cancel, ok := s.running[id]; ok {
-		cancel()
+		cancel(cause)
 	}
 }
 
@@ -93,8 +101,8 @@ func (s *Server) work(ctx context.Context) {
 }
 
 func (s *Server) runJob(ctx context.Context, j *Job) {
-	jobCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	jobCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	s.mu.Lock()
 	s.running[j.ID] = cancel
 	s.mu.Unlock()
@@ -116,8 +124,14 @@ func (s *Server) runJob(ctx context.Context, j *Job) {
 
 	report, reportPath, err := s.replay(jobCtx, j, logger)
 	if jobCtx.Err() != nil && ctx.Err() == nil {
-		// Superseded, or its PR was closed.
-		logger.Info("replay cancelled")
+		// Recorded as failed, unless superseded or closed: the queue already
+		// marked those, and Finish leaves them alone.
+		cause := context.Cause(jobCtx)
+		recorded, ferr := s.queue.Finish(j.ID, Job{State: stateFailed, Error: cause.Error()})
+		if ferr != nil {
+			logger.Error("finish job", "err", ferr)
+		}
+		logger.Info("replay cancelled", "cause", cause, "recorded", recorded)
 		return
 	}
 	if err != nil {

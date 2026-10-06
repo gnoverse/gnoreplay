@@ -1,0 +1,11 @@
+# Deletes worker droplets older than 4 hours, independently of
+# gnoreplay-server (see deploy/watchdog.sh).
+[Unit]
+Description=gnoreplay worker watchdog
+
+[Service]
+Type=oneshot
+User=gnoreplay
+Environment=DO_TOKEN_FILE=/etc/gnoreplay/digitalocean-token
+Environment=MAX_AGE=14400
+ExecStart=/opt/gnoreplay/src/deploy/watchdog.sh

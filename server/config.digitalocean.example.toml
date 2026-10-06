@@ -18,7 +18,8 @@ genesis = "/var/lib/gnoreplay/genesis.json"
 
 [job]
 gnoreplay_overlay = "/opt/gnoreplay/gnoreplay"
-run_timeout = "4h"
+# A replay that has not reported by then fails, and its worker is deleted.
+run_timeout = "3h30m"
 
 [digitalocean]
 # A token with droplet create/read/delete (and tag create/read) scopes.
@@ -37,6 +38,11 @@ listen = "10.110.0.2:8081"
 url = "http://10.110.0.2:8081"
 go_version = "1.26.1"
 go_mem_limit = "12GiB"
+# Hard cap on a worker's life, from its creation: older workers are deleted
+# whatever their job's state (by the server every 5 minutes, and by
+# deploy/watchdog.sh independently of it). Workers also power themselves off
+# at this age.
+max_age = "4h"
 
 [repos."gnolang/gno"]
 public_reports = true

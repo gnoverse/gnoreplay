@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 	"github.com/stretchr/testify/assert"
@@ -39,6 +40,13 @@ func TestDigitalOceanExampleConfig(t *testing.T) {
 	assert.Equal(t, "m-2vcpu-16gb", cfg.DigitalOcean.Size)
 	assert.Equal(t, "gnoreplay-worker", cfg.DigitalOcean.Tag)
 	assert.Equal(t, defaultRules, cfg.Rules)
+
+	assert.Equal(t, "4h0m0s", cfg.DigitalOcean.MaxAge.String())
+
+	// A job must time out before its worker is deleted from under it.
+	cfg.Job.RunTimeout = cfg.DigitalOcean.MaxAge
+	assert.ErrorContains(t, cfg.validate(), "must be below digitalocean.max_age")
+	cfg.Job.RunTimeout.Duration = time.Hour
 
 	// Workers must get a VPC of their own and an SSH key.
 	cfg.DigitalOcean.VPCUUID = ""

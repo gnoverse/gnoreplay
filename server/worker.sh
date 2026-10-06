@@ -16,6 +16,13 @@ mkdir -p "$WORK"
 LOG="$WORK/worker.log"
 exec >"$LOG" 2>&1
 
+# Last resort if nothing deletes this machine in time: power off at the max
+# age. (A powered-off droplet is still billed; the coordinator and the
+# watchdog delete it.)
+if [ {{.PowerOffMinutes}} -gt 0 ]; then
+	shutdown -P +{{.PowerOffMinutes}} "gnoreplay: worker max age reached"
+fi
+
 # api <method> <path> [curl args...] talks to the coordinator for this job.
 api() {
 	local method=$1 path=$2

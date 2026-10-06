@@ -29,6 +29,8 @@ doctl compute ssh-key list
 
 API token for the server: *API → Generate New Token → Custom scopes*: `droplet` (create, read, delete) and `tag` (create, read).
 
+Set a spend alert too (*Billing → Spend alerts*), and keep the account's droplet limit low: DigitalOcean has no spending cap. See [Limits on worker droplets](#limits-on-worker-droplets).
+
 ## 2. Coordinator
 
 ```bash
@@ -71,6 +73,8 @@ systemctl start gnoreplay-golden && systemctl enable --now gnoreplay-golden.time
 | `/etc/gnoreplay/viewer-key` | any random string, if private repos are tracked |
 
 ```bash
+# The watchdog first: it deletes workers older than 4h even if the server misbehaves.
+systemctl enable --now gnoreplay-watchdog.timer
 systemctl enable --now gnoreplay-server
 # Replay a PR on demand (PRs open before the first poll are not replayed):
 sudo -u gnoreplay /opt/gnoreplay/bin/gnoreplay-server -config /etc/gnoreplay/config.toml enqueue gnolang/gno 1234
@@ -84,8 +88,25 @@ replay.example.org {
 }
 ```
 
+## Limits on worker droplets
+
+DigitalOcean has no spending cap, so the limits are ours. A worker droplet lives at most **4 hours** (`[digitalocean] max_age`), enforced four times over, each independent of the others:
+
+| | Enforced by | When |
+|---|---|---|
+| 1 | the job: no report within `job.run_timeout` (3h30m) → the job fails and its worker is deleted | at 3h30m |
+| 2 | the server: every 5 minutes, deletes any worker older than `max_age`, even if its job still runs (the job then fails) | ≤ 4h05m |
+| 3 | `gnoreplay-watchdog.timer` on the coordinator ([`watchdog.sh`](watchdog.sh), a separate process from the server, needing only the DigitalOcean token) | ≤ 4h05m |
+| 4 | the [`worker-watchdog`](../.github/workflows/worker-watchdog.yml) GitHub workflow (the same script), for when the coordinator itself is down: set a `DO_TOKEN` repository secret to enable it | every 15 min (GitHub may delay scheduled runs) |
+
+Workers also power themselves off at 4h, which stops them working but not billing: only deletion does.
+
+Beyond that, spending is bounded by the account's droplet limit (3 for new accounts: the coordinator and 2 workers, so at most 2 × $0.125/h ≈ $6/day), and you can set a **spend alert** (*Billing → Spend alerts*, email only) as a last notice.
+
+To stop everything at once: `systemctl stop gnoreplay-server && doctl compute droplet delete --tag-name gnoreplay-worker`.
+
 ## Operating
 
-- Worker droplets are named `gnoreplay-job-<id>` and tagged `gnoreplay-worker`. The server deletes each when its replay ends, is superseded or times out, and deletes any it does not own at startup and every 10 minutes. To stop everything: `systemctl stop gnoreplay-server && doctl compute droplet delete --tag-name gnoreplay-worker`.
+- Worker droplets are named `gnoreplay-job-<id>` and tagged `gnoreplay-worker`. The server deletes each when its replay ends, fails, is superseded or times out, and at startup and every 5 minutes deletes any it does not own or that is over `max_age`.
 - A worker's log is in its job's page when it fails, and on the worker in `/root/gnoreplay/<job>/worker.log` while it runs (SSH in with your key).
 - A governance halt on mainnet stops the reference node: it needs the upgraded binary, like any node.

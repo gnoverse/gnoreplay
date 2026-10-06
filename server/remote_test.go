@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,9 +33,10 @@ type fakeMachines struct {
 }
 
 type fakeMachine struct {
-	name   string
-	cancel context.CancelFunc
-	done   chan struct{}
+	name    string
+	created time.Time
+	cancel  context.CancelFunc
+	done    chan struct{}
 }
 
 func newFakeMachines(dir string) *fakeMachines {
@@ -51,14 +53,14 @@ func (f *fakeMachines) Create(_ context.Context, name, userData string) (Machine
 		return Machine{}, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	m := &fakeMachine{name: name, cancel: cancel, done: make(chan struct{})}
+	m := &fakeMachine{name: name, created: time.Now(), cancel: cancel, done: make(chan struct{})}
 	go func() {
 		defer close(m.done)
 		exec.CommandContext(ctx, "bash", script).Run()
 	}()
 	f.running[id] = m
 	f.created = append(f.created, name)
-	return Machine{ID: id, Name: name}, nil
+	return Machine{ID: id, Name: name, Created: m.created}, nil
 }
 
 // orphan registers a machine no job owns, as if left by a crash.
@@ -68,7 +70,18 @@ func (f *fakeMachines) orphan(name string) {
 	f.nextID++
 	done := make(chan struct{})
 	close(done)
-	f.running[strconv.Itoa(f.nextID)] = &fakeMachine{name: name, cancel: func() {}, done: done}
+	f.running[strconv.Itoa(f.nextID)] = &fakeMachine{name: name, created: time.Now(), cancel: func() {}, done: done}
+}
+
+// age makes a machine look created d ago.
+func (f *fakeMachines) age(name string, d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, m := range f.running {
+		if m.name == name {
+			m.created = time.Now().Add(-d)
+		}
+	}
 }
 
 func (f *fakeMachines) Delete(_ context.Context, id string) error {
@@ -92,7 +105,7 @@ func (f *fakeMachines) List(context.Context) ([]Machine, error) {
 	defer f.mu.Unlock()
 	var out []Machine
 	for id, m := range f.running {
-		out = append(out, Machine{ID: id, Name: m.name})
+		out = append(out, Machine{ID: id, Name: m.name, Created: m.created})
 	}
 	return out, nil
 }
@@ -150,6 +163,8 @@ func TestRemoteReplay(t *testing.T) {
 	machines := newFakeMachines(t.TempDir())
 	srv.prov = machines
 	workerWorkDir = filepath.Join(root, "workers")
+	// Never schedule this machine's shutdown.
+	workerPowerOff = false
 	workerSrv := httptest.NewServer(srv.workerRoutes())
 	defer workerSrv.Close()
 	cfg.DigitalOcean.URL = workerSrv.URL
@@ -237,8 +252,54 @@ func TestRemoteReplay(t *testing.T) {
 	got, err := q.Get(slow.ID)
 	require.NoError(t, err)
 	assert.Equal(t, stateSuperseded, got.State)
+
+	// A worker older than max_age is deleted even though its job is still
+	// running; the job fails with the reason, for good (not requeued).
+	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPush, "master", 0, shaSlow))
+	stuck, err := q.Claim()
+	require.NoError(t, err)
+	require.Equal(t, shaSlow, stuck.SHA)
+	finished = make(chan struct{})
+	go func() {
+		defer close(finished)
+		srv.runJob(ctx, stuck)
+	}()
+	require.Eventually(t, func() bool { _, _, n := machines.names(); return n == 1 }, 30*time.Second, 50*time.Millisecond)
+	machines.age(machineName(stuck.ID), cfg.DigitalOcean.MaxAge.Duration+time.Minute)
+	require.NoError(t, srv.reap(ctx))
+	select {
+	case <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatal("job of an over-age worker did not stop")
+	}
+	_, deleted, running = machines.names()
+	assert.Contains(t, deleted, machineName(stuck.ID))
+	assert.Zero(t, running)
+	got, err = q.Get(stuck.ID)
+	require.NoError(t, err)
+	assert.Equal(t, stateFailed, got.State)
+	assert.Contains(t, got.Error, "exceeded its max age (4h0m0s)")
+	pending, err := q.Pending()
+	require.NoError(t, err)
+	assert.Empty(t, pending)
 }
 
 func TestWorkerScriptQuoting(t *testing.T) {
 	assert.Equal(t, `'it'\''s'`, shellQuote("it's"))
+}
+
+func TestWorkerScriptPowerOff(t *testing.T) {
+	render := func(minutes string) string {
+		var b strings.Builder
+		require.NoError(t, workerTmpl.Execute(&b, map[string]string{
+			"URL": "http://10.0.0.1:8081", "JobID": "1", "Token": "t", "WorkDir": "/w",
+			"GoVersion": "1.26.1", "GoMemLimit": "12GiB", "PowerOffMinutes": minutes,
+		}))
+		return b.String()
+	}
+	// The worker powers itself off at its max age...
+	assert.Contains(t, render("240"), `if [ 240 -gt 0 ]; then
+	shutdown -P +240`)
+	// ...unless disabled (tests).
+	assert.Contains(t, render("0"), "if [ 0 -gt 0 ]")
 }

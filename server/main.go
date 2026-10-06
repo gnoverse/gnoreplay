@@ -110,7 +110,7 @@ func serve(ctx context.Context, configPath string, logger *slog.Logger) error {
 		if err := srv.reap(ctx); err != nil {
 			return fmt.Errorf("reap worker machines: %w", err)
 		}
-		wg.Go(func() { srv.reapLoop(ctx, 10*time.Minute) })
+		wg.Go(func() { srv.reapLoop(ctx, 5*time.Minute) })
 		workerSrv := &http.Server{
 			Addr:              srv.cfg.DigitalOcean.Listen,
 			Handler:           srv.workerRoutes(),

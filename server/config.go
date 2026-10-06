@@ -78,6 +78,10 @@ type DigitalOceanConfig struct {
 	GoVersion string `toml:"go_version"`
 	// GoMemLimit is the replay's GOMEMLIMIT on the worker.
 	GoMemLimit string `toml:"go_mem_limit"`
+	// MaxAge is how long a worker may exist, from its creation, whatever
+	// its job's state: older ones are deleted (and their job cancelled).
+	// job.run_timeout must leave room for the worker's boot and build.
+	MaxAge Duration `toml:"max_age"`
 }
 
 type ChainConfig struct {
@@ -188,8 +192,16 @@ func (c *Config) setDefaults() {
 	}
 	if c.Job.RunTimeout.Duration == 0 {
 		c.Job.RunTimeout.Duration = 4 * time.Hour
+		if c.DigitalOcean != nil {
+			// Below the workers' max age, so jobs time out before their
+			// worker is deleted from under them.
+			c.Job.RunTimeout.Duration = 3*time.Hour + 30*time.Minute
+		}
 	}
 	if do := c.DigitalOcean; do != nil {
+		if do.MaxAge.Duration == 0 {
+			do.MaxAge.Duration = 4 * time.Hour
+		}
 		if do.Size == "" {
 			do.Size = "m-2vcpu-16gb"
 		}
@@ -231,6 +243,8 @@ func (c *Config) validate() error {
 			return fmt.Errorf("digitalocean.ssh_keys is required (otherwise every droplet's root password is emailed)")
 		case do.Listen == "" || do.URL == "":
 			return fmt.Errorf("digitalocean.listen and digitalocean.url are required")
+		case c.Job.RunTimeout.Duration >= do.MaxAge.Duration:
+			return fmt.Errorf("job.run_timeout (%s) must be below digitalocean.max_age (%s)", c.Job.RunTimeout, do.MaxAge)
 		}
 	}
 	for i, r := range c.Rules {

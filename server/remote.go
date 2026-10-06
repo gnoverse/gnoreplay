@@ -33,6 +33,10 @@ var workerTmpl = template.Must(template.New("worker").Funcs(template.FuncMap{
 // workerWorkDir is where workers put the job's files.
 var workerWorkDir = "/root/gnoreplay"
 
+// workerPowerOff makes workers schedule their own power-off at max_age.
+// Tests, which run the worker script on the test machine, turn it off.
+var workerPowerOff = true
+
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 // session is a remote job waiting for its worker.
@@ -64,10 +68,15 @@ func (s *Server) replayRemote(ctx context.Context, j *Job, src, reportFile strin
 
 	var userData strings.Builder
 	do := s.cfg.DigitalOcean
+	powerOff := 0
+	if workerPowerOff {
+		powerOff = int(do.MaxAge.Minutes())
+	}
 	if err := workerTmpl.Execute(&userData, map[string]string{
 		"URL": strings.TrimRight(do.URL, "/"), "JobID": strconv.FormatInt(j.ID, 10), "Token": sess.token,
 		"WorkDir":   filepath.Join(workerWorkDir, strconv.FormatInt(j.ID, 10)),
 		"GoVersion": do.GoVersion, "GoMemLimit": do.GoMemLimit,
+		"PowerOffMinutes": strconv.Itoa(powerOff),
 	}); err != nil {
 		return err
 	}
@@ -118,9 +127,11 @@ func tail(s string, n int) string {
 	return "…" + s[len(s)-n:]
 }
 
-// reap deletes worker machines that no running job owns: left over from a
-// crash or a failed delete. It runs at startup, before any job, and then
-// periodically.
+// reap deletes worker machines that no running job owns (left over from a
+// crash or a failed delete), and any older than max_age whatever owns it,
+// cancelling that job. It runs at startup, before any job, and then
+// periodically. (deploy/watchdog.sh enforces max_age too, without the
+// server.)
 func (s *Server) reap(ctx context.Context) error {
 	machines, err := s.prov.List(ctx)
 	if err != nil {
@@ -131,14 +142,22 @@ func (s *Server) reap(ctx context.Context) error {
 		s.mu.Lock()
 		_, active := s.sessions[id]
 		s.mu.Unlock()
-		if err == nil && active {
+		active = active && err == nil
+		tooOld := time.Since(m.Created) > s.cfg.DigitalOcean.MaxAge.Duration
+		if active && !tooOld {
 			continue
+		}
+		if active {
+			s.logger.Error("worker machine exceeded its max age: cancelling its job",
+				"machine", m.Name, "created", m.Created, "max_age", s.cfg.DigitalOcean.MaxAge)
+			s.cancelCause(id, fmt.Errorf("worker machine %s exceeded its max age (%s) and was deleted",
+				m.Name, s.cfg.DigitalOcean.MaxAge))
 		}
 		if err := s.prov.Delete(ctx, m.ID); err != nil {
 			s.logger.Error("reap worker machine", "machine", m.Name, "err", err)
 			continue
 		}
-		s.logger.Info("reaped worker machine", "machine", m.Name)
+		s.logger.Info("reaped worker machine", "machine", m.Name, "created", m.Created)
 	}
 	return nil
 }

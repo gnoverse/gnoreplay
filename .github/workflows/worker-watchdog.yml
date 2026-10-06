@@ -1,0 +1,31 @@
+# Deletes gnoreplay worker droplets older than 4 hours, from outside the
+# coordinator: it still runs if the coordinator is down. It does nothing until
+# a DO_TOKEN secret (droplet read + delete) is set on the repository.
+name: worker-watchdog
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: deploy/watchdog.sh
+          sparse-checkout-cone-mode: false
+      - name: Delete workers older than 4 hours
+        env:
+          DO_TOKEN: ${{ secrets.DO_TOKEN }}
+          MAX_AGE: "14400"
+        run: |
+          if [ -z "$DO_TOKEN" ]; then
+            echo "DO_TOKEN secret not set: nothing to watch."
+            exit 0
+          fi
+          deploy/watchdog.sh
