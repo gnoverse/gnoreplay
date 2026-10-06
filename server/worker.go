@@ -32,6 +32,8 @@ type Server struct {
 	// wake is signaled when a job is enqueued.
 	wake chan struct{}
 
+	gitMu sync.Mutex // serializes git operations on the mirrors
+
 	mu       sync.Mutex
 	running  map[int64]context.CancelCauseFunc
 	sessions map[int64]*session // remote jobs waiting for their worker
@@ -294,6 +296,12 @@ func (s *Server) replayLocal(ctx context.Context, j *Job, jobDir, src, reportFil
 
 // checkout extracts j.SHA into dst, fetching it into a per-repo bare mirror.
 func (s *Server) checkout(ctx context.Context, j *Job, dst string, log io.Writer) error {
+	// Jobs run concurrently and share the mirror: one creating it must not
+	// be seen half-initialized by another, and git fetches into the same
+	// repo would contend on its locks.
+	s.gitMu.Lock()
+	defer s.gitMu.Unlock()
+
 	mirror := filepath.Join(s.cfg.DataDir, "mirrors", j.Repo+".git")
 	if _, err := os.Stat(mirror); err != nil {
 		if err := s.run(ctx, nil, "", nil, log, "git", "init", "--bare", "-q", mirror); err != nil {
@@ -381,6 +389,11 @@ func sandbox(prefix []string, j *Job, src string) []string {
 }
 
 func copyDir(src, dst string) error {
+	// WalkDir does not follow a symlinked root (the overlay usually is one).
+	src, err := filepath.EvalSymlinks(src)
+	if err != nil {
+		return err
+	}
 	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
