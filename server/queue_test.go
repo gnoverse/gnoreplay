@@ -97,7 +97,7 @@ func TestSupersedeRunning(t *testing.T) {
 	assert.Equal(t, running.ID, sup[0].ID)
 
 	// The superseded job's late result is discarded.
-	recorded, err := q.Finish(running.ID, stateDone, "report.json", "")
+	recorded, err := q.Finish(running.ID, Job{State: stateDone, ReportPath: "report.json"})
 	require.NoError(t, err)
 	assert.False(t, recorded)
 	got, err := q.Get(running.ID)
@@ -120,9 +120,14 @@ func TestRequeueAndBaseline(t *testing.T) {
 	require.NoError(t, err)
 	j, err := q.Claim()
 	require.NoError(t, err)
-	ok, err := q.Finish(j.ID, stateDone, "r1.json", "")
+	ok, err := q.Finish(j.ID, Job{State: stateDone, ReportPath: "r1.json", Outcome: outcomePass, Summary: "same"})
 	require.NoError(t, err)
 	require.True(t, ok)
+	done, err := q.Get(j.ID)
+	require.NoError(t, err)
+	assert.Equal(t, outcomePass, done.Outcome)
+	assert.Equal(t, "same", done.Summary)
+	assert.False(t, done.FinishedAt.IsZero())
 
 	_, err = q.Enqueue(testJob(t, cfg, "gnolang/gno", eventPush, "master", 0, "base2", time.Now()))
 	require.NoError(t, err)
@@ -165,8 +170,6 @@ func TestCancelKey(t *testing.T) {
 	other := testJob(t, cfg, "gnolang/gno", eventPullRequest, "master", 10, "b", now)
 	_, err = q.Enqueue(other)
 	require.NoError(t, err)
-	assert.NotEmpty(t, pr.Secret)
-	assert.NotEqual(t, pr.Secret, other.Secret)
 
 	cancelled, err := q.CancelKey(pr.Key)
 	require.NoError(t, err)
@@ -175,6 +178,15 @@ func TestCancelKey(t *testing.T) {
 	next, err := q.Claim()
 	require.NoError(t, err)
 	assert.Equal(t, other.ID, next.ID)
+
+	// The latest job of a key is kept, whatever its state.
+	latest, err := q.Latest(pr.Key)
+	require.NoError(t, err)
+	assert.Equal(t, stateSuperseded, latest.State)
+	recent, err := q.Recent(10)
+	require.NoError(t, err)
+	require.Len(t, recent, 2)
+	assert.Equal(t, other.ID, recent[0].ID, "newest first")
 }
 
 func TestPriorityIgnoresUnknown(t *testing.T) {

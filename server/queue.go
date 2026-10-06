@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/rand"
 	"database/sql"
 	"fmt"
 	"time"
@@ -30,12 +29,19 @@ type Job struct {
 	Priority   int
 	State      string
 	EnqueuedAt time.Time
-	// Secret authorizes access to the job's page and report when its repo's
-	// reports are not public.
-	Secret     string
+	FinishedAt time.Time
 	ReportPath string
-	Error      string
+	// Outcome is set when the job is done: outcomePass or outcomeDiverges,
+	// with a one-line Summary.
+	Outcome string
+	Summary string
+	Error   string
 }
+
+const (
+	outcomePass     = "pass"
+	outcomeDiverges = "diverges"
+)
 
 func jobKey(repo, event, branch string, pr int) string {
 	if event == eventPullRequest {
@@ -61,8 +67,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 	state       TEXT    NOT NULL,
 	enqueued_at INTEGER NOT NULL,
 	finished_at INTEGER NOT NULL DEFAULT 0,
-	secret      TEXT    NOT NULL,
 	report_path TEXT    NOT NULL DEFAULT '',
+	outcome     TEXT    NOT NULL DEFAULT '',
+	summary     TEXT    NOT NULL DEFAULT '',
 	error       TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state, priority, enqueued_at);
@@ -111,10 +118,9 @@ func (q *Queue) Enqueue(j *Job) (superseded []*Job, err error) {
 		j.EnqueuedAt = time.Now()
 	}
 	j.State = stateQueued
-	j.Secret = rand.Text()
-	res, err := tx.Exec(`INSERT INTO jobs (key, repo, event, branch, pr, sha, priority, state, enqueued_at, secret)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		j.Key, j.Repo, j.Event, j.Branch, j.PR, j.SHA, j.Priority, j.State, j.EnqueuedAt.UnixNano(), j.Secret)
+	res, err := tx.Exec(`INSERT INTO jobs (key, repo, event, branch, pr, sha, priority, state, enqueued_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		j.Key, j.Repo, j.Event, j.Branch, j.PR, j.SHA, j.Priority, j.State, j.EnqueuedAt.UnixNano())
 	if err != nil {
 		return nil, err
 	}
@@ -177,11 +183,14 @@ func (q *Queue) Claim() (*Job, error) {
 	return j, tx.Commit()
 }
 
-// Finish records the outcome of a running job. It is a no-op if the job was
-// superseded meanwhile, and reports whether the outcome was recorded.
-func (q *Queue) Finish(id int64, state, reportPath, errMsg string) (bool, error) {
-	res, err := q.db.Exec(`UPDATE jobs SET state = ?, report_path = ?, error = ?, finished_at = ?
-		WHERE id = ? AND state = ?`, state, reportPath, errMsg, time.Now().UnixNano(), id, stateRunning)
+// Finish records how a running job ended, from the fields of done: State
+// (stateDone or stateFailed), ReportPath, Outcome, Summary and Error. It is a
+// no-op if the job was superseded meanwhile, and reports whether the result
+// was recorded.
+func (q *Queue) Finish(id int64, done Job) (bool, error) {
+	res, err := q.db.Exec(`UPDATE jobs SET state = ?, report_path = ?, outcome = ?, summary = ?, error = ?, finished_at = ?
+		WHERE id = ? AND state = ?`, done.State, done.ReportPath, done.Outcome, done.Summary, done.Error,
+		time.Now().UnixNano(), id, stateRunning)
 	if err != nil {
 		return false, err
 	}
@@ -207,6 +216,20 @@ func (q *Queue) Get(id int64) (*Job, error) {
 	}
 	if len(jobs) == 0 {
 		return nil, sql.ErrNoRows
+	}
+	return jobs[0], nil
+}
+
+// Recent lists the latest jobs, newest first.
+func (q *Queue) Recent(limit int) ([]*Job, error) {
+	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs ORDER BY id DESC LIMIT ?`, limit))
+}
+
+// Latest returns the newest job for key (a branch or a PR), or nil.
+func (q *Queue) Latest(key string) (*Job, error) {
+	jobs, err := scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE key = ? ORDER BY id DESC LIMIT 1`, key))
+	if err != nil || len(jobs) == 0 {
+		return nil, err
 	}
 	return jobs[0], nil
 }
@@ -266,7 +289,7 @@ func (q *Queue) MarkSynced(repo string) error {
 	return err
 }
 
-const jobColumns = `id, key, repo, event, branch, pr, sha, priority, state, enqueued_at, secret, report_path, error`
+const jobColumns = `id, key, repo, event, branch, pr, sha, priority, state, enqueued_at, finished_at, report_path, outcome, summary, error`
 
 func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 	if err != nil {
@@ -276,12 +299,15 @@ func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 	var jobs []*Job
 	for rows.Next() {
 		j := &Job{}
-		var enq int64
+		var enq, fin int64
 		if err := rows.Scan(&j.ID, &j.Key, &j.Repo, &j.Event, &j.Branch, &j.PR, &j.SHA,
-			&j.Priority, &j.State, &enq, &j.Secret, &j.ReportPath, &j.Error); err != nil {
+			&j.Priority, &j.State, &enq, &fin, &j.ReportPath, &j.Outcome, &j.Summary, &j.Error); err != nil {
 			return nil, err
 		}
 		j.EnqueuedAt = time.Unix(0, enq)
+		if fin != 0 {
+			j.FinishedAt = time.Unix(0, fin)
+		}
 		jobs = append(jobs, j)
 	}
 	return jobs, rows.Err()

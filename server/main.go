@@ -1,6 +1,6 @@
 // Command gnoreplay-server replays a gno.land chain's history with the binary
-// of each pushed commit or PR, and reports divergences as a commit status.
-// See README.md.
+// of each pushed commit or PR, and serves the txs whose results would change.
+// It only reads from GitHub. See README.md.
 //
 // Usage:
 //
@@ -59,9 +59,15 @@ func setup(configPath string, logger *slog.Logger) (*Server, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("read token: %w", err)
 	}
-	gh, err := newTokenClient(strings.TrimSpace(string(token)), cfg.GitHub.StatusContext)
+	gh, err := newTokenClient(strings.TrimSpace(string(token)))
 	if err != nil {
 		return nil, nil, err
+	}
+	var viewerKey []byte
+	if cfg.ViewerKeyFile != "" {
+		if viewerKey, err = os.ReadFile(cfg.ViewerKeyFile); err != nil {
+			return nil, nil, fmt.Errorf("read viewer key: %w", err)
+		}
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, nil, err
@@ -70,7 +76,9 @@ func setup(configPath string, logger *slog.Logger) (*Server, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("open queue: %w", err)
 	}
-	return newServer(cfg, q, gh, logger), func() { q.Close() }, nil
+	srv := newServer(cfg, q, gh, logger)
+	srv.viewerKey = strings.TrimSpace(string(viewerKey))
+	return srv, func() { q.Close() }, nil
 }
 
 func serve(ctx context.Context, configPath string, logger *slog.Logger) error {
@@ -125,11 +133,11 @@ func enqueueOne(ctx context.Context, configPath string, logger *slog.Logger, rep
 		if err != nil {
 			return err
 		}
-		return srv.enqueueFor(ctx, repo, eventPullRequest, pr.Base, pr.Number, pr.HeadSHA)
+		return srv.enqueueFor(repo, eventPullRequest, pr.Base, pr.Number, pr.HeadSHA)
 	}
 	sha, err := srv.gh.BranchHead(ctx, repo, target)
 	if err != nil {
 		return err
 	}
-	return srv.enqueueFor(ctx, repo, eventPush, target, 0, sha)
+	return srv.enqueueFor(repo, eventPush, target, 0, sha)
 }

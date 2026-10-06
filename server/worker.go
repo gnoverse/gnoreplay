@@ -22,6 +22,9 @@ type Server struct {
 	queue  *Queue
 	gh     GitHub
 	logger *slog.Logger
+	// viewerKey unlocks the results of repos without public reports; empty
+	// means they are not served.
+	viewerKey string
 
 	// wake is signaled when a job is enqueued.
 	wake chan struct{}
@@ -36,23 +39,16 @@ func newServer(cfg *Config, q *Queue, gh GitHub, logger *slog.Logger) *Server {
 
 func (s *Server) reportsDir() string { return filepath.Join(s.cfg.DataDir, "reports") }
 
-// enqueue queues j, marks its commit pending, and cancels the jobs it
-// supersedes.
-func (s *Server) enqueue(ctx context.Context, j *Job) error {
+// enqueue queues j and cancels the jobs it supersedes.
+func (s *Server) enqueue(j *Job) error {
 	superseded, err := s.queue.Enqueue(j)
 	if err != nil {
 		return err
 	}
 	s.logger.Info("enqueued", "job", j.ID, "key", j.Key, "sha", j.SHA, "priority", j.Priority)
-
 	for _, old := range superseded {
 		s.cancel(old.ID)
-		if old.SHA != j.SHA {
-			s.setStatus(ctx, old, "error", "Not checked: superseded by "+shortSHA(j.SHA))
-		}
 	}
-	s.setStatus(ctx, j, "pending", fmt.Sprintf("Queued for a replay (priority %d)", j.Priority))
-
 	select {
 	case s.wake <- struct{}{}:
 	default:
@@ -67,15 +63,6 @@ func (s *Server) cancel(id int64) {
 	defer s.mu.Unlock()
 	if cancel, ok := s.running[id]; ok {
 		cancel()
-	}
-}
-
-// setStatus sets j's commit status, linking to the job's page. A failure is
-// only logged: the replay result is still on the page.
-func (s *Server) setStatus(ctx context.Context, j *Job, state, description string) {
-	st := Status{State: state, Description: description, TargetURL: s.jobURL(j)}
-	if err := s.gh.SetStatus(ctx, j.Repo, j.SHA, st); err != nil {
-		s.logger.Error("set commit status", "job", j.ID, "err", err)
 	}
 }
 
@@ -112,7 +99,6 @@ func (s *Server) runJob(ctx context.Context, j *Job) {
 
 	logger := s.logger.With("job", j.ID, "key", j.Key, "sha", j.SHA)
 	logger.Info("replay started")
-	s.setStatus(ctx, j, "pending", "Replaying mainnet history (started "+time.Now().UTC().Format("15:04")+" UTC)")
 
 	// The baseline is read before this job finishes, so a push job compares
 	// against the previous commit on its branch.
@@ -123,16 +109,15 @@ func (s *Server) runJob(ctx context.Context, j *Job) {
 
 	report, reportPath, err := s.replay(jobCtx, j, logger)
 	if jobCtx.Err() != nil && ctx.Err() == nil {
-		// Superseded or closed: whatever replaced it owns the status now.
+		// Superseded, or its PR was closed.
 		logger.Info("replay cancelled")
 		return
 	}
 	if err != nil {
 		logger.Error("replay failed", "err", err)
-		if _, ferr := s.queue.Finish(j.ID, stateFailed, "", err.Error()); ferr != nil {
+		if _, ferr := s.queue.Finish(j.ID, Job{State: stateFailed, Error: err.Error()}); ferr != nil {
 			logger.Error("finish job", "err", ferr)
 		}
-		s.setStatus(ctx, j, "error", "Replay could not run: see details")
 		return
 	}
 
@@ -148,13 +133,14 @@ func (s *Server) runJob(ctx context.Context, j *Job) {
 	if err := os.WriteFile(bodyPath(reportPath), []byte(out.Body), 0o644); err != nil {
 		logger.Error("write job page", "err", err)
 	}
-	recorded, err := s.queue.Finish(j.ID, stateDone, reportPath, "")
+	recorded, err := s.queue.Finish(j.ID, Job{
+		State: stateDone, ReportPath: reportPath, Outcome: out.Outcome, Summary: out.Summary,
+	})
 	if err != nil || !recorded {
 		logger.Info("result discarded", "recorded", recorded, "err", err)
 		return
 	}
-	s.setStatus(ctx, j, out.State, out.Description)
-	logger.Info("replay done", "state", out.State, "new", len(c.New), "inherited", len(c.Inherited), "fixed", len(c.Fixed))
+	logger.Info("replay done", "outcome", out.Outcome, "new", len(c.New), "inherited", len(c.Inherited), "fixed", len(c.Fixed))
 }
 
 // bodyPath is where a job's rendered page body is stored, next to its report.

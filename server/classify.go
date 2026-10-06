@@ -110,17 +110,17 @@ func classify(r, base *Report) Classification {
 // would not, on their own).
 func (d Diff) consensus() bool { return d.Kind != "gas" }
 
-// Outcome is what a finished job reports: a commit status, and the markdown
-// body of the job page it links to.
+// Outcome is what a finished job reports: whether the commit diverges, a
+// one-line summary, and the markdown body of the job's page.
 type Outcome struct {
-	State       string // "success" or "failure"
-	Description string
-	Body        string
+	Outcome string // outcomePass or outcomeDiverges
+	Summary string
+	Body    string
 }
 
-// render reports a replay. The status is advisory (it is not a required
-// check): it fails when the commit changes a tx result or a block, and passes
-// otherwise, gas-only changes included, with the counts in its description.
+// render reports a replay. A commit diverges when it changes a tx result or a
+// block compared to its base; gas-only changes pass, with their count in the
+// summary.
 func render(job *Job, r *Report, c Classification, reportURL string) Outcome {
 	newConsensus, newGas := 0, 0
 	for _, d := range c.New {
@@ -131,24 +131,22 @@ func render(job *Job, r *Report, c Classification, reportURL string) Outcome {
 		}
 	}
 
-	var out Outcome
+	out := Outcome{Outcome: outcomePass}
 	switch {
 	case newConsensus > 0:
-		out.State = "failure"
-		out.Description = fmt.Sprintf("%d new divergence(s) from %s history (advisory)", newConsensus, r.ChainID)
+		out.Outcome = outcomeDiverges
+		out.Summary = fmt.Sprintf("%d new divergence(s) from %s history", newConsensus, r.ChainID)
 	case newGas > 0:
-		out.State = "success"
-		out.Description = fmt.Sprintf("Same results; %d tx(s) use different gas", newGas)
+		out.Summary = fmt.Sprintf("Same results; %d tx(s) use different gas", newGas)
 	default:
-		out.State = "success"
-		out.Description = fmt.Sprintf("%s history replays identically (%d blocks)", r.ChainID, r.Blocks)
+		out.Summary = fmt.Sprintf("%s history replays identically (%d blocks)", r.ChainID, r.Blocks)
 		if len(c.Inherited) > 0 {
-			out.Description = fmt.Sprintf("No new divergences (%d inherited from %s)", len(c.Inherited), job.Branch)
+			out.Summary = fmt.Sprintf("No new divergences (%d inherited from %s)", len(c.Inherited), job.Branch)
 		}
 	}
 
 	var s strings.Builder
-	fmt.Fprintf(&s, "**%s**\n\n", out.Description)
+	fmt.Fprintf(&s, "**%s**\n\n", out.Summary)
 	fmt.Fprintf(&s, "Replayed **%s** heights %d–%d (%d blocks, %d txs) with this commit's binary in %s, comparing each tx against the result recorded on chain.\n\n",
 		r.ChainID, r.FromHeight, r.ToHeight, r.Blocks, r.Txs, formatSeconds(r.Timing.TotalSeconds))
 	s.WriteString("| | result | gas-only | block |\n|---|---|---|---|\n")
@@ -184,7 +182,7 @@ func render(job *Job, r *Report, c Classification, reportURL string) Outcome {
 	if reportURL != "" {
 		fmt.Fprintf(&s, "Full report (JSON): %s\n\n", reportURL)
 	}
-	s.WriteString("This check is advisory. Intentional behavior changes are expected to be gated by height or shipped through a coordinated upgrade.\n\n")
+	s.WriteString("A divergence is not necessarily a bug: intentional behavior changes are expected to be gated by height or shipped through a coordinated upgrade.\n\n")
 
 	writeDiffs(&s, "New", c.New)
 	if len(c.Fixed) > 0 {

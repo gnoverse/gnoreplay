@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/google/go-github/v89/github"
@@ -14,36 +15,42 @@ type PullRequest struct {
 	HeadSHA string
 }
 
-type Status struct {
-	State       string // "pending", "success", "failure" or "error"
-	Description string
-	TargetURL   string
-}
-
-// GitHub is what the server needs from the GitHub API.
+// GitHub is what the server needs from the GitHub API: reads only. Results
+// are kept on the server, never written back to GitHub.
 type GitHub interface {
 	BranchHead(ctx context.Context, repo, branch string) (string, error)
 	OpenPulls(ctx context.Context, repo string) ([]PullRequest, error)
 	Pull(ctx context.Context, repo string, number int) (PullRequest, error)
-	SetStatus(ctx context.Context, repo, sha string, st Status) error
 	// Token authenticates git fetches.
 	Token() string
 }
 
-// tokenClient talks to GitHub with a personal access token. Check runs are
-// reserved to GitHub Apps, so results are reported as commit statuses.
+// tokenClient reads from GitHub with an access token.
 type tokenClient struct {
-	c       *github.Client
-	token   string
-	context string // status context
+	c     *github.Client
+	token string
 }
 
-func newTokenClient(token, statusContext string) (*tokenClient, error) {
-	c, err := github.NewClient(github.WithAuthToken(token))
+func newTokenClient(token string) (*tokenClient, error) {
+	c, err := github.NewClient(
+		github.WithTransport(readOnlyTransport{http.DefaultTransport}),
+		github.WithAuthToken(token),
+	)
 	if err != nil {
 		return nil, err
 	}
-	return &tokenClient{c: c, token: token, context: statusContext}, nil
+	return &tokenClient{c: c, token: token}, nil
+}
+
+// readOnlyTransport refuses any request that is not a read, so the server
+// cannot change anything on GitHub whatever the token would allow.
+type readOnlyTransport struct{ next http.RoundTripper }
+
+func (t readOnlyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		return nil, fmt.Errorf("refusing %s %s: the server only reads from GitHub", req.Method, req.URL.Path)
+	}
+	return t.next.RoundTrip(req)
 }
 
 func splitRepo(repo string) (owner, name string, err error) {
@@ -102,30 +109,6 @@ func (t *tokenClient) Pull(ctx context.Context, repo string, number int) (PullRe
 
 func toPullRequest(pr *github.PullRequest) PullRequest {
 	return PullRequest{Number: pr.GetNumber(), Base: pr.GetBase().GetRef(), HeadSHA: pr.GetHead().GetSHA()}
-}
-
-// maxDescriptionLen is GitHub's limit for a commit status description.
-const maxDescriptionLen = 140
-
-func (t *tokenClient) SetStatus(ctx context.Context, repo, sha string, st Status) error {
-	owner, name, err := splitRepo(repo)
-	if err != nil {
-		return err
-	}
-	desc := st.Description
-	if r := []rune(desc); len(r) > maxDescriptionLen {
-		desc = string(r[:maxDescriptionLen-1]) + "…"
-	}
-	status := github.RepoStatus{
-		State:       github.Ptr(st.State),
-		Description: github.Ptr(desc),
-		Context:     github.Ptr(t.context),
-	}
-	if st.TargetURL != "" {
-		status.TargetURL = github.Ptr(st.TargetURL)
-	}
-	_, _, err = t.c.Repositories.CreateStatus(ctx, owner, name, sha, status)
-	return err
 }
 
 func (t *tokenClient) Token() string { return t.token }

@@ -1,14 +1,23 @@
 # gnoreplay-server
 
-Replays gno.land mainnet's full history with the binary of each pushed commit and each PR on `gnolang/gno` and `gnolang/gno-fixes`, and reports every tx whose result would change as a commit status (`mainnet-replay`) linking to a page with the details.
+Replays gno.land mainnet's full history with the binary of each pushed commit and each PR on `gnolang/gno` and `gnolang/gno-fixes`, and lists every tx whose result would change.
 
-The status is **advisory**: it is not a required check, so it never blocks a merge. It fails when a commit would change a tx result or a block compared to its base branch, and passes otherwise, including when only gas usage changes (the description says how many txs).
+**It only reads from GitHub.** It polls instead of receiving webhooks, and its access token only needs read permissions; the GitHub client refuses any request other than a read, whatever the token allows. Results are published on the server's own pages, nowhere else:
 
-It works with a plain access token: it polls GitHub instead of receiving webhooks, and reports commit statuses rather than check runs (which only GitHub Apps can create).
+| Page | Shows |
+|---|---|
+| `/` | the latest replays and their results |
+| `/<owner>/<repo>/pull/<n>` | the latest replay of a PR (the same path as on GitHub) |
+| `/<owner>/<repo>/tree/<branch>` | the latest replay of a branch |
+| `/jobs/<id>` | one replay: what diverges, transaction by transaction |
+| `/reports/<id>` | its full JSON report |
+| `/queue` | pending replays |
+
+A commit *diverges* when it would change a tx result or a block compared to its base branch; gas-only changes don't count, but their number is shown.
 
 ## How a job runs
 
-1. Every `github.poll_interval`, the poller reads the head of each tracked branch and the open PRs of each tracked repo, and enqueues a replay for each new head: a push to a branch, a new PR, or a push to a PR. The commit gets a `pending` status.
+1. Every `github.poll_interval`, the poller reads the head of each tracked branch and the open PRs of each tracked repo, and enqueues a replay for each new head: a push to a branch, a new PR, or a push to a PR.
 2. A worker fetches the commit into a bare mirror (with the token, so private repos work), and extracts it.
 3. It copies [`gnoreplay/`](../gnoreplay/) into the checkout at `contribs/gnoreplay` and builds it there, so the replay runs that commit's application code.
 4. It copies the golden chain data (blockstore + state DBs, via reflinks) into the job dir and runs the replay with `GNOROOT` set to the checkout (stdlibs are read from disk at runtime).
@@ -16,7 +25,7 @@ It works with a plain access token: it polls GitHub instead of receiving webhook
    - **new** — diverges here, not on the base
    - **inherited** — diverges on the base too
    - **fixed** — diverges on the base, not here
-6. The commit status is set to the outcome, linking to `/jobs/<id>`: the new divergences first, then the fixed ones. The full JSON report is at `/reports/<id>`.
+6. The result is stored: `/jobs/<id>` lists the new divergences first, then the fixed ones.
 
 On its first pass over a repo, the poller only records PRs that are already open (replaying the backlog would take days); branches are replayed, as the baselines PRs are compared against. To replay an older PR, or re-run anything:
 
@@ -40,9 +49,7 @@ Priority, highest first (the `rules` config; these are the defaults):
 5. PRs to `master`
 6. PRs to `gno-fixes` `develop`
 
-Within a level, jobs run in arrival order. A new push to the same branch or PR supersedes the queued or running job for it (the old commit's status becomes `error`, "superseded"), so bursts of pushes don't pile up; closing a PR cancels its job. Jobs are not preempted by higher-priority arrivals.
-
-`GET /queue` lists pending jobs; jobs of private repos are shown without repo, branch or SHA.
+Within a level, jobs run in arrival order. A new push to the same branch or PR supersedes the queued or running job for it, so bursts of pushes don't pile up; closing a PR cancels its job. Jobs are not preempted by higher-priority arrivals.
 
 ## Deployment
 
@@ -51,17 +58,16 @@ What the box needs:
 - **A reference node**: a non-validator `gnoland` node on the mainnet binary, syncing continuously (see `misc/deployments/mainnet.gno.land/VALIDATOR.md`; its governance halts stop it during the initial sync — restart it each time). Every node stores per-height tx results in `state.db`: these are what replays are compared against.
 - **The golden copy**: `scripts/refresh-golden.sh` (timer, e.g. every 4h) stops the node, reflinks its `blockstore.db` and `state.db` into a new snapshot, restarts it and atomically repoints `golden`. Use XFS or btrfs so copies are instant and free.
 - **The server**: `go build` in this directory; config in `config.example.toml`. It runs on the host (not in a container), with git, and [microsandbox](https://microsandbox.dev) (`msb`, which needs KVM) for the job sandboxes in the example config. Each replay worker needs a 9 GB VM.
-- **A GitHub token** in `github.token_file`, able to read the tracked repos' contents and pull requests and write their commit statuses:
-  - fine-grained: repositories `gnolang/gno` (and `gnolang/gno-fixes`), permissions *Contents: read*, *Pull requests: read*, *Commit statuses: read and write* (the org may need to approve it);
-  - or classic: `repo:status` is enough for public repos; `repo` for `gno-fixes`.
-
-  Statuses are posted as the token's owner: use a bot account beyond a demo.
+- **A read-only GitHub token** in `github.token_file`, for the GitHub API's rate limit and for private repos:
+  - fine-grained (preferred): repositories `gnolang/gno` and `gnolang/gno-fixes`, permissions *Contents: read-only* and *Pull requests: read-only* (the org may need to approve it);
+  - or classic with **no scopes**, if only public repos are tracked: it can read them, and nothing else. (A classic token that can read a private repo needs the `repo` scope, which can also write: don't.)
+- **A viewer key** in `viewer_key_file`, if private repos are tracked: anyone who opens a page once with `?key=<key>` can see their results (it is kept in a cookie). Without it, they are not served at all.
 
 ### Security
 
-PR code is untrusted and runs on the box. Builds and replays run in microsandbox VMs that mount only the data dir, with a minimal environment; the replay VM has no network. The token never enters a VM: it goes to `git fetch` (on the host) through that command's environment only. Keep the token file outside `data_dir`.
+PR code is untrusted and runs on the box. Builds and replays run in microsandbox VMs that mount only the data dir, with a minimal environment; the replay VM has no network. The token never enters a VM: it goes to `git fetch` (on the host) through that command's environment only. Keep the token and viewer key files outside `data_dir`.
 
-Private repos' job pages and reports need the job's secret (`?k=…`), which only the commit status, visible to the repo's members, links to.
+The server never writes to GitHub: its client refuses any request other than `GET`/`HEAD` before it leaves the process (`TestTokenClientReadOnly`), and git only fetches.
 
 ## Development
 
@@ -69,4 +75,6 @@ Private repos' job pages and reports need the job's secret (`?k=…`), which onl
 go test ./...
 ```
 
-`TestServerEndToEnd` drives the whole pipeline — polling, queue, supersede and cancel, git fetch, build, chain data copy, replay, baseline classification, commit statuses, job pages and reports, private-repo links — with local git remotes, a fake GitHub and a stand-in `gnoreplay`.
+`TestServerEndToEnd` drives the whole pipeline — polling, queue, supersede and cancel, git fetch, build, chain data copy, replay, baseline classification, result pages and reports, the viewer key — with local git remotes, a fake GitHub and a stand-in `gnoreplay`.
+
+`TestTokenClientLive` reads `gnolang/gno` through the real API when `GNOREPLAY_LIVE_TOKEN` is set.

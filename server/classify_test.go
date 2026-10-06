@@ -42,14 +42,14 @@ func TestRender(t *testing.T) {
 	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 100, Blocks: 100, Txs: 5}
 
 	out := render(job, clean, classify(clean, clean), "")
-	assert.Equal(t, "success", out.State)
-	assert.Contains(t, out.Description, "replays identically")
+	assert.Equal(t, outcomePass, out.Outcome)
+	assert.Contains(t, out.Summary, "replays identically")
 
-	// Gas-only changes don't fail the status, but are reported.
+	// Gas-only changes don't count as diverging, but are reported.
 	gasOnly := &Report{ChainID: "gnoland-1", ToHeight: 100, Diffs: []Diff{{Kind: "gas", Height: 3, Index: 0, Detail: "gas_used 1 -> 2"}}}
 	out = render(job, gasOnly, classify(gasOnly, clean), "")
-	assert.Equal(t, "success", out.State)
-	assert.Contains(t, out.Description, "1 tx(s) use different gas")
+	assert.Equal(t, outcomePass, out.Outcome)
+	assert.Contains(t, out.Summary, "1 tx(s) use different gas")
 	assert.Contains(t, out.Body, "gas_used 1 -> 2")
 
 	broken := &Report{ChainID: "gnoland-1", ToHeight: 100, FirstAppHashMismatch: 7, Diffs: []Diff{
@@ -60,8 +60,8 @@ func TestRender(t *testing.T) {
 		},
 	}}
 	out = render(job, broken, classify(broken, clean), "https://replay.example/reports/1")
-	assert.Equal(t, "failure", out.State)
-	assert.Contains(t, out.Description, "2 new divergence(s) from gnoland-1 history (advisory)")
+	assert.Equal(t, outcomeDiverges, out.Outcome)
+	assert.Contains(t, out.Summary, "2 new divergence(s) from gnoland-1 history")
 	assert.Contains(t, out.Body, "First app hash mismatch at height **7**")
 	assert.Contains(t, out.Body, "https://replay.example/reports/1")
 	// Root causes are listed before diffs after the divergence.
@@ -70,8 +70,8 @@ func TestRender(t *testing.T) {
 
 	// Inherited-only divergences don't flag the PR.
 	out = render(job, broken, classify(broken, broken), "")
-	assert.Equal(t, "success", out.State)
-	assert.Contains(t, out.Description, "2 inherited from master")
+	assert.Equal(t, outcomePass, out.Outcome)
+	assert.Contains(t, out.Summary, "2 inherited from master")
 }
 
 func indexOf(s, sub string) int {

@@ -10,11 +10,15 @@ import (
 )
 
 type Config struct {
-	// Listen is the address of the HTTP server serving job pages and reports.
+	// Listen is the address of the HTTP server serving the results.
 	Listen string `toml:"listen"`
-	// PublicURL is how GitHub users reach this server; commit statuses link
-	// to job pages built from it. Empty disables the links.
+	// PublicURL is how users reach this server; reports link to each other
+	// with it. Empty disables the links.
 	PublicURL string `toml:"public_url"`
+	// ViewerKeyFile holds a key that unlocks the results of repos without
+	// public_reports (pass it once as ?key=, it is then kept in a cookie).
+	// Without it, those results are not served at all.
+	ViewerKeyFile string `toml:"viewer_key_file"`
 	// DataDir holds the job DB, git mirrors, job work dirs and reports.
 	DataDir string `toml:"data_dir"`
 	// Workers is the number of replays run concurrently.
@@ -34,10 +38,9 @@ type Config struct {
 
 type GitHubConfig struct {
 	// TokenFile holds a GitHub token that can read the tracked repos'
-	// contents and pull requests, and write their commit statuses.
+	// contents and pull requests. The server never writes to GitHub, so the
+	// token should not be able to either.
 	TokenFile string `toml:"token_file"`
-	// StatusContext names the commit status posted on commits.
-	StatusContext string `toml:"status_context"`
 	// PollInterval is how often tracked branches and open PRs are polled.
 	PollInterval Duration `toml:"poll_interval"`
 	// GitURL is prefixed to "owner/name.git" to fetch commits.
@@ -85,10 +88,8 @@ type Rule struct {
 }
 
 type RepoConfig struct {
-	// PublicReports serves this repo's job pages and reports to anyone, and
-	// lists its jobs on /queue. Otherwise a job's page and report need the
-	// job's secret, which only its commit status links to: keep false for
-	// private repos.
+	// PublicReports shows this repo's results to anyone. Otherwise they need
+	// the viewer key: keep false for private repos.
 	PublicReports bool `toml:"public_reports"`
 }
 
@@ -139,9 +140,6 @@ func (c *Config) setDefaults() {
 	}
 	if c.GitHub.GitURL == "" {
 		c.GitHub.GitURL = "https://github.com/"
-	}
-	if c.GitHub.StatusContext == "" {
-		c.GitHub.StatusContext = "mainnet-replay"
 	}
 	if c.GitHub.PollInterval.Duration == 0 {
 		c.GitHub.PollInterval.Duration = 2 * time.Minute

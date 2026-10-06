@@ -81,7 +81,7 @@ func (s *Server) pollRepo(ctx context.Context, repo string) error {
 		// on demand). Branches are always replayed, as the baselines PRs are
 		// compared against.
 		if synced || h.event == eventPush {
-			if err := s.enqueueFor(ctx, repo, h.event, h.branch, h.pr, h.sha); err != nil {
+			if err := s.enqueueFor(repo, h.event, h.branch, h.pr, h.sha); err != nil {
 				return err
 			}
 		}
@@ -115,12 +115,12 @@ func (s *Server) pollRepo(ctx context.Context, repo string) error {
 	return nil
 }
 
-func (s *Server) enqueueFor(ctx context.Context, repo, event, branch string, pr int, sha string) error {
+func (s *Server) enqueueFor(repo, event, branch string, pr int, sha string) error {
 	prio, ok := s.cfg.priority(repo, event, branch)
 	if !ok {
 		return fmt.Errorf("no rule for %s %s %s", repo, event, branch)
 	}
-	return s.enqueue(ctx, &Job{
+	return s.enqueue(&Job{
 		Key: jobKey(repo, event, branch, pr), Repo: repo, Event: event, Branch: branch,
 		PR: pr, SHA: sha, Priority: prio,
 	})

@@ -1,18 +1,20 @@
 # gnoreplay-server configuration. Paths are on the replay box.
 
 listen = ":8080"
-# How GitHub users reach this server: commit statuses link to job pages here.
+# How users reach this server (results are only published here).
 public_url = "https://replay.example.org"
+# Unlocks the results of repos without public_reports: open any page once
+# with ?key=<key>. Without it, those results are not served at all.
+viewer_key_file = "/etc/gnoreplay/viewer-key"
 data_dir = "/var/lib/gnoreplay"
 # Replays run concurrently. Each needs a 9G VM (see run_sandbox) and uses
 # ~1-2 cores; size to RAM first.
 workers = 2
 
 [github]
-# A token that can read the tracked repos' contents and pull requests and
-# write their commit statuses (see README.md).
+# A read-only token for the tracked repos' contents and pull requests (see
+# README.md). The server never writes to GitHub.
 token_file = "/etc/gnoreplay/github-token"
-status_context = "mainnet-replay"
 # Each poll costs one API call per tracked branch, plus one per 100 open PRs
 # per repo.
 poll_interval = "2m"
@@ -58,8 +60,8 @@ run_timeout = "4h"
 public_reports = true
 
 [repos."gnolang/gno-fixes"]
-# Private repo: a job's page and report are only reachable through the
-# secret link in its commit status, and /queue hides its jobs' details.
+# Private repo: its results need the viewer key, and /queue hides its jobs'
+# details from everyone else.
 public_reports = false
 
 # Priority rules (first match wins; earlier runs first). These are the

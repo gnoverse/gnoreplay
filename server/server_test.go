@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -19,17 +20,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeGitHub serves branch heads and open PRs from memory and records the
-// commit statuses set.
+// fakeGitHub serves branch heads and open PRs from memory. The GitHub
+// interface has no write methods: nothing goes back to GitHub.
 type fakeGitHub struct {
 	mu       sync.Mutex
 	branches map[string]string // "repo@branch" -> sha
 	pulls    map[string][]PullRequest
-	statuses map[string][]Status // sha -> statuses, in order
 }
 
 func newFakeGitHub() *fakeGitHub {
-	return &fakeGitHub{branches: map[string]string{}, pulls: map[string][]PullRequest{}, statuses: map[string][]Status{}}
+	return &fakeGitHub{branches: map[string]string{}, pulls: map[string][]PullRequest{}}
 }
 
 func (f *fakeGitHub) BranchHead(_ context.Context, repo, branch string) (string, error) {
@@ -59,23 +59,7 @@ func (f *fakeGitHub) Pull(_ context.Context, repo string, number int) (PullReque
 	return PullRequest{}, fmt.Errorf("no PR %d", number)
 }
 
-func (f *fakeGitHub) SetStatus(_ context.Context, _, sha string, st Status) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.statuses[sha] = append(f.statuses[sha], st)
-	return nil
-}
-
 func (f *fakeGitHub) Token() string { return "token" }
-
-func (f *fakeGitHub) last(sha string) Status {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if s := f.statuses[sha]; len(s) > 0 {
-		return s[len(s)-1]
-	}
-	return Status{}
-}
 
 func (f *fakeGitHub) setPulls(repo string, prs ...PullRequest) {
 	f.mu.Lock()
@@ -212,6 +196,7 @@ func TestServerEndToEnd(t *testing.T) {
 	defer q.Close()
 	gh := newFakeGitHub()
 	srv := newServer(cfg, q, gh, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv.viewerKey = "viewer-key"
 	httpSrv := httptest.NewServer(srv.routes())
 	defer httpSrv.Close()
 
@@ -228,17 +213,20 @@ func TestServerEndToEnd(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, j)
 		srv.runJob(ctx, j)
-		return j
+		done, err := q.Get(j.ID)
+		require.NoError(t, err)
+		return done
 	}
-	get := func(url string) (int, string) {
+	get := func(client *http.Client, path string) (int, string) {
 		t.Helper()
-		res, err := http.Get(strings.Replace(url, "https://replay.example", httpSrv.URL, 1))
+		res, err := client.Get(httpSrv.URL + path)
 		require.NoError(t, err)
 		defer res.Body.Close()
 		bz, err := io.ReadAll(res.Body)
 		require.NoError(t, err)
 		return res.StatusCode, string(bz)
 	}
+	anon := &http.Client{}
 
 	// First pass: tracked branches are replayed (they are the baselines);
 	// PRs already open are only recorded.
@@ -253,8 +241,6 @@ func TestServerEndToEnd(t *testing.T) {
 	pending, err := q.Pending()
 	require.NoError(t, err)
 	require.Len(t, pending, 3, "the three tracked branches")
-	assert.Equal(t, "pending", gh.last(shaMaster).State)
-	assert.Empty(t, gh.statuses[shaOldPR], "PRs open before the first pass are not replayed")
 
 	// Nothing changed: nothing new.
 	poll()
@@ -265,10 +251,8 @@ func TestServerEndToEnd(t *testing.T) {
 	assert.Equal(t, "gnolang/gno#branch/chain/mainnet", mainnetJob.Key, "priority 1 first")
 	assert.Equal(t, "gnolang/gno#branch/master", masterJob.Key)
 	assert.Equal(t, "gnolang/gno-fixes#branch/develop", fixesJob.Key)
-	st := gh.last(shaMaster)
-	assert.Equal(t, "success", st.State, st.Description)
-	assert.Contains(t, st.Description, "replays identically")
-	assert.Equal(t, fmt.Sprintf("https://replay.example/jobs/%d", masterJob.ID), st.TargetURL, "public repo: no secret in the link")
+	assert.Equal(t, outcomePass, masterJob.Outcome)
+	assert.Contains(t, masterJob.Summary, "replays identically")
 
 	// A PR is opened, then pushed to before its replay starts: the newer
 	// head supersedes the first.
@@ -277,50 +261,71 @@ func TestServerEndToEnd(t *testing.T) {
 		PullRequest{Number: 7, Base: "master", HeadSHA: shaPR},
 	)
 	poll()
-	assert.Equal(t, "pending", gh.last(shaPR).State)
 	gh.setPulls("gnolang/gno",
 		PullRequest{Number: 5, Base: "master", HeadSHA: shaOldPR},
 		PullRequest{Number: 7, Base: "master", HeadSHA: shaPR2},
 	)
 	poll()
-	assert.Equal(t, "error", gh.last(shaPR).State)
-	assert.Contains(t, gh.last(shaPR).Description, "superseded by "+shaPR2[:9])
-
 	prJob := runNext()
 	assert.Equal(t, shaPR2, prJob.SHA)
-	st = gh.last(shaPR2)
-	assert.Equal(t, "failure", st.State, "a new result divergence fails the (non-required) status")
-	assert.Contains(t, st.Description, "1 new divergence(s) from gnoland-1 history")
-	assert.LessOrEqual(t, len([]rune(st.Description)), maxDescriptionLen)
+	assert.Equal(t, outcomeDiverges, prJob.Outcome)
+	assert.Contains(t, prJob.Summary, "1 new divergence(s) from gnoland-1 history")
 
-	code, page := get(st.TargetURL)
+	// Results are on the server: the PR's GitHub path leads to its latest
+	// replay, whose page lists the divergence.
+	code, page := get(anon, "/gnolang/gno/pull/7")
 	require.Equal(t, http.StatusOK, code)
 	assert.Contains(t, page, "Replay of gnolang/gno PR #7 (into master)")
+	assert.Contains(t, page, shaPR2)
 	assert.Contains(t, page, "gno.land/r/demo/foo.Bar")
 	assert.Contains(t, page, "vm.VMError:")
 	assert.NotContains(t, page, "<script>", "tx errors are not rendered as HTML")
-	code, report := get(fmt.Sprintf("https://replay.example/reports/%d", prJob.ID))
+	code, page = get(anon, "/gnolang/gno/tree/chain/mainnet")
+	require.Equal(t, http.StatusOK, code)
+	assert.Contains(t, page, "Replay of gnolang/gno branch chain/mainnet")
+	code, _ = get(anon, "/gnolang/gno/pull/99")
+	assert.Equal(t, http.StatusNotFound, code)
+	code, report := get(anon, fmt.Sprintf("/reports/%d", prJob.ID))
 	require.Equal(t, http.StatusOK, code)
 	var served Report
 	require.NoError(t, json.Unmarshal([]byte(report), &served))
 	assert.Len(t, served.Diffs, 1)
 
-	// A PR of the private repo: its page needs the job's secret, which only
-	// its status links to.
+	// The superseded first push is listed as not checked.
+	code, index := get(anon, "/")
+	require.Equal(t, http.StatusOK, code)
+	assert.Contains(t, index, "✗ 1 new divergence(s)")
+	assert.Contains(t, index, "not checked: superseded")
+	assert.Contains(t, index, shaPR[:9])
+
+	// A PR of the private repo: invisible without the viewer key.
 	gh.setPulls("gnolang/gno-fixes", PullRequest{Number: 3, Base: "develop", HeadSHA: shaFixesPR})
 	poll()
 	fixesPR := runNext()
-	st = gh.last(shaFixesPR)
-	assert.Equal(t, "failure", st.State)
-	assert.Contains(t, st.TargetURL, "?k="+fixesPR.Secret)
-	code, _ = get(st.TargetURL)
-	assert.Equal(t, http.StatusOK, code)
-	code, _ = get(fmt.Sprintf("https://replay.example/jobs/%d", fixesPR.ID))
-	assert.Equal(t, http.StatusNotFound, code)
-	code, _ = get(fmt.Sprintf("https://replay.example/jobs/%d?k=wrong", fixesPR.ID))
-	assert.Equal(t, http.StatusNotFound, code)
-	code, _ = get(fmt.Sprintf("https://replay.example/reports/%d", fixesPR.ID))
-	assert.Equal(t, http.StatusNotFound, code)
+	assert.Equal(t, outcomeDiverges, fixesPR.Outcome)
+	for _, path := range []string{
+		fmt.Sprintf("/jobs/%d", fixesPR.ID), fmt.Sprintf("/reports/%d", fixesPR.ID),
+		"/gnolang/gno-fixes/pull/3", fmt.Sprintf("/jobs/%d?key=wrong", fixesPR.ID),
+	} {
+		code, _ = get(anon, path)
+		assert.Equal(t, http.StatusNotFound, code, path)
+	}
+	_, index = get(anon, "/")
+	assert.NotContains(t, index, "gno-fixes")
+	_, queue := get(anon, "/queue")
+	assert.NotContains(t, queue, "gno-fixes")
+
+	// With the key once, a cookie keeps the private results visible.
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+	viewer := &http.Client{Jar: jar}
+	code, _ = get(viewer, "/?key=viewer-key")
+	require.Equal(t, http.StatusOK, code)
+	code, page = get(viewer, "/gnolang/gno-fixes/pull/3")
+	require.Equal(t, http.StatusOK, code)
+	assert.Contains(t, page, "Replay of gnolang/gno-fixes PR #3 (into develop)")
+	_, index = get(viewer, "/")
+	assert.Contains(t, index, "gnolang/gno-fixes")
 
 	// A PR closed while queued is cancelled.
 	gh.setPulls("gnolang/gno",
@@ -336,16 +341,32 @@ func TestServerEndToEnd(t *testing.T) {
 	assert.Empty(t, pending)
 
 	// A PR open since before the first pass can be replayed on demand.
-	require.NoError(t, srv.enqueueFor(ctx, "gnolang/gno", eventPullRequest, "master", 5, shaOldPR))
+	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPullRequest, "master", 5, shaOldPR))
 	oldPR := runNext()
 	assert.Equal(t, "gnolang/gno#pr/5", oldPR.Key)
-	assert.Equal(t, "success", gh.last(shaOldPR).State)
+	assert.Equal(t, outcomePass, oldPR.Outcome)
 
 	// Job dirs are removed; reports are kept; cleanup ran for every job.
 	for _, j := range []*Job{mainnetJob, masterJob, fixesJob, prJob, fixesPR, oldPR} {
 		_, err = os.Stat(filepath.Join(cfg.DataDir, "jobs", fmt.Sprint(j.ID)))
 		assert.True(t, os.IsNotExist(err))
 		assert.FileExists(t, filepath.Join(root, fmt.Sprintf("cleaned-%d", j.ID)))
+	}
+}
+
+func TestNoViewerKey(t *testing.T) {
+	cfg := &Config{DataDir: t.TempDir()}
+	cfg.setDefaults()
+	q := newTestQueue(t)
+	srv := newServer(cfg, q, newFakeGitHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, srv.enqueueFor("gnolang/gno-fixes", eventPush, "develop", 0, "abc"))
+
+	// Without a configured key, no key unlocks private results, not even an
+	// empty one.
+	for _, path := range []string{"/jobs/1", "/jobs/1?key=", "/gnolang/gno-fixes/tree/develop"} {
+		rec := httptest.NewRecorder()
+		srv.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		assert.Equal(t, http.StatusNotFound, rec.Code, path)
 	}
 }
 
