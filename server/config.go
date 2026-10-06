@@ -21,12 +21,16 @@ type Config struct {
 	ViewerKeyFile string `toml:"viewer_key_file"`
 	// DataDir holds the job DB, git mirrors, job work dirs and reports.
 	DataDir string `toml:"data_dir"`
-	// Workers is the number of replays run concurrently.
+	// Workers is the number of replays run concurrently: local sandboxes, or
+	// worker droplets with [digitalocean].
 	Workers int `toml:"workers"`
 
 	GitHub GitHubConfig `toml:"github"`
 	Chain  ChainConfig  `toml:"chain"`
 	Job    JobConfig    `toml:"job"`
+	// DigitalOcean, when set, runs each replay on its own worker droplet
+	// instead of in a local sandbox.
+	DigitalOcean *DigitalOceanConfig `toml:"digitalocean"`
 
 	// Rules select what is replayed and its priority: the first matching rule
 	// wins, and its position is the priority (earlier runs first). Branches
@@ -45,6 +49,35 @@ type GitHubConfig struct {
 	PollInterval Duration `toml:"poll_interval"`
 	// GitURL is prefixed to "owner/name.git" to fetch commits.
 	GitURL string `toml:"git_url"`
+}
+
+// DigitalOceanConfig runs replays on disposable droplets: the droplet is the
+// sandbox. Each gets a startup script that downloads the job's inputs from the
+// coordinator over the private network, replays, and posts back the report;
+// the coordinator then deletes it.
+type DigitalOceanConfig struct {
+	// TokenFile holds an API token that can create, read and delete droplets.
+	TokenFile string `toml:"token_file"`
+	Region    string `toml:"region"`
+	Size      string `toml:"size"`
+	Image     string `toml:"image"`
+	// VPCUUID is the private network workers join. Use a VPC of their own:
+	// PR code runs on them and can reach anything else in it.
+	VPCUUID string `toml:"vpc_uuid"`
+	// SSHKeys are key fingerprints (or IDs) set on workers. One is required:
+	// without it, DigitalOcean emails a root password for every droplet.
+	SSHKeys []string `toml:"ssh_keys"`
+	// Tag marks the worker droplets, for firewalls and cleanup.
+	Tag string `toml:"tag"`
+	// Listen is the coordinator's private address that workers download
+	// their inputs from, and URL how they reach it ("http://10.x.y.z:8081").
+	Listen string `toml:"listen"`
+	URL    string `toml:"url"`
+	// GoVersion is the Go toolchain installed on workers (newer versions
+	// required by a tree are fetched automatically).
+	GoVersion string `toml:"go_version"`
+	// GoMemLimit is the replay's GOMEMLIMIT on the worker.
+	GoMemLimit string `toml:"go_mem_limit"`
 }
 
 type ChainConfig struct {
@@ -156,6 +189,23 @@ func (c *Config) setDefaults() {
 	if c.Job.RunTimeout.Duration == 0 {
 		c.Job.RunTimeout.Duration = 4 * time.Hour
 	}
+	if do := c.DigitalOcean; do != nil {
+		if do.Size == "" {
+			do.Size = "m-2vcpu-16gb"
+		}
+		if do.Image == "" {
+			do.Image = "ubuntu-24-04-x64"
+		}
+		if do.Tag == "" {
+			do.Tag = "gnoreplay-worker"
+		}
+		if do.GoVersion == "" {
+			do.GoVersion = "1.26.1"
+		}
+		if do.GoMemLimit == "" {
+			do.GoMemLimit = "12GiB"
+		}
+	}
 }
 
 func (c *Config) validate() error {
@@ -170,6 +220,18 @@ func (c *Config) validate() error {
 		return fmt.Errorf("github.token_file is required")
 	case c.Job.GnoreplayOverlay == "":
 		return fmt.Errorf("job.gnoreplay_overlay is required")
+	}
+	if do := c.DigitalOcean; do != nil {
+		switch {
+		case do.TokenFile == "" || do.Region == "":
+			return fmt.Errorf("digitalocean.token_file and digitalocean.region are required")
+		case do.VPCUUID == "":
+			return fmt.Errorf("digitalocean.vpc_uuid is required: workers must not share a private network")
+		case len(do.SSHKeys) == 0:
+			return fmt.Errorf("digitalocean.ssh_keys is required (otherwise every droplet's root password is emailed)")
+		case do.Listen == "" || do.URL == "":
+			return fmt.Errorf("digitalocean.listen and digitalocean.url are required")
+		}
 	}
 	for i, r := range c.Rules {
 		if r.Event != eventPush && r.Event != eventPullRequest {

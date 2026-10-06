@@ -1,0 +1,13 @@
+[Unit]
+Description=gnoreplay server
+After=network-online.target gnoland.service
+Wants=network-online.target
+
+[Service]
+User=gnoreplay
+ExecStart=/opt/gnoreplay/bin/gnoreplay-server -config /etc/gnoreplay/config.toml
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

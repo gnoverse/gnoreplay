@@ -25,16 +25,23 @@ type Server struct {
 	// viewerKey unlocks the results of repos without public reports; empty
 	// means they are not served.
 	viewerKey string
+	// prov, when set, runs replays on worker machines (see remote.go);
+	// otherwise they run locally in the job sandboxes.
+	prov Provisioner
 
 	// wake is signaled when a job is enqueued.
 	wake chan struct{}
 
-	mu      sync.Mutex
-	running map[int64]context.CancelFunc
+	mu       sync.Mutex
+	running  map[int64]context.CancelFunc
+	sessions map[int64]*session // remote jobs waiting for their worker
 }
 
 func newServer(cfg *Config, q *Queue, gh GitHub, logger *slog.Logger) *Server {
-	return &Server{cfg: cfg, queue: q, gh: gh, logger: logger, wake: make(chan struct{}, 1), running: map[int64]context.CancelFunc{}}
+	return &Server{
+		cfg: cfg, queue: q, gh: gh, logger: logger,
+		wake: make(chan struct{}, 1), running: map[int64]context.CancelFunc{}, sessions: map[int64]*session{},
+	}
 }
 
 func (s *Server) reportsDir() string { return filepath.Join(s.cfg.DataDir, "reports") }
@@ -188,7 +195,6 @@ func (s *Server) replay(ctx context.Context, j *Job, logger *slog.Logger) (*Repo
 	// 2. Tool: the server's copy, built against the commit's tree. (Not the
 	// commit's own contribs/gnoreplay, if it ever has one: the commit is
 	// what is being checked.)
-	step("build")
 	toolDir := filepath.Join(src, "contribs", "gnoreplay")
 	if err := os.RemoveAll(toolDir); err != nil {
 		return nil, "", err
@@ -196,39 +202,65 @@ func (s *Server) replay(ctx context.Context, j *Job, logger *slog.Logger) (*Repo
 	if err := copyDir(s.cfg.Job.GnoreplayOverlay, toolDir); err != nil {
 		return nil, "", fmt.Errorf("copy gnoreplay: %w", err)
 	}
+
+	// 3. Build and replay, here or on a worker machine.
+	if err := os.MkdirAll(s.reportsDir(), 0o755); err != nil {
+		return nil, "", err
+	}
+	reportFile := filepath.Join(jobDir, "report.json")
+	if s.prov != nil {
+		step("replay on a worker machine")
+		if err := s.replayRemote(ctx, j, src, reportFile, logFile); err != nil {
+			return nil, "", err
+		}
+	} else if err := s.replayLocal(ctx, j, jobDir, src, reportFile, logFile, step); err != nil {
+		return nil, "", err
+	}
+
+	reportPath := filepath.Join(s.reportsDir(), fmt.Sprintf("%d.json", j.ID))
+	if err := os.Rename(reportFile, reportPath); err != nil {
+		return nil, "", err
+	}
+	report, err := readReport(reportPath)
+	return report, reportPath, err
+}
+
+// replayLocal builds the tool in src and replays in the local job sandboxes,
+// saving the report to reportFile.
+func (s *Server) replayLocal(ctx context.Context, j *Job, jobDir, src, reportFile string, logFile io.Writer, step func(string)) error {
+	step("build")
+	toolDir := filepath.Join(src, "contribs", "gnoreplay")
 	bin := filepath.Join(jobDir, "gnoreplay")
 	buildCtx, cancel := context.WithTimeout(ctx, s.cfg.Job.BuildTimeout.Duration)
 	defer cancel()
 	// The tool's go.sum was resolved against another tree. go -C rather than
 	// the process's dir: a VM sandbox doesn't inherit it.
 	if err := s.run(buildCtx, sandbox(s.cfg.Job.BuildSandbox, j, src), toolDir, nil, logFile, "go", "-C", toolDir, "mod", "tidy"); err != nil {
-		return nil, "", fmt.Errorf("go mod tidy: %w", err)
+		return fmt.Errorf("go mod tidy: %w", err)
 	}
 	if err := s.run(buildCtx, sandbox(s.cfg.Job.BuildSandbox, j, src), toolDir, nil, logFile, "go", "-C", toolDir, "build", "-o", bin, "."); err != nil {
-		return nil, "", fmt.Errorf("build: %w", err)
+		return fmt.Errorf("build: %w", err)
 	}
 
-	// 3. Chain data: a private copy, as the replay opens it exclusively.
+	// A private copy of the chain data: the replay opens it exclusively.
 	step("copy chain data")
 	dataDir := filepath.Join(jobDir, "data")
 	if err := os.MkdirAll(filepath.Join(dataDir, "db"), 0o755); err != nil {
-		return nil, "", err
+		return err
 	}
 	for _, name := range []string{"blockstore.db", "state.db"} {
 		args := substitute(s.cfg.Job.CopyCommand,
 			"{src}", filepath.Join(s.cfg.Chain.GoldenDir, "db", name),
 			"{dst}", filepath.Join(dataDir, "db", name))
 		if err := s.run(ctx, nil, jobDir, nil, logFile, args[0], args[1:]...); err != nil {
-			return nil, "", fmt.Errorf("copy %s: %w", name, err)
+			return fmt.Errorf("copy %s: %w", name, err)
 		}
 	}
 
-	// 4. Replay.
 	step("replay")
-	reportFile := filepath.Join(jobDir, "report.json")
 	runCtx, cancelRun := context.WithTimeout(ctx, s.cfg.Job.RunTimeout.Duration)
 	defer cancelRun()
-	err = s.run(runCtx, sandbox(s.cfg.Job.RunSandbox, j, src), jobDir, []string{"GNOROOT=" + src}, logFile, bin,
+	err := s.run(runCtx, sandbox(s.cfg.Job.RunSandbox, j, src), jobDir, []string{"GNOROOT=" + src}, logFile, bin,
 		"--data-dir", dataDir,
 		"--genesis", s.cfg.Chain.Genesis,
 		"--work-dir", filepath.Join(jobDir, "work"),
@@ -241,18 +273,9 @@ func (s *Server) replay(ctx context.Context, j *Job, logger *slog.Logger) (*Repo
 		err = nil // diffs found: that's a result, not a failure
 	}
 	if err != nil {
-		return nil, "", fmt.Errorf("gnoreplay: %w", err)
+		return fmt.Errorf("gnoreplay: %w", err)
 	}
-
-	if err := os.MkdirAll(s.reportsDir(), 0o755); err != nil {
-		return nil, "", err
-	}
-	reportPath := filepath.Join(s.reportsDir(), fmt.Sprintf("%d.json", j.ID))
-	if err := os.Rename(reportFile, reportPath); err != nil {
-		return nil, "", err
-	}
-	report, err := readReport(reportPath)
-	return report, reportPath, err
+	return nil
 }
 
 // checkout extracts j.SHA into dst, fetching it into a per-repo bare mirror.

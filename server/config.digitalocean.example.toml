@@ -1,0 +1,45 @@
+# gnoreplay-server on a DigitalOcean coordinator droplet, running each replay
+# on its own worker droplet. See deploy/README.md.
+
+listen = "127.0.0.1:8080"   # behind Caddy, which serves it with TLS
+public_url = "https://replay.example.org"
+viewer_key_file = "/etc/gnoreplay/viewer-key"
+data_dir = "/var/lib/gnoreplay"
+# Worker droplets at once: each costs $0.125/h while it replays (~2 h).
+workers = 2
+
+[github]
+token_file = "/etc/gnoreplay/github-token"
+poll_interval = "2m"
+
+[chain]
+golden_dir = "/var/lib/gnoreplay/golden"
+genesis = "/var/lib/gnoreplay/genesis.json"
+
+[job]
+gnoreplay_overlay = "/opt/gnoreplay/gnoreplay"
+run_timeout = "4h"
+
+[digitalocean]
+# A token with droplet create/read/delete (and tag create/read) scopes.
+token_file = "/etc/gnoreplay/digitalocean-token"
+region = "fra1"
+size = "m-2vcpu-16gb"
+image = "ubuntu-24-04-x64"
+# The VPC the coordinator and workers share, used by nothing else.
+vpc_uuid = "00000000-0000-0000-0000-000000000000"
+# SSH key fingerprints set on workers (none set means DigitalOcean emails a
+# root password for every worker).
+ssh_keys = ["aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99"]
+tag = "gnoreplay-worker"
+# The coordinator's private (VPC) address, where workers fetch their inputs.
+listen = "10.110.0.2:8081"
+url = "http://10.110.0.2:8081"
+go_version = "1.26.1"
+go_mem_limit = "12GiB"
+
+[repos."gnolang/gno"]
+public_reports = true
+
+[repos."gnolang/gno-fixes"]
+public_reports = false

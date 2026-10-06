@@ -78,10 +78,20 @@ func setup(configPath string, logger *slog.Logger) (*Server, func(), error) {
 	}
 	srv := newServer(cfg, q, gh, logger)
 	srv.viewerKey = strings.TrimSpace(string(viewerKey))
+	if do := cfg.DigitalOcean; do != nil {
+		token, err := os.ReadFile(do.TokenFile)
+		if err != nil {
+			q.Close()
+			return nil, nil, fmt.Errorf("read digitalocean token: %w", err)
+		}
+		srv.prov = newDOProvisioner(strings.TrimSpace(string(token)), do)
+	}
 	return srv, func() { q.Close() }, nil
 }
 
 func serve(ctx context.Context, configPath string, logger *slog.Logger) error {
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
 	srv, closeFn, err := setup(configPath, logger)
 	if err != nil {
 		return err
@@ -94,6 +104,30 @@ func serve(ctx context.Context, configPath string, logger *slog.Logger) error {
 	}
 
 	var wg sync.WaitGroup
+	if srv.prov != nil {
+		// Interrupted jobs were requeued: no machine is in use yet, so any
+		// left over is deleted before new ones are created.
+		if err := srv.reap(ctx); err != nil {
+			return fmt.Errorf("reap worker machines: %w", err)
+		}
+		wg.Go(func() { srv.reapLoop(ctx, 10*time.Minute) })
+		workerSrv := &http.Server{
+			Addr:              srv.cfg.DigitalOcean.Listen,
+			Handler:           srv.workerRoutes(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			<-ctx.Done()
+			workerSrv.Close()
+		}()
+		go func() {
+			if err := workerSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("worker endpoint", "err", err)
+				stop()
+			}
+		}()
+		logger.Info("worker machines", "provider", "digitalocean", "endpoint", srv.cfg.DigitalOcean.Listen)
+	}
 	for range srv.cfg.Workers {
 		wg.Go(func() { srv.work(ctx) })
 	}

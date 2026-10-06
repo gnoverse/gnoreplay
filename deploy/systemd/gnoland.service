@@ -1,0 +1,21 @@
+# The mainnet reference node: its blocks and recorded tx results are what
+# replays run and are compared against.
+[Unit]
+Description=gno.land mainnet reference node (gnoreplay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=gnoreplay
+ExecStart=/opt/gnoreplay/bin/gnoland start \
+  --data-dir /var/lib/gnoland \
+  --genesis /var/lib/gnoreplay/genesis.json \
+  --chainid gnoland-1 \
+  --skip-genesis-sig-verification \
+  --log-level error
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

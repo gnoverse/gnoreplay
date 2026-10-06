@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh gnoreplay golden chain data every 4 hours
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=4h
+
+[Install]
+WantedBy=timers.target

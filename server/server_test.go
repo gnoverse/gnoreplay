@@ -78,6 +78,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -92,11 +93,16 @@ func main() {
 		panic(err)
 	}
 	root := os.Getenv("GNOROOT")
-	if root == "" || os.Getenv("SANDBOX_SRC") != root {
-		panic("GNOROOT not set, or {src} not substituted in the sandbox prefix")
+	if root == "" {
+		panic("GNOROOT not set")
 	}
-	if os.Getenv("SANDBOX_JOB") == "" || os.Getenv("SANDBOX_JOB") == "{job}" {
-		panic("{job} not substituted in the sandbox prefix")
+	// Run through a local sandbox prefix (env SANDBOX_JOB={job} ...).
+	if job, ok := os.LookupEnv("SANDBOX_JOB"); ok && (job == "{job}" || os.Getenv("SANDBOX_SRC") != root) {
+		panic("{job} or {src} not substituted in the sandbox prefix")
+	}
+	if bz, err := os.ReadFile(filepath.Join(root, "fake-sleep")); err == nil {
+		d, _ := time.ParseDuration(strings.TrimSpace(string(bz)))
+		time.Sleep(d)
 	}
 	report, err := os.ReadFile(filepath.Join(root, "fake-report.json"))
 	if err != nil {

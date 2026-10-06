@@ -1,0 +1,11 @@
+# Snapshots the reference node's chain data for replays (the node is stopped
+# for the copy).
+[Unit]
+Description=gnoreplay golden chain data refresh
+
+[Service]
+Type=oneshot
+Environment=NODE_SERVICE=gnoland
+Environment=NODE_DATA_DIR=/var/lib/gnoland
+Environment=GOLDEN_ROOT=/var/lib/gnoreplay
+ExecStart=/opt/gnoreplay/server/scripts/refresh-golden.sh

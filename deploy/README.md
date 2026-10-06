@@ -1,0 +1,91 @@
+# Deploying on DigitalOcean
+
+One always-on **coordinator** droplet runs the server, a mainnet reference node and its chain snapshots. Each replay runs on its own **worker** droplet, created by the coordinator and deleted when the replay ends.
+
+| | Size | Cost |
+|---|---|---|
+| Coordinator | Basic `s-2vcpu-4gb` | $24/mo |
+| Worker | Memory-Optimized `m-2vcpu-16gb` | $0.125/h, about $0.25–0.30 per replay; at most `workers` at once |
+
+## 1. Account setup (once)
+
+With [`doctl`](https://docs.digitalocean.com/reference/doctl/) authenticated:
+
+```bash
+REGION=fra1
+
+# A VPC of their own: PR code runs on the workers, and can reach anything in it.
+doctl vpcs create --name gnoreplay --region $REGION --ip-range 10.120.0.0/20
+
+# Workers accept no inbound connections; they need outbound access for Go
+# and its modules, and the coordinator over the VPC.
+doctl compute firewall create --name gnoreplay-worker --tag-names gnoreplay-worker \
+  --outbound-rules "protocol:tcp,ports:all,address:0.0.0.0/0,address:::/0 protocol:udp,ports:all,address:0.0.0.0/0,address:::/0"
+
+# Your SSH key (its fingerprint goes in the config: without one, DigitalOcean
+# emails a root password for every worker).
+doctl compute ssh-key list
+```
+
+API token for the server: *API → Generate New Token → Custom scopes*: `droplet` (create, read, delete) and `tag` (create, read).
+
+## 2. Coordinator
+
+```bash
+doctl compute droplet create gnoreplay --region $REGION --size s-2vcpu-4gb \
+  --image ubuntu-24-04-x64 --vpc-uuid <vpc id> --ssh-keys <fingerprint> --wait
+```
+
+Its firewall: inbound 22 (SSH) and 80/443 (the result pages, through Caddy); port 8081 is only bound to the private address.
+
+On the droplet:
+
+```bash
+apt-get update && apt-get install -y git caddy
+curl -fsSL https://go.dev/dl/go1.26.1.linux-amd64.tar.gz | tar -C /usr/local -xz
+useradd --system --create-home --home-dir /var/lib/gnoreplay gnoreplay
+mkdir -p /opt/gnoreplay/bin /etc/gnoreplay /var/lib/gnoland
+git clone https://github.com/gnoverse/gnoreplay /opt/gnoreplay/src && ln -s src/gnoreplay /opt/gnoreplay/gnoreplay && ln -s src/server /opt/gnoreplay/server
+(cd /opt/gnoreplay/server && /usr/local/go/bin/go build -o /opt/gnoreplay/bin/gnoreplay-server .)
+# The binary mainnet runs: the last row of misc/deployments/mainnet.gno.land/upgrades.json.
+git clone --depth 1 --branch chain/mainnet https://github.com/gnolang/gno /opt/gno
+(cd /opt/gno && CGO_ENABLED=0 /usr/local/go/bin/go build -o /opt/gnoreplay/bin/gnoland ./gno.land/cmd/gnoland)
+```
+
+**Chain data.** Syncing a node from genesis loads 3.26M genesis accounts at once, which needs far more than 4 GB. Seed `/var/lib/gnoland` instead with the whole data dir (`config/`, `secrets/`, `db/`) of a mainnet node that is already past genesis, and put the `genesis.json` it was started with in `/var/lib/gnoreplay/`. The node then only syncs the blocks since. Mainnet's node settings are in `misc/deployments/mainnet.gno.land/VALIDATOR.md`; keep the RPC on `127.0.0.1:26657`.
+
+```bash
+chown -R gnoreplay: /var/lib/gnoland /var/lib/gnoreplay
+cp /opt/gnoreplay/src/deploy/systemd/* /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now gnoland
+# Once the node has caught up with mainnet:
+systemctl start gnoreplay-golden && systemctl enable --now gnoreplay-golden.timer
+```
+
+**Server.** `/etc/gnoreplay/config.toml` from [`config.digitalocean.example.toml`](../server/config.digitalocean.example.toml) (the VPC id, your SSH key fingerprint, the droplet's private address for `[digitalocean] listen/url`), then the secrets, readable by `gnoreplay` only:
+
+| File | Content |
+|---|---|
+| `/etc/gnoreplay/github-token` | a read-only GitHub token (see the server README) |
+| `/etc/gnoreplay/digitalocean-token` | the API token above |
+| `/etc/gnoreplay/viewer-key` | any random string, if private repos are tracked |
+
+```bash
+systemctl enable --now gnoreplay-server
+# Replay a PR on demand (PRs open before the first poll are not replayed):
+sudo -u gnoreplay /opt/gnoreplay/bin/gnoreplay-server -config /etc/gnoreplay/config.toml enqueue gnolang/gno 1234
+```
+
+**HTTPS.** `/etc/caddy/Caddyfile`, with a DNS name for the droplet (`<ip with dashes>.sslip.io` works without DNS):
+
+```
+replay.example.org {
+	reverse_proxy 127.0.0.1:8080
+}
+```
+
+## Operating
+
+- Worker droplets are named `gnoreplay-job-<id>` and tagged `gnoreplay-worker`. The server deletes each when its replay ends, is superseded or times out, and deletes any it does not own at startup and every 10 minutes. To stop everything: `systemctl stop gnoreplay-server && doctl compute droplet delete --tag-name gnoreplay-worker`.
+- A worker's log is in its job's page when it fails, and on the worker in `/root/gnoreplay/<job>/worker.log` while it runs (SSH in with your key).
+- A governance halt on mainnet stops the reference node: it needs the upgraded binary, like any node.
