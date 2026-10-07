@@ -121,7 +121,7 @@ func TestSignIn(t *testing.T) {
 	require.NoError(t, err)
 	page, _ := io.ReadAll(res.Body)
 	res.Body.Close()
-	assert.Contains(t, string(page), `<a href="/login?next=%2f">Sign in with GitHub</a>`)
+	assert.Contains(t, string(page), `<a href="/login?next=%2f">Sign in</a>`)
 
 	// A listed user signs in, and is sent back where they were.
 	alice := newJar(t)

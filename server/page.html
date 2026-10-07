@@ -24,7 +24,7 @@ header.top .wrap { display: flex; gap: .5rem 1rem; align-items: center; flex-wra
 .brand { font-weight: 650; color: var(--fg); font-size: 1.05rem; }
 header form { flex: 1 1 16rem; display: flex; }
 header input { flex: 1; min-width: 0; padding: .4rem .6rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--fg); font: inherit; }
-nav { display: flex; gap: 1rem; align-items: center; }
+nav { display: flex; gap: 1rem; align-items: center; white-space: nowrap; }
 nav form { margin: 0; }
 button.link { background: none; border: 0; padding: 0; font: inherit; color: var(--link); cursor: pointer; }
 button.link:hover { text-decoration: underline; }
@@ -70,9 +70,9 @@ footer { border-top: 1px solid var(--border); color: var(--muted); font-size: .8
 <header class="top"><div class="wrap">
 <a class="brand" href="/">gnoreplay</a>
 <form action="/search" method="get" role="search"><input type="search" name="q" value="{{.Query}}" placeholder="PR number, branch, commit, PR title or GitHub URL" aria-label="Search replays"></form>
-<nav><a href="/#running">Queue</a><a href="{{source}}">Source on GitHub</a>
+<nav><a href="/#running">Queue</a>
 {{- if .Viewer}}<span class="muted">@{{.Viewer}}</span><form method="post" action="/logout"><button class="link">Sign out</button></form>
-{{- else if .SignIn}}<a href="/login?next={{.Path}}">Sign in with GitHub</a>{{end}}</nav>
+{{- else if .SignIn}}<a href="/login?next={{.Path}}">Sign in</a>{{end}}</nav>
 </div></header>
 <main class="wrap">
 {{end}}
@@ -80,7 +80,7 @@ footer { border-top: 1px solid var(--border); color: var(--muted); font-size: .8
 {{define "foot"}}
 </main>
 <footer><div class="wrap">
-<a href="{{source}}">gnoreplay</a> replays gno.land mainnet's history with each change. Results are advisory, and only published here. <span id="tz"></span>
+gnoreplay replays gno.land mainnet's history with each change. Results are advisory, and only published here. <span id="tz"></span> <a href="{{source}}">Source on GitHub</a>
 </div></footer>
 <script>
 (function () {
