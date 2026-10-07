@@ -119,7 +119,12 @@ func targetURL(j *Job) string {
 // githubURL is a job's PR or branch on GitHub.
 func githubURL(j *Job) string { return "https://github.com" + targetURL(j) }
 
-func commitURL(j *Job) string { return fmt.Sprintf("https://github.com/%s/commit/%s", j.Repo, j.SHA) }
+func commitURL(j *Job) string { return commitOf(j, j.SHA) }
+
+// commitOf is commit sha of j's repo on GitHub.
+func commitOf(j *Job, sha string) string {
+	return fmt.Sprintf("https://github.com/%s/commit/%s", j.Repo, sha)
+}
 
 // badge is a job's state, as one word with a CSS class.
 func badge(j *Job) template.HTML {
@@ -142,6 +147,8 @@ func result(j *Job) string {
 		return "the replay could not run: " + truncateStr(firstLine(j.Error), 140)
 	case stateSuperseded:
 		return "not checked: superseded by a newer push, or the PR was closed"
+	case stateSkipped:
+		return "not replayed: " + j.Summary
 	case stateRunning:
 		return "replaying"
 	}
@@ -191,7 +198,7 @@ var pageHTML string
 
 var pages = template.Must(template.New("").Funcs(template.FuncMap{
 	"result": result, "badge": badge, "short": shortSHA,
-	"targetURL": targetURL, "githubURL": githubURL, "commitURL": commitURL,
+	"targetURL": targetURL, "githubURL": githubURL, "commitURL": commitURL, "commitOf": commitOf,
 	"ts": timestamp, "took": took, "source": func() string { return sourceURL },
 	"pr":  func(event string) bool { return event == eventPullRequest },
 	"inc": func(i int) int { return i + 1 },
@@ -378,6 +385,8 @@ func jobBody(j *Job) (template.HTML, error) {
 		md = "The replay did not complete, so nothing was checked.\n\n```\n" + j.Error + "\n```\n"
 	case stateSuperseded:
 		md = "Not checked: superseded by a newer push, or the PR was closed."
+	case stateSkipped:
+		md = "Not replayed: " + j.Summary + ". Pushes to tracked branches are always replayed."
 	default:
 		return "", nil
 	}

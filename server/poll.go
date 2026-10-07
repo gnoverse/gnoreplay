@@ -81,8 +81,13 @@ func (s *Server) pollRepo(ctx context.Context, repo string) error {
 		// replaying the whole backlog would take days (`enqueue` replays one
 		// on demand). Branches are always replayed, as the baselines PRs are
 		// compared against.
-		if synced || h.event == eventPush {
+		switch {
+		case h.event == eventPush:
 			if err := s.enqueueFor(repo, h.event, h.branch, h.pr, h.sha); err != nil {
+				return err
+			}
+		case synced:
+			if err := s.enqueuePull(ctx, repo, h.branch, h.pr, h.sha); err != nil {
 				return err
 			}
 		}
@@ -126,13 +131,47 @@ func (s *Server) pollRepo(ctx context.Context, repo string) error {
 	return nil
 }
 
+// enqueuePull queues a PR's new head, unless none of the PR's changes can
+// affect the node: then it is recorded as skipped.
+func (s *Server) enqueuePull(ctx context.Context, repo, base string, pr int, sha string) error {
+	files, err := s.gh.PullFiles(ctx, repo, pr)
+	if err != nil {
+		return fmt.Errorf("files of PR %d: %w", pr, err)
+	}
+	reason := skipReason(files)
+	if reason == "" {
+		return s.enqueueFor(repo, eventPullRequest, base, pr, sha)
+	}
+	j, err := s.newJob(repo, eventPullRequest, base, pr, sha)
+	if err != nil {
+		return err
+	}
+	superseded, err := s.queue.Skip(j, reason)
+	if err != nil {
+		return err
+	}
+	s.logger.Info("skipped", "job", j.ID, "key", j.Key, "sha", sha, "reason", reason)
+	for _, old := range superseded {
+		s.cancel(old.ID)
+	}
+	return nil
+}
+
 func (s *Server) enqueueFor(repo, event, branch string, pr int, sha string) error {
+	j, err := s.newJob(repo, event, branch, pr, sha)
+	if err != nil {
+		return err
+	}
+	return s.enqueue(j)
+}
+
+func (s *Server) newJob(repo, event, branch string, pr int, sha string) (*Job, error) {
 	prio, ok := s.cfg.priority(repo, event, branch)
 	if !ok {
-		return fmt.Errorf("no rule for %s %s %s", repo, event, branch)
+		return nil, fmt.Errorf("no rule for %s %s %s", repo, event, branch)
 	}
-	return s.enqueue(&Job{
+	return &Job{
 		Key: jobKey(repo, event, branch, pr), Repo: repo, Event: event, Branch: branch,
 		PR: pr, SHA: sha, Priority: prio,
-	})
+	}, nil
 }

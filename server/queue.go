@@ -15,6 +15,9 @@ const (
 	stateDone       = "done"
 	stateFailed     = "failed"
 	stateSuperseded = "superseded"
+	// stateSkipped: a PR whose changes can't affect the node; Summary says
+	// why.
+	stateSkipped = "skipped"
 )
 
 type Job struct {
@@ -37,6 +40,10 @@ type Job struct {
 	BaseID int64
 	// Title and Author are the PR's, kept up to date by the poller.
 	Title, Author string
+	// ReplaySHA is the commit replayed, set once it is checked out: SHA for a
+	// push, GitHub's test merge of the PR into its base for a PR when there
+	// is one. ReplayNote says which, for PRs.
+	ReplaySHA, ReplayNote string
 	// Outcome is set when the job is done: outcomePass or outcomeDiverges,
 	// with a one-line Summary.
 	Outcome string
@@ -80,7 +87,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 	started_at  INTEGER NOT NULL DEFAULT 0,
 	base_id     INTEGER NOT NULL DEFAULT 0,
 	title       TEXT    NOT NULL DEFAULT '',
-	author      TEXT    NOT NULL DEFAULT ''
+	author      TEXT    NOT NULL DEFAULT '',
+	replay_sha  TEXT    NOT NULL DEFAULT '',
+	replay_note TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state, priority, enqueued_at);
 CREATE INDEX IF NOT EXISTS jobs_key ON jobs (key, state);
@@ -110,6 +119,8 @@ var addedColumns = []struct{ table, column, decl string }{
 	{"jobs", "base_id", "INTEGER NOT NULL DEFAULT 0"},
 	{"jobs", "title", "TEXT NOT NULL DEFAULT ''"},
 	{"jobs", "author", "TEXT NOT NULL DEFAULT ''"},
+	{"jobs", "replay_sha", "TEXT NOT NULL DEFAULT ''"},
+	{"jobs", "replay_note", "TEXT NOT NULL DEFAULT ''"},
 }
 
 func migrate(db *sql.DB) error {
@@ -152,6 +163,18 @@ func (q *Queue) Close() error { return q.db.Close() }
 // Enqueue adds j as queued and supersedes queued or running jobs with the
 // same key, which it returns (their state is already updated).
 func (q *Queue) Enqueue(j *Job) (superseded []*Job, err error) {
+	j.State = stateQueued
+	return q.add(j)
+}
+
+// Skip records j as not replayed, for reason, superseding the key's queued
+// or running jobs like Enqueue.
+func (q *Queue) Skip(j *Job, reason string) (superseded []*Job, err error) {
+	j.State, j.Summary, j.FinishedAt = stateSkipped, reason, time.Now()
+	return q.add(j)
+}
+
+func (q *Queue) add(j *Job) (superseded []*Job, err error) {
 	tx, err := q.db.Begin()
 	if err != nil {
 		return nil, err
@@ -164,10 +187,13 @@ func (q *Queue) Enqueue(j *Job) (superseded []*Job, err error) {
 	if j.EnqueuedAt.IsZero() {
 		j.EnqueuedAt = time.Now()
 	}
-	j.State = stateQueued
-	res, err := tx.Exec(`INSERT INTO jobs (key, repo, event, branch, pr, sha, priority, state, enqueued_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		j.Key, j.Repo, j.Event, j.Branch, j.PR, j.SHA, j.Priority, j.State, j.EnqueuedAt.UnixNano())
+	var finished int64
+	if !j.FinishedAt.IsZero() {
+		finished = j.FinishedAt.UnixNano()
+	}
+	res, err := tx.Exec(`INSERT INTO jobs (key, repo, event, branch, pr, sha, priority, state, enqueued_at, finished_at, summary)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		j.Key, j.Repo, j.Event, j.Branch, j.PR, j.SHA, j.Priority, j.State, j.EnqueuedAt.UnixNano(), finished, j.Summary)
 	if err != nil {
 		return nil, err
 	}
@@ -320,6 +346,12 @@ func (q *Queue) SetResult(id int64, outcome, summary string, baseID int64) error
 	return err
 }
 
+// SetReplay records what a job replays (see Job.ReplaySHA).
+func (q *Queue) SetReplay(id int64, sha, note string) error {
+	_, err := q.db.Exec(`UPDATE jobs SET replay_sha = ?, replay_note = ? WHERE id = ?`, sha, note, id)
+	return err
+}
+
 // SetPRInfo records a PR's title and author on its jobs.
 func (q *Queue) SetPRInfo(key, title, author string) error {
 	_, err := q.db.Exec(`UPDATE jobs SET title = ?, author = ? WHERE key = ? AND (title != ? OR author != ?)`,
@@ -422,7 +454,7 @@ func (q *Queue) MarkSynced(repo string) error {
 }
 
 const jobColumns = `id, key, repo, event, branch, pr, sha, priority, state, enqueued_at, started_at, finished_at,
-	report_path, outcome, summary, base_id, error, title, author`
+	report_path, outcome, summary, base_id, error, title, author, replay_sha, replay_note`
 
 func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 	if err != nil {
@@ -434,7 +466,8 @@ func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 		j := &Job{}
 		var enq, start, fin int64
 		if err := rows.Scan(&j.ID, &j.Key, &j.Repo, &j.Event, &j.Branch, &j.PR, &j.SHA, &j.Priority, &j.State,
-			&enq, &start, &fin, &j.ReportPath, &j.Outcome, &j.Summary, &j.BaseID, &j.Error, &j.Title, &j.Author); err != nil {
+			&enq, &start, &fin, &j.ReportPath, &j.Outcome, &j.Summary, &j.BaseID, &j.Error, &j.Title, &j.Author,
+			&j.ReplaySHA, &j.ReplayNote); err != nil {
 			return nil, err
 		}
 		j.EnqueuedAt = time.Unix(0, enq)

@@ -34,6 +34,10 @@ func TestTokenClientLive(t *testing.T) {
 	assert.Equal(t, prs[0].Number, pr.Number)
 	assert.NotEmpty(t, pr.Base)
 	assert.Len(t, pr.HeadSHA, 40)
+	files, err := gh.PullFiles(ctx, "gnolang/gno", pr.Number)
+	require.NoError(t, err)
+	assert.NotEmpty(t, files)
+	t.Logf("PR #%d: mergeable %v, test merge %q, %d files", pr.Number, pr.Mergeable, pr.MergeSHA, len(files))
 }
 
 // TestTokenClientReadOnly checks that the client refuses writes before they
@@ -44,9 +48,9 @@ func TestTokenClientReadOnly(t *testing.T) {
 	ctx := context.Background()
 
 	_, _, err = gh.c.Repositories.CreateStatus(ctx, "gnolang", "gno", "0000000000000000000000000000000000000000",
-		github.RepoStatus{State: github.Ptr("success")})
+		github.RepoStatus{State: new("success")})
 	require.ErrorContains(t, err, "refusing POST")
-	_, _, err = gh.c.Issues.CreateComment(ctx, "gnolang", "gno", 1, &github.IssueComment{Body: github.Ptr("x")})
+	_, _, err = gh.c.Issues.CreateComment(ctx, "gnolang", "gno", 1, &github.IssueComment{Body: new("x")})
 	require.ErrorContains(t, err, "refusing POST")
 	_, err = gh.c.Repositories.Delete(ctx, "gnolang", "gno")
 	require.ErrorContains(t, err, "refusing DELETE")

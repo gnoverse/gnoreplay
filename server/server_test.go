@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,10 +28,17 @@ type fakeGitHub struct {
 	mu       sync.Mutex
 	branches map[string]string // "repo@branch" -> sha
 	pulls    map[string][]PullRequest
+	files    map[string][]string // "repo#pr" -> changed files; none listed means unknown
 }
 
 func newFakeGitHub() *fakeGitHub {
-	return &fakeGitHub{branches: map[string]string{}, pulls: map[string][]PullRequest{}}
+	return &fakeGitHub{branches: map[string]string{}, pulls: map[string][]PullRequest{}, files: map[string][]string{}}
+}
+
+func (f *fakeGitHub) PullFiles(_ context.Context, repo string, number int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.files[fmt.Sprintf("%s#%d", repo, number)], nil
 }
 
 func (f *fakeGitHub) BranchHead(_ context.Context, repo, branch string) (string, error) {
@@ -152,10 +160,19 @@ func commitReport(t *testing.T, repo string, report *Report, exit int) string {
 	return git(t, repo, "rev-parse", "HEAD")
 }
 
+// fastMergeRetry makes PR jobs give up quickly on GitHub's test merge, which
+// the fake computes only when told to.
+func fastMergeRetry(t *testing.T) {
+	attempts, retry := mergeAttempts, mergeRetry
+	mergeAttempts, mergeRetry = 2, time.Millisecond
+	t.Cleanup(func() { mergeAttempts, mergeRetry = attempts, retry })
+}
+
 func TestServerEndToEnd(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	fastMergeRetry(t)
 	root := t.TempDir()
 
 	// The "GitHub" remotes: file:///<root>/remote/<owner>/<name>.git
@@ -391,6 +408,35 @@ func TestServerEndToEnd(t *testing.T) {
 	pending, _ = q.Pending()
 	assert.Empty(t, pending)
 
+	// A PR that only changes what can't affect the node is not replayed: it
+	// is listed as skipped. A push that changes the node is.
+	gh.files["gnolang/gno#11"] = []string{"docs/guide.md", "examples/gno.land/r/demo/foo/foo.gno"}
+	gh.setPulls("gnolang/gno",
+		PullRequest{Number: 5, Base: "master", HeadSHA: shaOldPR},
+		PullRequest{Number: 11, Base: "master", HeadSHA: shaOldPR, Title: "docs: typo"},
+	)
+	poll()
+	pending, _ = q.Pending()
+	assert.Empty(t, pending)
+	skipped, err := q.ByKey("gnolang/gno#pr/11", 10)
+	require.NoError(t, err)
+	require.Len(t, skipped, 1)
+	assert.Equal(t, stateSkipped, skipped[0].State)
+	code, page = get(anon, "/gnolang/gno/pull/11")
+	require.Equal(t, http.StatusOK, code)
+	assert.Contains(t, page, "not replayed: none of its 2 changed file(s) can affect the node")
+	gh.files["gnolang/gno#11"] = append(gh.files["gnolang/gno#11"], "gnovm/pkg/gnolang/machine.go")
+	gh.setPulls("gnolang/gno",
+		PullRequest{Number: 5, Base: "master", HeadSHA: shaOldPR},
+		PullRequest{Number: 11, Base: "master", HeadSHA: shaPR, Title: "docs: typo"},
+	)
+	poll()
+	pending, _ = q.Pending()
+	require.Len(t, pending, 1)
+	assert.Equal(t, "gnolang/gno#pr/11", pending[0].Key)
+	_, err = q.CancelKey("gnolang/gno#pr/11")
+	require.NoError(t, err)
+
 	// A PR open since before the first pass can be replayed on demand.
 	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPullRequest, "master", 5, shaOldPR))
 	oldPR := runNext()
@@ -402,6 +448,89 @@ func TestServerEndToEnd(t *testing.T) {
 		_, err = os.Stat(filepath.Join(cfg.DataDir, "jobs", fmt.Sprint(j.ID)))
 		assert.True(t, os.IsNotExist(err))
 		assert.FileExists(t, filepath.Join(root, fmt.Sprintf("cleaned-%d", j.ID)))
+	}
+}
+
+// A PR is replayed merged into its base: what its branch lacks from the base
+// doesn't show. Without a usable test merge, its head is replayed, noted.
+func TestPullTestMerge(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	fastMergeRetry(t)
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote", "gnolang", "gno.git")
+	require.NoError(t, os.MkdirAll(remote, 0o755))
+	git(t, remote, "init", "-q")
+	git(t, remote, "config", "uploadpack.allowAnySHA1InWant", "true")
+
+	// The PR branches off before master's fix: its head alone diverges, its
+	// merge into master doesn't.
+	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
+	broken := &Report{
+		ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10,
+		Diffs: []Diff{{Kind: "result", Height: 3, Index: 0, Recorded: &Result{}, Replayed: &Result{Error: "boom"}}},
+	}
+	fork := commitReport(t, remote, clean, 0)
+	head := commitReport(t, remote, broken, 2)
+	git(t, remote, "reset", "-q", "--hard", fork)
+	master := commitReport(t, remote, clean, 0)
+	merge := git(t, remote, "commit-tree", master+"^{tree}", "-p", master, "-p", head, "-m", "test merge")
+
+	golden := filepath.Join(root, "golden")
+	require.NoError(t, os.MkdirAll(filepath.Join(golden, "db", "state.db"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(golden, "db", "state.db", "MARKER"), nil, 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(golden, "db", "blockstore.db"), 0o755))
+	overlay := filepath.Join(root, "overlay")
+	require.NoError(t, os.MkdirAll(overlay, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(overlay, "go.mod"), []byte("module fake\n\ngo 1.22\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(overlay, "main.go"), []byte(fakeTool), 0o644))
+	cfg := &Config{
+		DataDir: filepath.Join(root, "data"),
+		Chain:   ChainConfig{GoldenDir: golden, Genesis: filepath.Join(root, "genesis.json")},
+		GitHub:  GitHubConfig{GitURL: "file://" + filepath.Join(root, "remote") + "/"},
+		Job:     JobConfig{GnoreplayOverlay: overlay},
+	}
+	cfg.setDefaults()
+	q := newTestQueue(t)
+	gh := newFakeGitHub()
+	srv := newServer(cfg, q, gh, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	yes, no := true, false
+	run := func(pr PullRequest) *Job {
+		t.Helper()
+		gh.setPulls("gnolang/gno", pr)
+		require.NoError(t, srv.enqueueFor("gnolang/gno", eventPullRequest, "master", pr.Number, head))
+		j, err := q.Claim()
+		require.NoError(t, err)
+		srv.runJob(context.Background(), j)
+		done, err := q.Get(j.ID)
+		require.NoError(t, err)
+		require.Equal(t, stateDone, done.State, done.Error)
+		return done
+	}
+
+	j := run(PullRequest{Number: 9, Base: "master", HeadSHA: head, Mergeable: &yes, MergeSHA: merge})
+	assert.Equal(t, outcomePass, j.Outcome, "master's fix is in the merge")
+	assert.Equal(t, merge, j.ReplaySHA)
+	assert.Equal(t, "this PR merged into master at "+shortSHA(master)+" (GitHub's test merge)", j.ReplayNote)
+	bz, err := os.ReadFile(bodyPath(j.ReportPath))
+	require.NoError(t, err)
+	assert.Contains(t, string(bz), "Replayed this PR merged into master")
+
+	for _, c := range []struct {
+		pr  PullRequest
+		why string
+	}{
+		{PullRequest{Mergeable: &no}, "it conflicts with master"},
+		{PullRequest{}, "GitHub had not computed its test merge"},
+		{PullRequest{Mergeable: &yes, MergeSHA: master}, "its test merge could not be used"}, // not a merge of the head
+	} {
+		c.pr.Number, c.pr.Base, c.pr.HeadSHA = 9, "master", head
+		j := run(c.pr)
+		assert.Equal(t, outcomeDiverges, j.Outcome, c.why)
+		assert.Equal(t, head, j.ReplaySHA, c.why)
+		assert.Equal(t, "the PR's head as is: "+c.why+", so what it lacks from master may show as divergences", j.ReplayNote)
 	}
 }
 

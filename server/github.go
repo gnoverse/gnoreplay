@@ -15,6 +15,10 @@ type PullRequest struct {
 	HeadSHA string
 	Title   string
 	Author  string // login
+	// Mergeable is nil until GitHub has computed it (Pull asks it to); when
+	// true, MergeSHA is GitHub's test merge of the head into the base.
+	Mergeable *bool
+	MergeSHA  string
 }
 
 // GitHub is what the server needs from the GitHub API: reads only. Results
@@ -23,6 +27,9 @@ type GitHub interface {
 	BranchHead(ctx context.Context, repo, branch string) (string, error)
 	OpenPulls(ctx context.Context, repo string) ([]PullRequest, error)
 	Pull(ctx context.Context, repo string, number int) (PullRequest, error)
+	// PullFiles lists the files a PR changes, renamed ones under both names.
+	// GitHub lists maxPullFiles at most.
+	PullFiles(ctx context.Context, repo string, number int) ([]string, error)
 	// Token authenticates git fetches.
 	Token() string
 }
@@ -109,10 +116,36 @@ func (t *tokenClient) Pull(ctx context.Context, repo string, number int) (PullRe
 	return toPullRequest(pr), nil
 }
 
+func (t *tokenClient) PullFiles(ctx context.Context, repo string, number int) ([]string, error) {
+	owner, name, err := splitRepo(repo)
+	if err != nil {
+		return nil, err
+	}
+	opts := &github.ListOptions{PerPage: 100}
+	var out []string
+	for {
+		files, res, err := t.c.PullRequests.ListFiles(ctx, owner, name, number, opts)
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range files {
+			out = append(out, f.GetFilename())
+			if prev := f.GetPreviousFilename(); prev != "" {
+				out = append(out, prev)
+			}
+		}
+		if res.NextPage == 0 {
+			return out, nil
+		}
+		opts.Page = res.NextPage
+	}
+}
+
 func toPullRequest(pr *github.PullRequest) PullRequest {
 	return PullRequest{
 		Number: pr.GetNumber(), Base: pr.GetBase().GetRef(), HeadSHA: pr.GetHead().GetSHA(),
 		Title: pr.GetTitle(), Author: pr.GetUser().GetLogin(),
+		Mergeable: pr.Mergeable, MergeSHA: pr.GetMergeCommitSHA(),
 	}
 }
 

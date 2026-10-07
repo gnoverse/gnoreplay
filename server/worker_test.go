@@ -61,8 +61,11 @@ func TestConcurrentCheckouts(t *testing.T) {
 	errs := make([]error, len(shas))
 	for i, sha := range shas {
 		wg.Go(func() {
-			j := &Job{ID: int64(i + 1), Repo: "gnolang/gno", SHA: sha}
-			errs[i] = srv.checkout(context.Background(), j, filepath.Join(root, "src", fmt.Sprint(i)), io.Discard)
+			parents, err := srv.checkout(context.Background(), "gnolang/gno", sha, filepath.Join(root, "src", fmt.Sprint(i)), io.Discard)
+			if err == nil && i > 0 && (len(parents) != 1 || parents[0] != shas[i-1]) {
+				err = fmt.Errorf("parents %v, want [%s]", parents, shas[i-1])
+			}
+			errs[i] = err
 		})
 	}
 	wg.Wait()

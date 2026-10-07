@@ -187,6 +187,9 @@ func render(job *Job, r *Report, c Classification, reportURL string, base *Job) 
 		row("fixed vs `"+job.Branch+"`", c.Fixed)
 	}
 	s.WriteString("\n")
+	if job.ReplayNote != "" {
+		fmt.Fprintf(&s, "Replayed %s.\n\n", job.ReplayNote)
+	}
 	if base != nil {
 		fmt.Fprintf(&s, "Compared with `%s` at commit `%s` ([its replay](/jobs/%d)).\n\n", base.Branch, shortSHA(base.SHA), base.ID)
 	}

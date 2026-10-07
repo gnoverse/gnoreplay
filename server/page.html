@@ -25,7 +25,7 @@ header.top .wrap { display: flex; gap: .5rem 1rem; align-items: center; flex-wra
 header form { flex: 1 1 16rem; display: flex; }
 header input { flex: 1; min-width: 0; padding: .4rem .6rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--fg); font: inherit; }
 nav { display: flex; gap: 1rem; }
-main { padding-top: 1.25rem; padding-bottom: 2rem; }
+main.wrap { padding-top: 1.75rem; padding-bottom: 2rem; }
 h1 { font-size: 1.6rem; margin: .2rem 0 .4rem; line-height: 1.3; overflow-wrap: anywhere; }
 h1 .sub { color: var(--muted); font-weight: 400; }
 h2 { font-size: 1.15rem; margin: 2rem 0 .6rem; padding-bottom: .3rem; border-bottom: 1px solid var(--border); }
@@ -47,7 +47,7 @@ td time, .nowrap { white-space: nowrap; }
 .badge.diverges { color: var(--fail); background: var(--fail-bg); }
 .badge.error { color: var(--warn); background: var(--warn-bg); }
 .badge.running { color: var(--info); background: var(--info-bg); }
-.badge.queued, .badge.superseded { color: var(--muted); background: var(--gray-bg); }
+.badge.queued, .badge.superseded, .badge.skipped { color: var(--muted); background: var(--gray-bg); }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); gap: .75rem; }
 .card { border: 1px solid var(--border); border-radius: 8px; padding: .75rem 1rem; }
 .card h3 { margin: 0 0 .35rem; font-size: 1rem; }
@@ -120,7 +120,9 @@ footer { border-top: 1px solid var(--border); color: var(--muted); font-size: .8
 <li><span class="badge diverges">diverges</span> at least one transaction's result, or a block, differs from mainnet where the base branch's latest replay matches it. Divergences the base branch has too are counted as inherited, not new. After the first app hash mismatch, diffs may be consequences of earlier ones: read from the top.</li>
 <li><span class="badge error">error</span> the replay could not run (build or worker failure, timeout): nothing was checked.</li>
 <li><span class="badge superseded">superseded</span> a newer push came first, or the PR was closed.</li>
+<li><span class="badge skipped">skipped</span> the PR only changes files that can't affect the node (documentation, tests, CI, examples or tools). Pushes to branches are always replayed.</li>
 </ul>
+<p>A PR is replayed merged into its base branch (GitHub's test merge, what CI tests), so what its branch lacks from the base doesn't show as divergences. When it conflicts, its head is replayed as is, and its page says so.</p>
 <p>A divergence is not necessarily a bug: intended behavior changes are expected to be gated by height, or shipped through a coordinated upgrade.</p>
 <p>GitHub is polled every {{.PollInterval}}. Each new head is queued in the priority order below, superseding its PR's or branch's previous replay, and replayed on a disposable machine of its own: up to {{.Workers}} at once, about 1h45m each (at most {{.RunTimeoutMinutes}} minutes). PRs that were already open when the server started are replayed from their next push. The server only reads from GitHub: it posts no statuses or comments, results are published here only.</p>
 {{with .Rules}}<p>What is checked, in priority order:</p>
@@ -172,6 +174,7 @@ footer { border-top: 1px solid var(--border); color: var(--muted); font-size: .8
 <dt>Commit</dt><dd><a href="{{commitURL .}}"><code>{{.SHA}}</code></a></dd>
 {{if pr .Event}}<dt>Pull request</dt><dd><a href="{{targetURL .}}">all its replays</a> · <a href="{{githubURL .}}">on GitHub ↗</a>{{with .Author}} · by @{{.}}{{end}}</dd>
 <dt>Base branch</dt><dd><a href="/{{.Repo}}/tree/{{.Branch}}">{{.Branch}}</a></dd>{{else}}<dt>Branch</dt><dd><a href="{{targetURL .}}">all its replays</a> · <a href="{{githubURL .}}">on GitHub ↗</a></dd>{{end}}
+{{if .ReplayNote}}<dt>Replayed</dt><dd>{{if ne .ReplaySHA .SHA}}<a href="{{commitOf . .ReplaySHA}}"><code>{{short .ReplaySHA}}</code></a>: {{end}}{{.ReplayNote}}</dd>{{end}}
 {{with $.Base}}<dt>Compared with</dt><dd><a href="/jobs/{{.ID}}">{{.Branch}} at <code>{{short .SHA}}</code></a></dd>{{end}}
 <dt>Queued</dt><dd>{{ts .EnqueuedAt}}</dd>
 <dt>Started</dt><dd>{{ts .StartedAt}}</dd>

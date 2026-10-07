@@ -242,7 +242,7 @@ func (s *Server) replay(ctx context.Context, j *Job, logger *slog.Logger) (*Repo
 
 	// 1. Source.
 	step("fetch")
-	if err := s.checkout(ctx, j, src, logFile); err != nil {
+	if err := s.checkoutJob(ctx, j, src, logFile); err != nil {
 		return nil, "", fmt.Errorf("checkout: %w", err)
 	}
 
@@ -346,18 +346,88 @@ func (s *Server) replayLocal(ctx context.Context, j *Job, jobDir, src, reportFil
 	return nil
 }
 
-// checkout extracts j.SHA into dst, fetching it into a per-repo bare mirror.
-func (s *Server) checkout(ctx context.Context, j *Job, dst string, log io.Writer) error {
+// mergeAttempts and mergeRetry bound the wait for GitHub to compute a PR's
+// test merge, which it does in the background after a push.
+var (
+	mergeAttempts = 6
+	mergeRetry    = 10 * time.Second
+)
+
+// checkoutJob extracts what j replays into dst, and records it on j: the
+// pushed commit for a branch. For a PR, GitHub's test merge of the PR into its
+// base branch, as CI tests it, so that changes the PR's branch lacks from its
+// base don't show as divergences; failing that (e.g. a conflict), the PR's
+// head, with a note saying why.
+func (s *Server) checkoutJob(ctx context.Context, j *Job, dst string, log io.Writer) error {
+	sha, note := j.SHA, ""
+	if j.Event == eventPullRequest {
+		merge, why := s.testMerge(ctx, j)
+		if merge != "" {
+			parents, err := s.checkout(ctx, j.Repo, merge, dst, log)
+			if err == nil && len(parents) == 2 && parents[1] == j.SHA {
+				sha = merge
+				note = fmt.Sprintf("this PR merged into %s at %s (GitHub's test merge)", j.Branch, shortSHA(parents[0]))
+			} else {
+				fmt.Fprintf(log, "test merge %s unusable (parents %v, err %v)\n", merge, parents, err)
+				why = "its test merge could not be used"
+				if err := os.RemoveAll(dst); err != nil {
+					return err
+				}
+			}
+		}
+		if note == "" {
+			note = fmt.Sprintf("the PR's head as is: %s, so what it lacks from %s may show as divergences", why, j.Branch)
+		}
+		fmt.Fprintf(log, "replaying %s\n", note)
+	}
+	if sha == j.SHA {
+		if _, err := s.checkout(ctx, j.Repo, sha, dst, log); err != nil {
+			return err
+		}
+	}
+	j.ReplaySHA, j.ReplayNote = sha, note
+	return s.queue.SetReplay(j.ID, sha, note)
+}
+
+// testMerge returns GitHub's test merge of PR job j, or "" and why there is
+// none to replay.
+func (s *Server) testMerge(ctx context.Context, j *Job) (sha, why string) {
+	for attempt := 1; ; attempt++ {
+		pr, err := s.gh.Pull(ctx, j.Repo, j.PR)
+		switch {
+		case err != nil:
+			s.logger.Error("read PR", "job", j.ID, "pr", j.PR, "err", err)
+			return "", "GitHub could not be asked for its test merge"
+		case pr.HeadSHA != j.SHA:
+			return "", "it was pushed to since" // and this job superseded
+		case pr.Mergeable != nil && *pr.Mergeable && pr.MergeSHA != "":
+			return pr.MergeSHA, ""
+		case pr.Mergeable != nil:
+			return "", "it conflicts with " + j.Branch
+		case attempt == mergeAttempts:
+			return "", "GitHub had not computed its test merge"
+		}
+		select {
+		case <-ctx.Done():
+			return "", "the job was stopped"
+		case <-time.After(mergeRetry):
+		}
+	}
+}
+
+// checkout extracts commit sha of repo into dst, fetching it into a per-repo
+// bare mirror, and returns its parents.
+func (s *Server) checkout(ctx context.Context, repo, sha, dst string, log io.Writer) (parents []string, err error) {
 	// Jobs run concurrently and share the mirror: one creating it must not
 	// be seen half-initialized by another, and git fetches into the same
 	// repo would contend on its locks.
 	s.gitMu.Lock()
 	defer s.gitMu.Unlock()
 
-	mirror := filepath.Join(s.cfg.DataDir, "mirrors", j.Repo+".git")
+	mirror := filepath.Join(s.cfg.DataDir, "mirrors", repo+".git")
 	if _, err := os.Stat(mirror); err != nil {
 		if err := s.run(ctx, nil, "", nil, log, "git", "init", "--bare", "-q", mirror); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + s.gh.Token()))
@@ -368,19 +438,32 @@ func (s *Server) checkout(ctx context.Context, j *Job, dst string, log io.Writer
 		"GIT_CONFIG_VALUE_0=Authorization: Basic " + auth,
 		"GIT_TERMINAL_PROMPT=0",
 	}
-	url := s.cfg.GitHub.GitURL + j.Repo + ".git"
-	if err := s.run(ctx, nil, "", env, log, "git", "-C", mirror, "fetch", "-q", "--no-tags", "--depth=1", url, j.SHA); err != nil {
-		return err
+	url := s.cfg.GitHub.GitURL + repo + ".git"
+	if err := s.run(ctx, nil, "", env, log, "git", "-C", mirror, "fetch", "-q", "--no-tags", "--depth=1", url, sha); err != nil {
+		return nil, err
+	}
+	// The commit object names its parents even in a shallow mirror.
+	object, err := exec.CommandContext(ctx, "git", "-C", mirror, "cat-file", "commit", sha).Output()
+	if err != nil {
+		return nil, fmt.Errorf("read commit %s: %w", sha, err)
+	}
+	for _, line := range strings.Split(string(object), "\n") {
+		if line == "" {
+			break // end of the headers
+		}
+		if p, ok := strings.CutPrefix(line, "parent "); ok {
+			parents = append(parents, p)
+		}
 	}
 	if err := os.MkdirAll(dst, 0o755); err != nil {
-		return err
+		return nil, err
 	}
 	tarball := dst + ".tar"
-	if err := s.run(ctx, nil, "", nil, log, "git", "-C", mirror, "archive", "--format=tar", "-o", tarball, j.SHA); err != nil {
-		return err
+	if err := s.run(ctx, nil, "", nil, log, "git", "-C", mirror, "archive", "--format=tar", "-o", tarball, sha); err != nil {
+		return nil, err
 	}
 	defer os.Remove(tarball)
-	return s.run(ctx, nil, "", nil, log, "tar", "-xf", tarball, "-C", dst)
+	return parents, s.run(ctx, nil, "", nil, log, "tar", "-xf", tarball, "-C", dst)
 }
 
 // run runs a command with the given sandbox prefix, logging its output. The

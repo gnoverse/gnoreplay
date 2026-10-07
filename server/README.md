@@ -18,8 +18,8 @@ A commit *diverges* when it would change a tx result or a block compared to its 
 
 ## How a job runs
 
-1. Every `github.poll_interval`, the poller reads the head of each tracked branch and the open PRs of each tracked repo, and enqueues a replay for each new head: a push to a branch, a new PR, or a push to a PR.
-2. A worker fetches the commit into a bare mirror (with the token, so private repos work), and extracts it.
+1. Every `github.poll_interval`, the poller reads the head of each tracked branch and the open PRs of each tracked repo, and enqueues a replay for each new head: a push to a branch, a new PR, or a push to a PR. A PR none of whose changed files can affect the node is recorded as *skipped* instead ([`skip.go`](skip.go): documentation, tests, CI, examples, and tools neither the node nor the replay links; anything under `gnovm/stdlibs/` counts, tests and READMEs included, as stdlibs are loaded into the state whole). Pushes to branches, and replays queued with `enqueue`, always run.
+2. A worker fetches the commit into a bare mirror (with the token, so private repos work), and extracts it. For a PR, that is GitHub's test merge of the PR into its base branch (what CI tests), so that what the PR's branch lacks from its base doesn't show as divergences; when there is none (a conflict, or GitHub hasn't computed it within a minute), the PR's head, and its page says so.
 3. It copies [`gnoreplay/`](../gnoreplay/) into the checkout at `contribs/gnoreplay` and builds it there, so the replay runs that commit's application code.
 4. It copies the golden chain data (blockstore + state DBs, via reflinks) into the job dir and runs the replay with `GNOROOT` set to the checkout (stdlibs are read from disk at runtime).
 5. The report's diffs are classified against the latest completed replay of the base branch (for a push: the branch's previous commit):
