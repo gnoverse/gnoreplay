@@ -46,12 +46,23 @@ if ! command -v go >/dev/null; then
 	export PATH=/usr/local/go/bin:$PATH
 fi
 
+# fetch_tar <path> <dir> downloads and extracts a tar into dir, from scratch
+# on each attempt: a coordinator restart cuts the stream.
+fetch_tar() {
+	local attempt
+	for attempt in 1 2 3 4 5; do
+		rm -rf "$2" && mkdir -p "$2" || return 1
+		api GET "$1" | tar -x -C "$2" && return 0
+		sleep 30
+	done
+	return 1
+}
+
 cd "$WORK" || fail "cd $WORK"
-mkdir -p src data
 step "download source"
-api GET source | tar -x -C src || fail "download source"
+fetch_tar source src || fail "download source"
 step "download chain data"
-api GET golden | tar -x -C data || fail "download chain data"
+fetch_tar golden data || fail "download chain data"
 step "download genesis"
 api GET genesis -o genesis.json || fail "download genesis"
 
