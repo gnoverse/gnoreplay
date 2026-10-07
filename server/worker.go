@@ -22,9 +22,13 @@ type Server struct {
 	queue  *Queue
 	gh     GitHub
 	logger *slog.Logger
-	// viewerKey unlocks the results of repos without public reports; empty
-	// means they are not served.
-	viewerKey string
+	// Sign-in with GitHub, for repos without public reports (see auth.go):
+	// sessionKey signs the session cookies, and none means nobody is signed
+	// in.
+	sessionKey  []byte
+	oauthSecret string
+	oauth       oauthEndpoints
+	viewers     viewerLists
 	// prov, when set, runs replays on worker machines (see remote.go);
 	// otherwise they run locally in the job sandboxes.
 	prov Provisioner
@@ -41,7 +45,7 @@ type Server struct {
 
 func newServer(cfg *Config, q *Queue, gh GitHub, logger *slog.Logger) *Server {
 	return &Server{
-		cfg: cfg, queue: q, gh: gh, logger: logger,
+		cfg: cfg, queue: q, gh: gh, logger: logger, oauth: githubOAuth,
 		wake: make(chan struct{}, 1), running: map[int64]context.CancelCauseFunc{}, sessions: map[int64]*session{},
 	}
 }

@@ -15,10 +15,6 @@ type Config struct {
 	// PublicURL is how users reach this server; reports link to each other
 	// with it. Empty disables the links.
 	PublicURL string `toml:"public_url"`
-	// ViewerKeyFile holds a key that unlocks the results of repos without
-	// public_reports (pass it once as ?key=, it is then kept in a cookie).
-	// Without it, those results are not served at all.
-	ViewerKeyFile string `toml:"viewer_key_file"`
 	// DataDir holds the job DB, git mirrors, job work dirs and reports.
 	DataDir string `toml:"data_dir"`
 	// Workers is the number of replays run concurrently: local sandboxes, or
@@ -49,6 +45,18 @@ type GitHubConfig struct {
 	PollInterval Duration `toml:"poll_interval"`
 	// GitURL is prefixed to "owner/name.git" to fetch commits.
 	GitURL string `toml:"git_url"`
+	// OAuth lets users sign in with GitHub, to see the results of repos that
+	// aren't public (see RepoConfig.ViewersFile). Without it, those are not
+	// served at all.
+	OAuth *OAuthConfig `toml:"oauth"`
+}
+
+// OAuthConfig is a GitHub OAuth app (not a GitHub App: it needs no approval
+// from the repos' organization), with <public_url>/auth/callback as its
+// callback URL. It asks for no scopes: users only prove who they are.
+type OAuthConfig struct {
+	ClientID         string `toml:"client_id"`
+	ClientSecretFile string `toml:"client_secret_file"`
 }
 
 // DigitalOceanConfig runs replays on disposable droplets: the droplet is the
@@ -125,9 +133,14 @@ type Rule struct {
 }
 
 type RepoConfig struct {
-	// PublicReports shows this repo's results to anyone. Otherwise they need
-	// the viewer key: keep false for private repos.
+	// PublicReports shows this repo's results to anyone: keep false for
+	// private repos.
 	PublicReports bool `toml:"public_reports"`
+	// ViewersFile lists who may see this repo's results when they aren't
+	// public, once signed in with GitHub: a GitHub user ID per line, then
+	// anything (e.g. the login); # starts a comment. It is reread when it
+	// changes. scripts/sync-viewers.sh writes it from the repo's collaborators.
+	ViewersFile string `toml:"viewers_file"`
 }
 
 type Duration struct{ time.Duration }
@@ -232,6 +245,19 @@ func (c *Config) validate() error {
 		return fmt.Errorf("github.token_file is required")
 	case c.Job.GnoreplayOverlay == "":
 		return fmt.Errorf("job.gnoreplay_overlay is required")
+	}
+	if o := c.GitHub.OAuth; o != nil {
+		switch {
+		case o.ClientID == "" || o.ClientSecretFile == "":
+			return fmt.Errorf("github.oauth.client_id and github.oauth.client_secret_file are required")
+		case c.PublicURL == "":
+			return fmt.Errorf("github.oauth needs public_url, for its callback URL")
+		}
+	}
+	for name, repo := range c.Repos {
+		if repo.ViewersFile != "" && c.GitHub.OAuth == nil {
+			return fmt.Errorf("repos.%q.viewers_file needs github.oauth to sign viewers in", name)
+		}
 	}
 	if do := c.DigitalOcean; do != nil {
 		switch {

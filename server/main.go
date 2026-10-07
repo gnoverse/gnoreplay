@@ -66,12 +66,6 @@ func setup(configPath string, logger *slog.Logger) (*Server, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	var viewerKey []byte
-	if cfg.ViewerKeyFile != "" {
-		if viewerKey, err = os.ReadFile(cfg.ViewerKeyFile); err != nil {
-			return nil, nil, fmt.Errorf("read viewer key: %w", err)
-		}
-	}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, nil, err
 	}
@@ -80,7 +74,18 @@ func setup(configPath string, logger *slog.Logger) (*Server, func(), error) {
 		return nil, nil, fmt.Errorf("open queue: %w", err)
 	}
 	srv := newServer(cfg, q, gh, logger)
-	srv.viewerKey = strings.TrimSpace(string(viewerKey))
+	if o := cfg.GitHub.OAuth; o != nil {
+		secret, err := os.ReadFile(o.ClientSecretFile)
+		if err != nil {
+			q.Close()
+			return nil, nil, fmt.Errorf("read github oauth secret: %w", err)
+		}
+		srv.oauthSecret = strings.TrimSpace(string(secret))
+		if srv.sessionKey, err = loadSessionKey(filepath.Join(cfg.DataDir, "session.key")); err != nil {
+			q.Close()
+			return nil, nil, fmt.Errorf("session key: %w", err)
+		}
+	}
 	if do := cfg.DigitalOcean; do != nil {
 		token, err := os.ReadFile(do.TokenFile)
 		if err != nil {

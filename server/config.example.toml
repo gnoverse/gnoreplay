@@ -3,9 +3,6 @@
 listen = ":8080"
 # How users reach this server (results are only published here).
 public_url = "https://replay.example.org"
-# Unlocks the results of repos without public_reports: open any page once
-# with ?key=<key>. Without it, those results are not served at all.
-viewer_key_file = "/etc/gnoreplay/viewer-key"
 data_dir = "/var/lib/gnoreplay"
 # Replays run concurrently. Each needs a 9G VM (see run_sandbox) and uses
 # ~1-2 cores; size to RAM first.
@@ -18,6 +15,15 @@ token_file = "/etc/gnoreplay/github-token"
 # Each poll costs one API call per tracked branch, plus one per 100 open PRs
 # per repo.
 poll_interval = "2m"
+
+# Sign-in with GitHub, for the results of repos without public_reports. A
+# GitHub OAuth app (Settings → Developer settings → OAuth Apps; no approval
+# from the repos' organization needed), with callback URL
+# <public_url>/auth/callback. It asks for no scopes: users only prove who they
+# are, and viewers_file below says who may see what.
+[github.oauth]
+client_id = "Ov23liXXXXXXXXXXXXXX"
+client_secret_file = "/etc/gnoreplay/github-oauth-secret"
 
 [chain]
 # Stopped copy of the reference node's data dir, refreshed by
@@ -60,9 +66,11 @@ run_timeout = "4h"
 public_reports = true
 
 [repos."gnolang/gno-fixes"]
-# Private repo: its results need the viewer key, and /queue hides its jobs'
-# details from everyone else.
+# Private repo: its results are only shown to the users its viewers file
+# lists, signed in (scripts/sync-viewers.sh writes it from the repo's
+# collaborators), and pages and /queue hide its jobs from everyone else.
 public_reports = false
+viewers_file = "/etc/gnoreplay/gno-fixes-viewers"
 
 # Priority rules (first match wins; earlier runs first). These are the
 # defaults, shown for reference.

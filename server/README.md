@@ -73,7 +73,7 @@ What the box needs in both cases (except where noted):
 - **A read-only GitHub token** in `github.token_file`, for the GitHub API's rate limit and for private repos:
   - fine-grained (preferred): repositories `gnolang/gno` and `gnolang/gno-fixes`, permissions *Contents: read-only* and *Pull requests: read-only* (the org may need to approve it);
   - or classic with **no scopes**, if only public repos are tracked: it can read them, and nothing else. (A classic token that can read a private repo needs the `repo` scope, which can also write: don't.)
-- **A viewer key** in `viewer_key_file`, if private repos are tracked: anyone who opens a page once with `?key=<key>` can see their results (it is kept in a cookie). Without it, they are not served at all.
+- **Sign-in with GitHub**, if private repos are tracked (`[github.oauth]`, see the deploy README): a private repo's results are only shown to the users its `viewers_file` lists, signed in; everyone else doesn't see them, in pages, search or `/queue`. Sign-in only identifies users (the OAuth app asks for no scopes). Who may see a repo is not asked of GitHub, as its collaborator check needs push access, which the server's token doesn't have: [`scripts/sync-viewers.sh`](scripts/sync-viewers.sh), run by someone with push access, writes the list from the repo's collaborators, by GitHub user ID (a login can be renamed, then taken). The server rereads it when it changes. Without `[github.oauth]`, private results are not served at all.
 
 ### Security
 
@@ -82,7 +82,7 @@ PR code is untrusted.
 - **Worker machines** hold nothing but their own job: the coordinator checks out the commit and serves it, with the chain data, on its private address to a token valid for that job only, and takes the report back the same way. They get no GitHub or cloud credentials, and no inbound connections (cloud firewall). They live in a VPC of their own, so they can't reach anything but the coordinator's worker endpoint; they keep outbound internet access for Go and its modules.
 - **Local mode**: builds and replays run in microsandbox VMs that mount only the data dir, with a minimal environment; the replay VM has no network.
 
-The GitHub token stays on the coordinator: it goes to `git fetch` there through that command's environment only. Keep the token and viewer key files outside `data_dir`.
+The GitHub token stays on the coordinator: it goes to `git fetch` there through that command's environment only. Keep the token, OAuth secret and viewers files outside `data_dir` (which holds `session.key`, the key signing session cookies, created on first start).
 
 The server never writes to GitHub: its client refuses any request other than `GET`/`HEAD` before it leaves the process (`TestTokenClientReadOnly`), and git only fetches.
 
@@ -92,6 +92,6 @@ The server never writes to GitHub: its client refuses any request other than `GE
 go test ./...
 ```
 
-`TestServerEndToEnd` drives the whole pipeline — polling, queue, supersede and cancel, git fetch, build, chain data copy, replay, baseline classification, result pages and reports, the viewer key — with local git remotes, a fake GitHub and a stand-in `gnoreplay`.
+`TestServerEndToEnd` drives the whole pipeline — polling, queue, supersede and cancel, git fetch, build, chain data copy, replay, baseline classification, result pages and reports, private repos behind sign-in — with local git remotes, a fake GitHub and a stand-in `gnoreplay`.
 
 `TestTokenClientLive` reads `gnolang/gno` through the real API when `GNOREPLAY_LIVE_TOKEN` is set.

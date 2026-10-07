@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -32,41 +31,21 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /{owner}/{repo}/tree/{branch...}", s.serveTarget)
 	mux.HandleFunc("GET /search", s.serveSearch)
 	mux.HandleFunc("GET /queue", s.serveQueue)
+	mux.HandleFunc("GET /login", s.serveLogin)
+	mux.HandleFunc("GET /auth/callback", s.serveCallback)
+	mux.HandleFunc("POST /logout", s.serveLogout)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
-	return s.withViewerKey(mux)
+	return mux
 }
 
-const viewerCookie = "gnoreplay_key"
-
-// withViewerKey turns a valid ?key= into a cookie, so links between pages
-// keep working without carrying the key.
-func (s *Server) withViewerKey(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if key := r.URL.Query().Get("key"); key != "" && s.validKey(key) {
-			http.SetCookie(w, &http.Cookie{
-				Name: viewerCookie, Value: key, Path: "/", HttpOnly: true,
-				Secure: strings.HasPrefix(s.cfg.PublicURL, "https://"), SameSite: http.SameSiteLaxMode,
-				MaxAge: 90 * 24 * 3600,
-			})
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func (s *Server) validKey(key string) bool {
-	return s.viewerKey != "" && subtle.ConstantTimeCompare([]byte(key), []byte(s.viewerKey)) == 1
-}
-
-// canSee reports whether the request may see repo's results.
+// canSee reports whether the request may see repo's results: anyone if they
+// are public, else users its viewers file lists, signed in.
 func (s *Server) canSee(r *http.Request, repo string) bool {
 	if s.cfg.Repos[repo].PublicReports {
 		return true
 	}
-	if s.validKey(r.URL.Query().Get("key")) {
-		return true
-	}
-	c, err := r.Cookie(viewerCookie)
-	return err == nil && s.validKey(c.Value)
+	v := s.viewer(r)
+	return v != nil && s.allowed(repo, v.ID)
 }
 
 func (s *Server) visible(r *http.Request, jobs []*Job) []*Job {
@@ -204,10 +183,24 @@ var pages = template.Must(template.New("").Funcs(template.FuncMap{
 	"inc": func(i int) int { return i + 1 },
 }).Parse(pageHTML))
 
-// base is what every page has: its title and the search box's text.
+// base is what every page has: its title, the search box's text, and who is
+// signed in.
 type base struct {
 	Title string
 	Query string
+	// Viewer is the signed-in user's login, if any; SignIn offers to sign
+	// in, back to Path.
+	Viewer string
+	SignIn bool
+	Path   string
+}
+
+func (s *Server) base(r *http.Request, title, query string) base {
+	b := base{Title: title, Query: query, SignIn: s.oauthEnabled(), Path: r.URL.RequestURI()}
+	if v := s.viewer(r); v != nil {
+		b.Viewer = v.Login
+	}
+	return b
 }
 
 func (s *Server) writePage(w http.ResponseWriter, name string, data any) {
@@ -257,7 +250,7 @@ func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
 		Workers           int
 		RunTimeoutMinutes int
 	}{
-		base:              base{Title: "gnoreplay: mainnet replay checks"},
+		base:              s.base(r, "gnoreplay: mainnet replay checks", ""),
 		Recent:            s.visible(r, recent),
 		PollInterval:      s.cfg.GitHub.PollInterval.String(),
 		Workers:           s.cfg.Workers,
@@ -330,7 +323,7 @@ func (s *Server) serveTarget(w http.ResponseWriter, r *http.Request) {
 		Latest *Job // the newest replay that ran to an end, or nil
 		Body   template.HTML
 	}{First: jobs[0], Jobs: jobs}
-	data.Title = fmt.Sprintf("%s %s", repo, describe(jobs[0]))
+	data.base = s.base(r, fmt.Sprintf("%s %s", repo, describe(jobs[0])), "")
 	for _, j := range jobs {
 		if j.State == stateDone || j.State == stateFailed {
 			data.Latest = j
@@ -362,7 +355,7 @@ func (s *Server) serveJob(w http.ResponseWriter, r *http.Request) {
 		Job  *Job
 		Base *Job // the baseline it was compared with, or nil
 		Body template.HTML
-	}{base: base{Title: fmt.Sprintf("Replay of %s %s at %s", j.Repo, describe(j), shortSHA(j.SHA))}, Job: j, Body: body}
+	}{base: s.base(r, fmt.Sprintf("Replay of %s %s at %s", j.Repo, describe(j), shortSHA(j.SHA)), ""), Job: j, Body: body}
 	if j.BaseID != 0 {
 		if b, err := s.queue.Get(j.BaseID); err == nil {
 			data.Base = b
@@ -435,7 +428,7 @@ func (s *Server) serveSearch(w http.ResponseWriter, r *http.Request) {
 	s.writePage(w, "search", struct {
 		base
 		Jobs []*Job
-	}{base{Title: "Search: " + q, Query: q}, jobs})
+	}{s.base(r, "Search: "+q, q), jobs})
 }
 
 // search returns the jobs q designates, and whether it designates commits

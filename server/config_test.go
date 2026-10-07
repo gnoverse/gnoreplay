@@ -26,9 +26,20 @@ func loadExample(t *testing.T, path string) *Config {
 
 func TestExampleConfig(t *testing.T) {
 	cfg := loadExample(t, "config.example.toml")
-	assert.Equal(t, "/etc/gnoreplay/viewer-key", cfg.ViewerKeyFile)
+	require.NotNil(t, cfg.GitHub.OAuth)
+	assert.Equal(t, "/etc/gnoreplay/github-oauth-secret", cfg.GitHub.OAuth.ClientSecretFile)
 	assert.Equal(t, defaultRules, cfg.Rules)
 	assert.False(t, cfg.Repos["gnolang/gno-fixes"].PublicReports)
+	assert.Equal(t, "/etc/gnoreplay/gno-fixes-viewers", cfg.Repos["gnolang/gno-fixes"].ViewersFile)
+
+	// Viewers sign in with GitHub, whose callback is on the public URL.
+	oauth := cfg.GitHub.OAuth
+	cfg.PublicURL = ""
+	assert.ErrorContains(t, cfg.validate(), "github.oauth needs public_url")
+	cfg.PublicURL = "https://replay.example.org"
+	cfg.GitHub.OAuth = nil
+	assert.ErrorContains(t, cfg.validate(), "viewers_file needs github.oauth")
+	cfg.GitHub.OAuth = oauth
 	assert.True(t, cfg.Repos["gnolang/gno"].PublicReports)
 	assert.Equal(t, "4h0m0s", cfg.Job.RunTimeout.String())
 	assert.Nil(t, cfg.DigitalOcean)

@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -215,7 +214,10 @@ func TestServerEndToEnd(t *testing.T) {
 		Chain:     ChainConfig{GoldenDir: golden, Genesis: filepath.Join(root, "genesis.json")},
 		GitHub:    GitHubConfig{GitURL: "file://" + filepath.Join(root, "remote") + "/"},
 		PublicURL: "https://replay.example",
-		Repos:     map[string]RepoConfig{"gnolang/gno": {PublicReports: true}},
+		Repos: map[string]RepoConfig{
+			"gnolang/gno":       {PublicReports: true},
+			"gnolang/gno-fixes": {ViewersFile: filepath.Join(root, "gno-fixes-viewers")},
+		},
 		Job: JobConfig{
 			GnoreplayOverlay: overlay,
 			// A stand-in for a VM sandbox: it must get the job and checkout.
@@ -229,7 +231,8 @@ func TestServerEndToEnd(t *testing.T) {
 	defer q.Close()
 	gh := newFakeGitHub()
 	srv := newServer(cfg, q, gh, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	srv.viewerKey = "viewer-key"
+	enableSignIn(t, srv, map[string]Viewer{"alice-code": {ID: 42, Login: "alice"}})
+	require.NoError(t, os.WriteFile(cfg.Repos["gnolang/gno-fixes"].ViewersFile, []byte("42 alice\n"), 0o644))
 	httpSrv := httptest.NewServer(srv.routes())
 	defer httpSrv.Close()
 
@@ -359,7 +362,7 @@ func TestServerEndToEnd(t *testing.T) {
 	require.Equal(t, http.StatusOK, code)
 	assert.Contains(t, page, "No replay matches")
 
-	// A PR of the private repo: invisible without the viewer key, even
+	// A PR of the private repo: invisible unless signed in and listed, even
 	// queued.
 	gh.setPulls("gnolang/gno-fixes", PullRequest{Number: 3, Base: "develop", HeadSHA: shaFixesPR})
 	poll()
@@ -370,7 +373,7 @@ func TestServerEndToEnd(t *testing.T) {
 	assert.Equal(t, outcomeDiverges, fixesPR.Outcome)
 	for _, path := range []string{
 		fmt.Sprintf("/jobs/%d", fixesPR.ID), fmt.Sprintf("/reports/%d", fixesPR.ID),
-		"/gnolang/gno-fixes/pull/3", fmt.Sprintf("/jobs/%d?key=wrong", fixesPR.ID),
+		"/gnolang/gno-fixes/pull/3",
 	} {
 		code, _ = get(anon, path)
 		assert.Equal(t, http.StatusNotFound, code, path)
@@ -382,12 +385,10 @@ func TestServerEndToEnd(t *testing.T) {
 	_, queue := get(anon, "/queue")
 	assert.NotContains(t, queue, "gno-fixes")
 
-	// With the key once, a cookie keeps the private results visible.
-	jar, err := cookiejar.New(nil)
-	require.NoError(t, err)
-	viewer := &http.Client{Jar: jar}
-	code, _ = get(viewer, "/?key=viewer-key")
-	require.Equal(t, http.StatusOK, code)
+	// Signed in, a listed user sees them.
+	viewer := newJar(t)
+	code, _ = signIn(t, viewer, httpSrv.URL, "alice-code", "/")
+	require.Equal(t, http.StatusFound, code)
 	code, page = get(viewer, "/gnolang/gno-fixes/pull/3")
 	require.Equal(t, http.StatusOK, code)
 	assert.Contains(t, page, "PR #3")
@@ -531,22 +532,6 @@ func TestPullTestMerge(t *testing.T) {
 		assert.Equal(t, outcomeDiverges, j.Outcome, c.why)
 		assert.Equal(t, head, j.ReplaySHA, c.why)
 		assert.Equal(t, "the PR's head as is: "+c.why+", so what it lacks from master may show as divergences", j.ReplayNote)
-	}
-}
-
-func TestNoViewerKey(t *testing.T) {
-	cfg := &Config{DataDir: t.TempDir()}
-	cfg.setDefaults()
-	q := newTestQueue(t)
-	srv := newServer(cfg, q, newFakeGitHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	require.NoError(t, srv.enqueueFor("gnolang/gno-fixes", eventPush, "develop", 0, "abc"))
-
-	// Without a configured key, no key unlocks private results, not even an
-	// empty one.
-	for _, path := range []string{"/jobs/1", "/jobs/1?key=", "/gnolang/gno-fixes/tree/develop"} {
-		rec := httptest.NewRecorder()
-		srv.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
-		assert.Equal(t, http.StatusNotFound, rec.Code, path)
 	}
 }
 

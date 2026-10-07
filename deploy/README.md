@@ -70,7 +70,10 @@ systemctl start gnoreplay-golden && systemctl enable --now gnoreplay-golden.time
 |---|---|
 | `/etc/gnoreplay/github-token` | a read-only GitHub token (see the server README) |
 | `/etc/gnoreplay/digitalocean-token` | the API token above |
-| `/etc/gnoreplay/viewer-key` | any random string, if private repos are tracked |
+| `/etc/gnoreplay/github-oauth-secret` | if private repos are tracked: the client secret of the sign-in OAuth app (below) |
+| `/etc/gnoreplay/<repo>-viewers` | if private repos are tracked: who may see each one's results, from [`scripts/sync-viewers.sh`](../server/scripts/sync-viewers.sh) (rerun when its collaborators change) |
+
+**Private repos' results** are shown to the users their `viewers_file` lists, signed in with GitHub. Register an OAuth app (any account can, e.g. the server's GitHub account: *Settings → Developer settings → OAuth Apps → New OAuth App*; the organization needn't approve it, as it reads no organization data), with homepage `https://<host>` and callback URL `https://<host>/auth/callback`. Put its client ID in `[github.oauth]` and a generated client secret in the file above. It asks users for no scopes.
 
 ```bash
 # The watchdog first: it deletes workers older than 4h even if the server misbehaves.
