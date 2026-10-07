@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -116,24 +117,31 @@ func (f *fakeMachines) names() (created, deleted []string, running int) {
 	return append([]string(nil), f.created...), append([]string(nil), f.deleted...), len(f.running)
 }
 
-func TestRemoteReplay(t *testing.T) {
+// remoteEnv runs remote replays on fakeMachines, with a worker endpoint
+// that a restarted server takes over.
+type remoteEnv struct {
+	root, remote string // remote: the gnolang/gno repo
+	cfg          *Config
+	q            *Queue
+	machines     *fakeMachines
+	srv          *Server
+	handler      atomic.Value // the worker endpoint's http.Handler
+}
+
+func newRemoteEnv(t *testing.T) *remoteEnv {
+	t.Helper()
 	for _, tool := range []string{"git", "bash", "curl", "tar"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s not available", tool)
 		}
 	}
-	root := t.TempDir()
+	e := &remoteEnv{root: t.TempDir()}
+	root := e.root
 
-	remote := filepath.Join(root, "remote", "gnolang", "gno.git")
-	require.NoError(t, os.MkdirAll(remote, 0o755))
-	git(t, remote, "init", "-q")
-	git(t, remote, "config", "uploadpack.allowAnySHA1InWant", "true")
-
-	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
-	shaClean := commitReport(t, remote, clean, 0)
-	shaCrash := commitReport(t, remote, clean, 1) // the tool exits 1
-	require.NoError(t, os.WriteFile(filepath.Join(remote, "fake-sleep"), []byte("1h"), 0o644))
-	shaSlow := commitReport(t, remote, clean, 0)
+	e.remote = filepath.Join(root, "remote", "gnolang", "gno.git")
+	require.NoError(t, os.MkdirAll(e.remote, 0o755))
+	git(t, e.remote, "init", "-q")
+	git(t, e.remote, "config", "uploadpack.allowAnySHA1InWant", "true")
 
 	golden := filepath.Join(root, "golden")
 	for _, name := range []string{"blockstore.db", "state.db"} {
@@ -147,7 +155,7 @@ func TestRemoteReplay(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(overlay, "go.mod"), []byte("module fake\n\ngo 1.22\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(overlay, "main.go"), []byte(fakeTool), 0o644))
 
-	cfg := &Config{
+	e.cfg = &Config{
 		DataDir:      filepath.Join(root, "data"),
 		Chain:        ChainConfig{GoldenDir: golden, Genesis: genesis},
 		GitHub:       GitHubConfig{GitURL: "file://" + filepath.Join(root, "remote") + "/"},
@@ -155,19 +163,42 @@ func TestRemoteReplay(t *testing.T) {
 		Job:          JobConfig{GnoreplayOverlay: overlay},
 		DigitalOcean: &DigitalOceanConfig{},
 	}
-	cfg.setDefaults()
-	q, err := openQueue(filepath.Join(t.TempDir(), "jobs.db"))
+	e.cfg.setDefaults()
+	var err error
+	e.q, err = openQueue(filepath.Join(t.TempDir(), "jobs.db"))
 	require.NoError(t, err)
-	defer q.Close()
-	srv := newServer(cfg, q, newFakeGitHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	machines := newFakeMachines(t.TempDir())
-	srv.prov = machines
+	t.Cleanup(func() { e.q.Close() })
+	e.machines = newFakeMachines(t.TempDir())
 	workerWorkDir = filepath.Join(root, "workers")
 	// Never schedule this machine's shutdown.
 	workerPowerOff = false
-	workerSrv := httptest.NewServer(srv.workerRoutes())
-	defer workerSrv.Close()
-	cfg.DigitalOcean.URL = workerSrv.URL
+	workerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		e.handler.Load().(http.Handler).ServeHTTP(w, r)
+	}))
+	t.Cleanup(workerSrv.Close)
+	e.cfg.DigitalOcean.URL = workerSrv.URL
+	e.restart()
+	return e
+}
+
+// restart replaces the server with a new process's, on the same queue,
+// machines and worker endpoint.
+func (e *remoteEnv) restart() *Server {
+	e.srv = newServer(e.cfg, e.q, newFakeGitHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	e.srv.prov = e.machines
+	e.handler.Store(e.srv.workerRoutes())
+	return e.srv
+}
+
+func TestRemoteReplay(t *testing.T) {
+	e := newRemoteEnv(t)
+	cfg, q, srv, machines, remote := e.cfg, e.q, e.srv, e.machines, e.remote
+
+	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
+	shaClean := commitReport(t, remote, clean, 0)
+	shaCrash := commitReport(t, remote, clean, 1) // the tool exits 1
+	require.NoError(t, os.WriteFile(filepath.Join(remote, "fake-sleep"), []byte("1h"), 0o644))
+	shaSlow := commitReport(t, remote, clean, 0)
 
 	ctx := context.Background()
 	run := func(sha string) *Job {
@@ -231,7 +262,7 @@ func TestRemoteReplay(t *testing.T) {
 
 	// Worker endpoints need the job's token.
 	for _, token := range []string{"", "wrong"} {
-		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/worker/%d/source", workerSrv.URL, slow.ID), nil)
+		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/worker/%d/source", cfg.DigitalOcean.URL, slow.ID), nil)
 		require.NoError(t, err)
 		req.Header.Set("Authorization", "Bearer "+token)
 		res, err := http.DefaultClient.Do(req)
@@ -282,6 +313,116 @@ func TestRemoteReplay(t *testing.T) {
 	pending, err := q.Pending()
 	require.NoError(t, err)
 	assert.Empty(t, pending)
+}
+
+// A restarted server resumes the jobs its predecessor left on worker
+// machines, instead of failing them or starting over.
+func TestRemoteResume(t *testing.T) {
+	e := newRemoteEnv(t)
+	q, machines := e.q, e.machines
+	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
+	gate := filepath.Join(e.root, "gate")
+	require.NoError(t, os.WriteFile(filepath.Join(e.remote, "fake-wait"), []byte(gate), 0o644))
+	shaGated := commitReport(t, e.remote, clean, 0)
+
+	// The first process starts the job, then stops.
+	srv := e.srv
+	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPush, "master", 0, shaGated))
+	j, err := q.Claim()
+	require.NoError(t, err)
+	ctx, stop := context.WithCancelCause(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		srv.runJob(ctx, j)
+	}()
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(filepath.Join(workerWorkDir, fmt.Sprint(j.ID), "src", "fake-wait"))
+		return err == nil // the worker has the source
+	}, 30*time.Second, 50*time.Millisecond)
+	stop(errShutdown)
+	<-stopped
+
+	// Its job is left running, with its machine, session and job dir.
+	got, err := q.Get(j.ID)
+	require.NoError(t, err)
+	assert.Equal(t, stateRunning, got.State)
+	_, deleted, running := machines.names()
+	assert.Empty(t, deleted)
+	assert.Equal(t, 1, running)
+	stored, err := q.Sessions()
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	assert.Equal(t, j.ID, stored[0].JobID)
+	assert.DirExists(t, e.srv.jobDir(j.ID))
+
+	// Meanwhile: a job interrupted before it had a machine, and a machine
+	// no job owns.
+	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPush, "chain/mainnet", 0, shaGated))
+	early, err := q.Claim()
+	require.NoError(t, err)
+	machines.orphan("gnoreplay-job-999")
+
+	// The next process resumes the first job, queues the second again and
+	// deletes the orphan.
+	srv = e.restart()
+	ctx = context.Background()
+	resume, err := srv.start(ctx)
+	require.NoError(t, err)
+	require.Len(t, resume, 1)
+	assert.Equal(t, j.ID, resume[0].job.ID)
+	got, err = q.Get(early.ID)
+	require.NoError(t, err)
+	assert.Equal(t, stateQueued, got.State)
+	_, deleted, running = machines.names()
+	assert.Equal(t, []string{"gnoreplay-job-999"}, deleted)
+	assert.Equal(t, 1, running)
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		srv.resumeJob(ctx, resume[0])
+	}()
+	require.NoError(t, os.WriteFile(gate, nil, 0o644))
+	select {
+	case <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatal("resumed job did not finish")
+	}
+	got, err = q.Get(j.ID)
+	require.NoError(t, err)
+	require.Equal(t, stateDone, got.State, got.Error)
+	assert.Equal(t, outcomePass, got.Outcome)
+	_, deleted, running = machines.names()
+	assert.Contains(t, deleted, machineName(j.ID))
+	assert.Zero(t, running)
+	stored, err = q.Sessions()
+	require.NoError(t, err)
+	assert.Empty(t, stored)
+	assert.NoDirExists(t, srv.jobDir(j.ID))
+}
+
+// A result saved just before a restart is used, not waited for again.
+func TestAwaitWorkerSavedResult(t *testing.T) {
+	cfg := &Config{DataDir: t.TempDir()}
+	cfg.setDefaults()
+	srv := newServer(cfg, newTestQueue(t), newFakeGitHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	machines := newFakeMachines(t.TempDir())
+	srv.prov = machines
+	machines.orphan("gnoreplay-job-1")
+	ms, err := machines.List(context.Background())
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	sess := &session{dir: dir, created: time.Now(), done: make(chan struct{}, 1)}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, workerFailed), []byte("boom"), 0o644))
+	err = srv.awaitWorker(context.Background(), sess, ms[0], io.Discard)
+	assert.ErrorContains(t, err, "worker failed:\nboom")
+	_, deleted, _ := machines.names()
+	assert.Equal(t, []string{"gnoreplay-job-1"}, deleted)
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "report.json"), []byte("{}"), 0o644))
+	assert.NoError(t, srv.awaitWorker(context.Background(), sess, Machine{ID: "gone"}, io.Discard))
 }
 
 func TestWorkerScriptQuoting(t *testing.T) {

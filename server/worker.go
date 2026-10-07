@@ -69,6 +69,12 @@ func shortSHA(sha string) string { return sha[:min(len(sha), 9)] }
 
 var errSuperseded = errors.New("superseded by a newer push, or the PR was closed")
 
+// errShutdown cancels the server's context when it stops: jobs on worker
+// machines are left running, and resumed at the next start; others run again.
+var errShutdown = errors.New("server stopping")
+
+func shuttingDown(ctx context.Context) bool { return errors.Is(context.Cause(ctx), errShutdown) }
+
 // cancel stops a running job, superseded or closed: the queue already
 // marked it so.
 func (s *Server) cancel(id int64) { s.cancelCause(id, errSuperseded) }
@@ -83,8 +89,15 @@ func (s *Server) cancelCause(id int64, cause error) {
 	}
 }
 
-// work runs jobs until ctx is done.
-func (s *Server) work(ctx context.Context) {
+// work runs jobs until ctx is done: first those a previous process left on
+// worker machines, then queued ones.
+func (s *Server) work(ctx context.Context, resume <-chan resumable) {
+	for r := range resume {
+		if ctx.Err() != nil {
+			return
+		}
+		s.resumeJob(ctx, r)
+	}
 	for ctx.Err() == nil {
 		j, err := s.queue.Claim()
 		if err != nil {
@@ -103,6 +116,14 @@ func (s *Server) work(ctx context.Context) {
 }
 
 func (s *Server) runJob(ctx context.Context, j *Job) {
+	s.track(ctx, j, func(ctx context.Context, logger *slog.Logger) (*Report, string, error) {
+		return s.replay(ctx, j, logger)
+	})
+}
+
+// track runs a job's replay, then records its result: it can be cancelled
+// meanwhile, and a stopping server leaves it running.
+func (s *Server) track(ctx context.Context, j *Job, replay func(context.Context, *slog.Logger) (*Report, string, error)) {
 	jobCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	s.mu.Lock()
@@ -115,17 +136,21 @@ func (s *Server) runJob(ctx context.Context, j *Job) {
 	}()
 
 	logger := s.logger.With("job", j.ID, "key", j.Key, "sha", j.SHA)
-	logger.Info("replay started")
 
 	// The baseline is read before this job finishes, so a push job compares
 	// against the previous commit on its branch.
-	base, err := s.queue.Baseline(j.Repo, j.Branch)
+	base, err := s.queue.Baseline(j.Repo, j.Branch, time.Now())
 	if err != nil {
 		logger.Error("load baseline", "err", err)
 	}
 
-	report, reportPath, err := s.replay(jobCtx, j, logger)
-	if jobCtx.Err() != nil && ctx.Err() == nil {
+	report, reportPath, err := replay(jobCtx, logger)
+	switch {
+	case err == nil:
+	case shuttingDown(jobCtx):
+		logger.Info("server stopping: replay left for the next start")
+		return
+	case jobCtx.Err() != nil:
 		// Recorded as failed, unless superseded or closed: the queue already
 		// marked those, and Finish leaves them alone.
 		cause := context.Cause(jobCtx)
@@ -135,8 +160,7 @@ func (s *Server) runJob(ctx context.Context, j *Job) {
 		}
 		logger.Info("replay cancelled", "cause", cause, "recorded", recorded)
 		return
-	}
-	if err != nil {
+	default:
 		logger.Error("replay failed", "err", err)
 		if _, ferr := s.queue.Finish(j.ID, Job{State: stateFailed, Error: err.Error()}); ferr != nil {
 			logger.Error("finish job", "err", ferr)
@@ -144,26 +168,41 @@ func (s *Server) runJob(ctx context.Context, j *Job) {
 		return
 	}
 
-	var baseReport *Report
-	if base != nil {
-		if baseReport, err = readReport(base.ReportPath); err != nil {
-			logger.Error("read baseline report", "base", base.ID, "err", err)
-		}
-	}
-	c := classify(report, baseReport)
-	out := render(j, report, c, s.reportURL(j))
-	// The job page shows this body; write it before marking the job done.
-	if err := os.WriteFile(bodyPath(reportPath), []byte(out.Body), 0o644); err != nil {
+	out, c, err := s.renderJob(j, report, reportPath, base)
+	if err != nil {
 		logger.Error("write job page", "err", err)
 	}
 	recorded, err := s.queue.Finish(j.ID, Job{
-		State: stateDone, ReportPath: reportPath, Outcome: out.Outcome, Summary: out.Summary,
+		State: stateDone, ReportPath: reportPath, Outcome: out.Outcome, Summary: out.Summary, BaseID: baseID(base),
 	})
 	if err != nil || !recorded {
 		logger.Info("result discarded", "recorded", recorded, "err", err)
 		return
 	}
 	logger.Info("replay done", "outcome", out.Outcome, "new", len(c.New), "inherited", len(c.Inherited), "fixed", len(c.Fixed))
+}
+
+// renderJob classifies a job's report against its base job's, and writes the
+// job page's body next to the report.
+func (s *Server) renderJob(j *Job, report *Report, reportPath string, base *Job) (Outcome, Classification, error) {
+	var baseReport *Report
+	if base != nil {
+		var err error
+		if baseReport, err = readReport(base.ReportPath); err != nil {
+			s.logger.Error("read baseline report", "job", j.ID, "base", base.ID, "err", err)
+			base = nil
+		}
+	}
+	c := classify(report, baseReport)
+	out := render(j, report, c, s.reportURL(j), base)
+	return out, c, os.WriteFile(bodyPath(reportPath), []byte(out.Body), 0o644)
+}
+
+func baseID(base *Job) int64 {
+	if base == nil {
+		return 0
+	}
+	return base.ID
 }
 
 // bodyPath is where a job's rendered page body is stored, next to its report.
@@ -174,16 +213,15 @@ func bodyPath(reportPath string) string {
 // replay fetches the commit, builds gnoreplay from it and runs it against a
 // copy of the golden data dir. It returns the report and where it is stored.
 func (s *Server) replay(ctx context.Context, j *Job, logger *slog.Logger) (*Report, string, error) {
-	jobDir := filepath.Join(s.cfg.DataDir, "jobs", fmt.Sprint(j.ID))
+	logger.Info("replay started")
+	jobDir := s.jobDir(j.ID)
 	if err := os.RemoveAll(jobDir); err != nil {
 		return nil, "", err
 	}
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		return nil, "", err
 	}
-	if !s.cfg.Job.KeepJobDirs {
-		defer os.RemoveAll(jobDir)
-	}
+	defer s.removeJobDir(ctx, jobDir)
 	logFile, err := os.Create(filepath.Join(jobDir, "job.log"))
 	if err != nil {
 		return nil, "", err
@@ -226,13 +264,27 @@ func (s *Server) replay(ctx context.Context, j *Job, logger *slog.Logger) (*Repo
 	reportFile := filepath.Join(jobDir, "report.json")
 	if s.prov != nil {
 		step("replay on a worker machine")
-		if err := s.replayRemote(ctx, j, src, reportFile, logFile); err != nil {
+		if err := s.replayRemote(ctx, j, jobDir, logFile); err != nil {
 			return nil, "", err
 		}
 	} else if err := s.replayLocal(ctx, j, jobDir, src, reportFile, logFile, step); err != nil {
 		return nil, "", err
 	}
+	return s.saveReport(j, reportFile)
+}
 
+func (s *Server) jobDir(id int64) string { return filepath.Join(s.cfg.DataDir, "jobs", fmt.Sprint(id)) }
+
+// removeJobDir removes a job's dir once it is over, unless job dirs are kept
+// or the server is stopping: its worker may still need it at the next start.
+func (s *Server) removeJobDir(ctx context.Context, dir string) {
+	if !s.cfg.Job.KeepJobDirs && !shuttingDown(ctx) {
+		os.RemoveAll(dir)
+	}
+}
+
+// saveReport moves a job's report from its job dir to the reports dir.
+func (s *Server) saveReport(j *Job, reportFile string) (*Report, string, error) {
 	reportPath := filepath.Join(s.reportsDir(), fmt.Sprintf("%d.json", j.ID))
 	if err := os.Rename(reportFile, reportPath); err != nil {
 		return nil, "", err

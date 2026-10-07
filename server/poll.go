@@ -41,6 +41,7 @@ func (s *Server) pollRepo(ctx context.Context, repo string) error {
 		event, branch string
 		pr            int
 		sha           string
+		title, author string
 	}
 	var current []head
 	hasPRRules := false
@@ -52,7 +53,7 @@ func (s *Server) pollRepo(ctx context.Context, repo string) error {
 			if err != nil {
 				return fmt.Errorf("branch %s: %w", r.Branch, err)
 			}
-			current = append(current, head{eventPush, r.Branch, 0, sha})
+			current = append(current, head{event: eventPush, branch: r.Branch, sha: sha})
 		case r.Event == eventPullRequest:
 			hasPRRules = true
 		}
@@ -64,7 +65,7 @@ func (s *Server) pollRepo(ctx context.Context, repo string) error {
 		}
 		for _, pr := range prs {
 			if _, ok := s.cfg.priority(repo, eventPullRequest, pr.Base); ok {
-				current = append(current, head{eventPullRequest, pr.Base, pr.Number, pr.HeadSHA})
+				current = append(current, head{eventPullRequest, pr.Base, pr.Number, pr.HeadSHA, pr.Title, pr.Author})
 			}
 		}
 	}
@@ -86,6 +87,16 @@ func (s *Server) pollRepo(ctx context.Context, repo string) error {
 			}
 		}
 		if err := s.queue.SetHead(key, repo, h.sha); err != nil {
+			return err
+		}
+	}
+	// Titles go on the PRs' jobs: new ones, those queued with the enqueue
+	// command, and renamed PRs'.
+	for _, h := range current {
+		if h.event != eventPullRequest {
+			continue
+		}
+		if err := s.queue.SetPRInfo(jobKey(repo, h.event, h.branch, h.pr), h.title, h.author); err != nil {
 			return err
 		}
 	}

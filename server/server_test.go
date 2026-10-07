@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -103,6 +104,15 @@ func main() {
 	if bz, err := os.ReadFile(filepath.Join(root, "fake-sleep")); err == nil {
 		d, _ := time.ParseDuration(strings.TrimSpace(string(bz)))
 		time.Sleep(d)
+	}
+	// Wait until the test creates the file named in fake-wait.
+	if bz, err := os.ReadFile(filepath.Join(root, "fake-wait")); err == nil {
+		for {
+			if _, err := os.Stat(strings.TrimSpace(string(bz))); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 	report, err := os.ReadFile(filepath.Join(root, "fake-report.json"))
 	if err != nil {
@@ -262,33 +272,41 @@ func TestServerEndToEnd(t *testing.T) {
 
 	// A PR is opened, then pushed to before its replay starts: the newer
 	// head supersedes the first.
-	gh.setPulls("gnolang/gno",
-		PullRequest{Number: 5, Base: "master", HeadSHA: shaOldPR},
-		PullRequest{Number: 7, Base: "master", HeadSHA: shaPR},
-	)
+	pr7 := PullRequest{Number: 7, Base: "master", HeadSHA: shaPR, Title: "<b>Add</b> things", Author: "alice"}
+	gh.setPulls("gnolang/gno", PullRequest{Number: 5, Base: "master", HeadSHA: shaOldPR}, pr7)
 	poll()
-	gh.setPulls("gnolang/gno",
-		PullRequest{Number: 5, Base: "master", HeadSHA: shaOldPR},
-		PullRequest{Number: 7, Base: "master", HeadSHA: shaPR2},
-	)
+	pr7.HeadSHA = shaPR2
+	gh.setPulls("gnolang/gno", PullRequest{Number: 5, Base: "master", HeadSHA: shaOldPR}, pr7)
 	poll()
 	prJob := runNext()
 	assert.Equal(t, shaPR2, prJob.SHA)
 	assert.Equal(t, outcomeDiverges, prJob.Outcome)
 	assert.Contains(t, prJob.Summary, "1 new divergence(s) from gnoland-1 history")
+	assert.Equal(t, "<b>Add</b> things", prJob.Title)
+	assert.Equal(t, masterJob.ID, prJob.BaseID)
 
-	// Results are on the server: the PR's GitHub path leads to its latest
-	// replay, whose page lists the divergence.
+	// Results are on the server: the PR's GitHub path lists its replays, the
+	// superseded first push included, and shows the latest in full.
 	code, page := get(anon, "/gnolang/gno/pull/7")
 	require.Equal(t, http.StatusOK, code)
-	assert.Contains(t, page, "Replay of gnolang/gno PR #7 (into master)")
-	assert.Contains(t, page, shaPR2)
+	assert.Contains(t, page, "PR #7")
+	assert.Contains(t, page, "&lt;b&gt;Add&lt;/b&gt; things", "PR titles are escaped")
+	assert.Contains(t, page, "by @alice")
+	assert.Contains(t, page, "https://github.com/gnolang/gno/commit/"+shaPR2)
+	assert.Contains(t, page, shaPR[:9])
+	assert.Contains(t, page, "not checked: superseded")
+	assert.Contains(t, page, "<h2>New divergences (1)</h2>")
 	assert.Contains(t, page, "gno.land/r/demo/foo.Bar")
 	assert.Contains(t, page, "vm.VMError:")
-	assert.NotContains(t, page, "<script>", "tx errors are not rendered as HTML")
+	assert.NotContains(t, page, "<script>unexpected", "tx errors are not rendered as HTML")
+	code, page = get(anon, fmt.Sprintf("/jobs/%d", prJob.ID))
+	require.Equal(t, http.StatusOK, code)
+	assert.Contains(t, page, fmt.Sprintf(`<a href="/jobs/%d">master at <code>%s</code></a>`, masterJob.ID, shortSHA(masterJob.SHA)),
+		"the baseline it was compared with")
+	assert.Contains(t, page, `<time datetime="`)
 	code, page = get(anon, "/gnolang/gno/tree/chain/mainnet")
 	require.Equal(t, http.StatusOK, code)
-	assert.Contains(t, page, "Replay of gnolang/gno branch chain/mainnet")
+	assert.Contains(t, page, "Branch chain/mainnet")
 	code, _ = get(anon, "/gnolang/gno/pull/99")
 	assert.Equal(t, http.StatusNotFound, code)
 	code, report := get(anon, fmt.Sprintf("/reports/%d", prJob.ID))
@@ -297,16 +315,40 @@ func TestServerEndToEnd(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(report), &served))
 	assert.Len(t, served.Diffs, 1)
 
-	// The superseded first push is listed as not checked.
 	code, index := get(anon, "/")
 	require.Equal(t, http.StatusOK, code)
-	assert.Contains(t, index, "✗ 1 new divergence(s)")
-	assert.Contains(t, index, "not checked: superseded")
-	assert.Contains(t, index, shaPR[:9])
+	assert.Contains(t, index, "1 new divergence(s)")
+	assert.Contains(t, index, "pushes to gnolang/gno chain/mainnet")
+	assert.Contains(t, index, sourceURL)
 
-	// A PR of the private repo: invisible without the viewer key.
+	// Search leads to a PR's, a branch's or a commit's replays.
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	for q, want := range map[string]string{
+		"7":  "/gnolang/gno/pull/7",
+		"#7": "/gnolang/gno/pull/7",
+		"https://github.com/gnolang/gno/pull/7/files": "/gnolang/gno/pull/7",
+		"chain/mainnet": "/gnolang/gno/tree/chain/mainnet",
+		"THINGS":        "/gnolang/gno/pull/7",
+		shaPR2[:7]:      fmt.Sprintf("/jobs/%d", prJob.ID),
+		"github.com/gnolang/gno/commit/" + shaPR2: fmt.Sprintf("/jobs/%d", prJob.ID),
+	} {
+		res, err := noRedirect.Get(httpSrv.URL + "/search?q=" + url.QueryEscape(q))
+		require.NoError(t, err)
+		res.Body.Close()
+		assert.Equal(t, http.StatusFound, res.StatusCode, q)
+		assert.Equal(t, want, res.Header.Get("Location"), q)
+	}
+	code, page = get(anon, "/search?q=nothing+like+it")
+	require.Equal(t, http.StatusOK, code)
+	assert.Contains(t, page, "No replay matches")
+
+	// A PR of the private repo: invisible without the viewer key, even
+	// queued.
 	gh.setPulls("gnolang/gno-fixes", PullRequest{Number: 3, Base: "develop", HeadSHA: shaFixesPR})
 	poll()
+	_, index = get(anon, "/")
+	assert.NotContains(t, index, "gno-fixes")
+	assert.Contains(t, index, "a private repository's replay")
 	fixesPR := runNext()
 	assert.Equal(t, outcomeDiverges, fixesPR.Outcome)
 	for _, path := range []string{
@@ -316,6 +358,8 @@ func TestServerEndToEnd(t *testing.T) {
 		code, _ = get(anon, path)
 		assert.Equal(t, http.StatusNotFound, code, path)
 	}
+	_, page = get(anon, "/search?q=3")
+	assert.Contains(t, page, "No replay matches")
 	_, index = get(anon, "/")
 	assert.NotContains(t, index, "gno-fixes")
 	_, queue := get(anon, "/queue")
@@ -329,7 +373,8 @@ func TestServerEndToEnd(t *testing.T) {
 	require.Equal(t, http.StatusOK, code)
 	code, page = get(viewer, "/gnolang/gno-fixes/pull/3")
 	require.Equal(t, http.StatusOK, code)
-	assert.Contains(t, page, "Replay of gnolang/gno-fixes PR #3 (into develop)")
+	assert.Contains(t, page, "PR #3")
+	assert.Contains(t, page, "gnolang/gno-fixes · into")
 	_, index = get(viewer, "/")
 	assert.Contains(t, index, "gnolang/gno-fixes")
 

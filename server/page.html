@@ -1,0 +1,188 @@
+{{define "head"}}<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}}</title>
+<style>
+:root {
+	--bg: #fff; --fg: #1f2328; --muted: #59636e; --border: #d1d9e0; --subtle: #f6f8fa; --link: #0969da;
+	--pass: #1a7f37; --pass-bg: #dafbe1; --fail: #cf222e; --fail-bg: #ffebe9;
+	--warn: #9a6700; --warn-bg: #fff8c5; --info: #0969da; --info-bg: #ddf4ff; --gray-bg: #eff2f5;
+}
+@media (prefers-color-scheme: dark) {
+	:root {
+		--bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --border: #3d444d; --subtle: #151b23; --link: #4493f8;
+		--pass: #3fb950; --pass-bg: #12261e; --fail: #f85149; --fail-bg: #25171c;
+		--warn: #d29922; --warn-bg: #272115; --info: #4493f8; --info-bg: #121d2f; --gray-bg: #212830;
+	}
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.wrap { max-width: 72rem; margin: 0 auto; padding: 0 16px; }
+header.top { border-bottom: 1px solid var(--border); background: var(--subtle); }
+header.top .wrap { display: flex; gap: .5rem 1rem; align-items: center; flex-wrap: wrap; padding-top: .6rem; padding-bottom: .6rem; }
+.brand { font-weight: 650; color: var(--fg); font-size: 1.05rem; }
+header form { flex: 1 1 16rem; display: flex; }
+header input { flex: 1; min-width: 0; padding: .4rem .6rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--fg); font: inherit; }
+nav { display: flex; gap: 1rem; }
+main { padding-top: 1.25rem; padding-bottom: 2rem; }
+h1 { font-size: 1.6rem; margin: .2rem 0 .4rem; line-height: 1.3; overflow-wrap: anywhere; }
+h1 .sub { color: var(--muted); font-weight: 400; }
+h2 { font-size: 1.15rem; margin: 2rem 0 .6rem; padding-bottom: .3rem; border-bottom: 1px solid var(--border); }
+.lead { font-size: 1.02rem; max-width: 52rem; }
+.muted, .meta, .crumbs { color: var(--muted); }
+.crumbs { font-size: .9rem; }
+code, pre { font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+code { background: var(--subtle); padding: .1em .3em; border-radius: 4px; }
+pre { background: var(--subtle); padding: .75rem; overflow-x: auto; white-space: pre-wrap; border-radius: 6px; }
+pre code { background: none; padding: 0; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: .93rem; }
+th, td { padding: .45rem .6rem; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: .85rem; white-space: nowrap; }
+td time, .nowrap { white-space: nowrap; }
+.title { color: var(--muted); font-size: .88rem; }
+.badge { display: inline-block; padding: 0 .55em; border-radius: 2em; font-size: .78rem; font-weight: 600; line-height: 1.75; white-space: nowrap; }
+.badge.pass { color: var(--pass); background: var(--pass-bg); }
+.badge.diverges { color: var(--fail); background: var(--fail-bg); }
+.badge.error { color: var(--warn); background: var(--warn-bg); }
+.badge.running { color: var(--info); background: var(--info-bg); }
+.badge.queued, .badge.superseded { color: var(--muted); background: var(--gray-bg); }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); gap: .75rem; }
+.card { border: 1px solid var(--border); border-radius: 8px; padding: .75rem 1rem; }
+.card h3 { margin: 0 0 .35rem; font-size: 1rem; }
+.card > div { margin-top: .2rem; }
+dl.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: .3rem 1rem; margin: 1rem 0; }
+dl.facts dt { color: var(--muted); }
+dl.facts dd { margin: 0; overflow-wrap: anywhere; }
+details { border: 1px solid var(--border); border-radius: 8px; padding: .6rem 1rem; margin: 1rem 0; max-width: 52rem; }
+details summary { cursor: pointer; font-weight: 600; }
+details li { margin: .3rem 0; }
+.report { margin-top: 1rem; overflow-wrap: anywhere; }
+.report h2 { font-size: 1.05rem; }
+.report table { width: auto; }
+.report li { margin: .2rem 0; }
+footer { border-top: 1px solid var(--border); color: var(--muted); font-size: .85rem; padding: 1rem 0 2rem; }
+</style></head><body>
+<header class="top"><div class="wrap">
+<a class="brand" href="/">gnoreplay</a>
+<form action="/search" method="get" role="search"><input type="search" name="q" value="{{.Query}}" placeholder="PR number, branch, commit, PR title or GitHub URL" aria-label="Search replays"></form>
+<nav><a href="/#running">Queue</a><a href="{{source}}">Source on GitHub</a></nav>
+</div></header>
+<main class="wrap">
+{{end}}
+
+{{define "foot"}}
+</main>
+<footer><div class="wrap">
+<a href="{{source}}">gnoreplay</a> replays gno.land mainnet's history with each change. Results are advisory, and only published here. <span id="tz"></span>
+</div></footer>
+<script>
+(function () {
+	var rtf = window.Intl && Intl.RelativeTimeFormat ? new Intl.RelativeTimeFormat(undefined, { numeric: "auto" }) : null;
+	function rel(d) {
+		var s = (d - Date.now()) / 1000, a = Math.abs(s);
+		var u = a < 60 ? ["second", 1] : a < 3600 ? ["minute", 60] : a < 86400 ? ["hour", 3600] : ["day", 86400];
+		return rtf.format(Math.round(s / u[1]), u[0]);
+	}
+	var year = new Date().getFullYear();
+	document.querySelectorAll("time[datetime]").forEach(function (t) {
+		var d = new Date(t.getAttribute("datetime"));
+		if (isNaN(d)) return;
+		var opts = { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" };
+		if (d.getFullYear() !== year) opts.year = "numeric";
+		t.textContent = d.toLocaleString(undefined, opts);
+		t.title = d.toLocaleString(undefined, { dateStyle: "full", timeStyle: "long" }) + (rtf ? " (" + rel(d) + ")" : "");
+	});
+	try {
+		document.getElementById("tz").textContent = "Times are in your time zone (" + Intl.DateTimeFormat().resolvedOptions().timeZone + ").";
+	} catch (e) {}
+})();
+</script>
+</body></html>
+{{end}}
+
+{{define "what"}}<a href="{{targetURL .}}">{{if pr .Event}}PR #{{.PR}}{{else}}{{.Branch}}{{end}}</a> <span class="muted">{{if pr .Event}}into {{.Branch}}, {{end}}{{.Repo}}</span>{{with .Title}}<div class="title">{{.}}</div>{{end}}{{end}}
+
+{{define "commit"}}<a href="{{commitURL .}}"><code>{{short .SHA}}</code></a>{{end}}
+
+{{define "jobs"}}{{if .}}<div class="scroll"><table>
+<tr><th>Result</th><th>What</th><th>Commit</th><th>When</th><th>Took</th></tr>
+{{range .}}<tr><td>{{badge .}} <a href="/jobs/{{.ID}}">{{result .}}</a></td><td>{{template "what" .}}</td><td>{{template "commit" .}}</td><td>{{if .FinishedAt.IsZero}}{{ts .EnqueuedAt}}{{else}}{{ts .FinishedAt}}{{end}}</td><td class="nowrap">{{took .}}</td></tr>
+{{end}}</table></div>{{else}}<p class="muted">No replays yet.</p>{{end}}{{end}}
+
+{{define "index"}}{{template "head" .}}
+<h1>Mainnet replay checks</h1>
+<p class="lead">Would this change alter the outcome of a transaction already on gno.land mainnet? For every push to a tracked branch and every PR into one, gnoreplay builds the commit's node and replays the entire history of <strong>gnoland-1</strong> with it, every block from genesis to a recent height, comparing each transaction's result (error, returned data, events) and gas with what the chain recorded.</p>
+<details><summary>How it works, and how to read a result</summary>
+<ul>
+<li><span class="badge pass">pass</span> no transaction's result changes. Gas-only differences are listed, but pass: on their own, they change no outcome.</li>
+<li><span class="badge diverges">diverges</span> at least one transaction's result, or a block, differs from mainnet where the base branch's latest replay matches it. Divergences the base branch has too are counted as inherited, not new. After the first app hash mismatch, diffs may be consequences of earlier ones: read from the top.</li>
+<li><span class="badge error">error</span> the replay could not run (build or worker failure, timeout): nothing was checked.</li>
+<li><span class="badge superseded">superseded</span> a newer push came first, or the PR was closed.</li>
+</ul>
+<p>A divergence is not necessarily a bug: intended behavior changes are expected to be gated by height, or shipped through a coordinated upgrade.</p>
+<p>GitHub is polled every {{.PollInterval}}. Each new head is queued in the priority order below, superseding its PR's or branch's previous replay, and replayed on a disposable machine of its own: up to {{.Workers}} at once, about 1h45m each (at most {{.RunTimeoutMinutes}} minutes). PRs that were already open when the server started are replayed from their next push. The server only reads from GitHub: it posts no statuses or comments, results are published here only.</p>
+{{with .Rules}}<p>What is checked, in priority order:</p>
+<ol>{{range .}}<li>{{.}}</li>{{end}}</ol>{{end}}
+</details>
+
+{{if .Branches}}<h2>Branches</h2>
+<div class="cards">{{range .Branches}}<div class="card">
+<h3><a href="/{{.Repo}}/tree/{{.Branch}}">{{.Branch}}</a> <span class="muted">{{.Repo}}</span></h3>
+{{with .Latest}}<div>{{badge .}} <a href="/jobs/{{.ID}}">{{result .}}</a></div>
+<div class="meta">{{template "commit" .}} · {{ts .FinishedAt}}</div>{{else}}<div class="meta">No replay yet.</div>{{end}}
+{{with .Pending}}<div class="meta">{{badge .}} {{template "commit" .}}{{if .StartedAt.IsZero}}{{else}} for {{took .}}{{end}}</div>{{end}}
+</div>{{end}}</div>{{end}}
+
+<h2 id="running">Running ({{len .Running}})</h2>
+{{if .Running}}<div class="scroll"><table>
+<tr><th>What</th><th>Commit</th><th>Started</th><th>Running for</th></tr>
+{{range .Running}}<tr>{{if .Visible}}<td>{{template "what" .Job}}</td><td><a href="/jobs/{{.ID}}"><code>{{short .SHA}}</code></a></td>{{else}}<td colspan="2" class="muted">a private repository's replay</td>{{end}}<td>{{ts .StartedAt}}</td><td class="nowrap">{{took .Job}}</td></tr>
+{{end}}</table></div>{{else}}<p class="muted">Nothing is replaying.</p>{{end}}
+
+<h2>Queued ({{len .Queued}})</h2>
+{{if .Queued}}<div class="scroll"><table>
+<tr><th>#</th><th>What</th><th>Commit</th><th>Queued</th></tr>
+{{range $i, $r := .Queued}}<tr><td>{{inc $i}}</td>{{if .Visible}}<td>{{template "what" .Job}}</td><td><a href="/jobs/{{.ID}}"><code>{{short .SHA}}</code></a></td>{{else}}<td colspan="2" class="muted">a private repository's replay</td>{{end}}<td>{{ts .EnqueuedAt}}</td></tr>
+{{end}}</table></div>{{else}}<p class="muted">The queue is empty.</p>{{end}}
+
+<h2>Recent results</h2>
+{{template "jobs" .Recent}}
+{{template "foot" .}}{{end}}
+
+{{define "target"}}{{template "head" .}}
+{{with .First}}<div class="crumbs"><a href="/">gnoreplay</a> › {{.Repo}}</div>
+<h1>{{if pr .Event}}PR #{{.PR}}{{with .Title}} <span class="sub">{{.}}</span>{{end}}{{else}}Branch {{.Branch}}{{end}}</h1>
+<p class="meta">{{.Repo}}{{if pr .Event}} · into <a href="/{{.Repo}}/tree/{{.Branch}}">{{.Branch}}</a>{{with .Author}} · by @{{.}}{{end}}{{end}} · <a href="{{githubURL .}}">on GitHub ↗</a></p>{{end}}
+<h2>Replays ({{len .Jobs}})</h2>
+<div class="scroll"><table>
+<tr><th>Result</th><th>Commit</th><th>Queued</th><th>Finished</th><th>Took</th></tr>
+{{range .Jobs}}<tr><td>{{badge .}} <a href="/jobs/{{.ID}}">{{result .}}</a></td><td>{{template "commit" .}}</td><td>{{ts .EnqueuedAt}}</td><td>{{ts .FinishedAt}}</td><td class="nowrap">{{took .}}</td></tr>
+{{end}}</table></div>
+{{with .Latest}}<h2>Latest result, at <a href="/jobs/{{.ID}}"><code>{{short .SHA}}</code></a> {{badge .}}</h2>
+<div class="report">{{$.Body}}</div>{{end}}
+{{template "foot" .}}{{end}}
+
+{{define "job"}}{{template "head" .}}{{with .Job}}
+<div class="crumbs"><a href="/">gnoreplay</a> › {{.Repo}} › <a href="{{targetURL .}}">{{if pr .Event}}PR #{{.PR}}{{else}}{{.Branch}}{{end}}</a> › replay {{.ID}}</div>
+<h1>{{if pr .Event}}PR #{{.PR}}{{with .Title}} <span class="sub">{{.}}</span>{{end}}{{else}}Branch {{.Branch}}{{end}} at <code>{{short .SHA}}</code></h1>
+<dl class="facts">
+<dt>Result</dt><dd>{{badge .}} {{result .}}</dd>
+<dt>Commit</dt><dd><a href="{{commitURL .}}"><code>{{.SHA}}</code></a></dd>
+{{if pr .Event}}<dt>Pull request</dt><dd><a href="{{targetURL .}}">all its replays</a> · <a href="{{githubURL .}}">on GitHub ↗</a>{{with .Author}} · by @{{.}}{{end}}</dd>
+<dt>Base branch</dt><dd><a href="/{{.Repo}}/tree/{{.Branch}}">{{.Branch}}</a></dd>{{else}}<dt>Branch</dt><dd><a href="{{targetURL .}}">all its replays</a> · <a href="{{githubURL .}}">on GitHub ↗</a></dd>{{end}}
+{{with $.Base}}<dt>Compared with</dt><dd><a href="/jobs/{{.ID}}">{{.Branch}} at <code>{{short .SHA}}</code></a></dd>{{end}}
+<dt>Queued</dt><dd>{{ts .EnqueuedAt}}</dd>
+<dt>Started</dt><dd>{{ts .StartedAt}}</dd>
+<dt>Finished</dt><dd>{{ts .FinishedAt}}</dd>
+<dt>Took</dt><dd>{{took .}}</dd>
+{{if .ReportPath}}<dt>Report</dt><dd><a href="/reports/{{.ID}}">full report (JSON)</a></dd>{{end}}
+</dl>{{end}}
+{{with .Body}}<div class="report">{{.}}</div>{{end}}
+{{template "foot" .}}{{end}}
+
+{{define "search"}}{{template "head" .}}
+<h1>Search <span class="sub">“{{.Query}}”</span></h1>
+{{if .Jobs}}{{template "jobs" .Jobs}}{{else}}<p>No replay matches. Search by PR number (<code>6208</code>), branch (<code>master</code>), commit (<code>87f0357</code>), words of a PR title, or paste a GitHub URL.</p>{{end}}
+{{template "foot" .}}{{end}}

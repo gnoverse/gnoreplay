@@ -13,6 +13,8 @@ type PullRequest struct {
 	Number  int
 	Base    string // base branch
 	HeadSHA string
+	Title   string
+	Author  string // login
 }
 
 // GitHub is what the server needs from the GitHub API: reads only. Results
@@ -108,7 +110,10 @@ func (t *tokenClient) Pull(ctx context.Context, repo string, number int) (PullRe
 }
 
 func toPullRequest(pr *github.PullRequest) PullRequest {
-	return PullRequest{Number: pr.GetNumber(), Base: pr.GetBase().GetRef(), HeadSHA: pr.GetHead().GetSHA()}
+	return PullRequest{
+		Number: pr.GetNumber(), Base: pr.GetBase().GetRef(), HeadSHA: pr.GetHead().GetSHA(),
+		Title: pr.GetTitle(), Author: pr.GetUser().GetLogin(),
+	}
 }
 
 func (t *tokenClient) Token() string { return t.token }

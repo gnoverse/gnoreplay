@@ -6,14 +6,15 @@ Replays gno.land mainnet's full history with the binary of each pushed commit an
 
 | Page | Shows |
 |---|---|
-| `/` | the latest replays and their results |
-| `/<owner>/<repo>/pull/<n>` | the latest replay of a PR (the same path as on GitHub) |
-| `/<owner>/<repo>/tree/<branch>` | the latest replay of a branch |
+| `/` | what this is, the tracked branches' latest results, what is running and queued, the latest results |
+| `/<owner>/<repo>/pull/<n>` | a PR's replays, and its latest result in full (the same path as on GitHub) |
+| `/<owner>/<repo>/tree/<branch>` | the same for a branch |
 | `/jobs/<id>` | one replay: what diverges, transaction by transaction |
 | `/reports/<id>` | its full JSON report |
-| `/queue` | pending replays |
+| `/search?q=` | finds replays by PR number, branch, commit, PR title or GitHub URL (the search box on every page) |
+| `/queue` | pending replays, as JSON |
 
-A commit *diverges* when it would change a tx result or a block compared to its base branch; gas-only changes don't count, but their number is shown.
+A commit *diverges* when it would change a tx result or a block compared to its base branch; gas-only changes don't count, but their number is shown. Times are shown in the reader's time zone.
 
 ## How a job runs
 
@@ -36,9 +37,15 @@ gnoreplay-server -config config.toml enqueue gnolang/gno master   # a branch
 
 A running server picks the job up from the shared queue.
 
+When the rendering of results changes, render finished jobs' pages again (all of them, or the given ones):
+
+```bash
+gnoreplay-server -config config.toml rerender [job-id...]
+```
+
 ## Queue
 
-Persisted in SQLite (`<data_dir>/jobs.db`), so it survives restarts; jobs interrupted by a restart run again, and pushes made while the server was down are seen on its first poll.
+Persisted in SQLite (`<data_dir>/jobs.db`), so it survives restarts, and pushes made while the server was down are seen on its first poll. A restart doesn't lose running replays either: a stopping server leaves jobs on worker machines running, and the next process resumes them (each job's token hash and start time are in the `sessions` table, its files in its job dir, and workers retry their uploads for a few minutes). Jobs interrupted any other way, or whose machine is gone, run again.
 
 Priority, highest first (the `rules` config; these are the defaults):
 

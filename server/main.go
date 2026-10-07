@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -39,8 +40,10 @@ func main() {
 		err = serve(ctx, *configPath, logger)
 	case args[0] == "enqueue" && len(args) == 3:
 		err = enqueueOne(ctx, *configPath, logger, args[1], args[2])
+	case args[0] == "rerender":
+		err = rerender(*configPath, logger, args[1:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: gnoreplay-server [-config path] [enqueue <owner/repo> <pr-number|branch>]")
+		fmt.Fprintln(os.Stderr, "usage: gnoreplay-server [-config path] [enqueue <owner/repo> <pr-number|branch> | rerender [job-id...]]")
 		os.Exit(2)
 	}
 	if err != nil {
@@ -89,27 +92,29 @@ func setup(configPath string, logger *slog.Logger) (*Server, func(), error) {
 	return srv, func() { q.Close() }, nil
 }
 
-func serve(ctx context.Context, configPath string, logger *slog.Logger) error {
-	ctx, stop := context.WithCancel(ctx)
-	defer stop()
+func serve(parent context.Context, configPath string, logger *slog.Logger) error {
+	// Stopping cancels with errShutdown, which leaves jobs on worker machines
+	// running: the next start resumes them.
+	ctx, stop := context.WithCancelCause(context.WithoutCancel(parent))
+	defer stop(errShutdown)
+	defer context.AfterFunc(parent, func() { stop(errShutdown) })()
 	srv, closeFn, err := setup(configPath, logger)
 	if err != nil {
 		return err
 	}
 	defer closeFn()
-	if n, err := srv.queue.Requeue(); err != nil {
+	resumed, err := srv.start(ctx)
+	if err != nil {
 		return err
-	} else if n > 0 {
-		logger.Info("requeued interrupted jobs", "count", n)
 	}
+	resume := make(chan resumable, len(resumed))
+	for _, r := range resumed {
+		resume <- r
+	}
+	close(resume)
 
 	var wg sync.WaitGroup
 	if srv.prov != nil {
-		// Interrupted jobs were requeued: no machine is in use yet, so any
-		// left over is deleted before new ones are created.
-		if err := srv.reap(ctx); err != nil {
-			return fmt.Errorf("reap worker machines: %w", err)
-		}
 		wg.Go(func() { srv.reapLoop(ctx, 5*time.Minute) })
 		workerSrv := &http.Server{
 			Addr:              srv.cfg.DigitalOcean.Listen,
@@ -123,13 +128,13 @@ func serve(ctx context.Context, configPath string, logger *slog.Logger) error {
 		go func() {
 			if err := workerSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 				logger.Error("worker endpoint", "err", err)
-				stop()
+				stop(errShutdown)
 			}
 		}()
 		logger.Info("worker machines", "provider", "digitalocean", "endpoint", srv.cfg.DigitalOcean.Listen)
 	}
 	for range srv.cfg.Workers {
-		wg.Go(func() { srv.work(ctx) })
+		wg.Go(func() { srv.work(ctx, resume) })
 	}
 	wg.Go(func() { srv.pollLoop(ctx) })
 
@@ -146,12 +151,66 @@ func serve(ctx context.Context, configPath string, logger *slog.Logger) error {
 	}()
 	logger.Info("listening", "addr", srv.cfg.Listen, "workers", srv.cfg.Workers, "poll", srv.cfg.GitHub.PollInterval)
 	err = httpSrv.ListenAndServe()
-	// Interrupted jobs are requeued on the next start.
+	stop(errShutdown) // if it failed to start
 	wg.Wait()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 	return err
+}
+
+// rerender renders the pages of finished jobs again (all of them without
+// ids), once rendering changed. Each is compared with the baseline it had.
+func rerender(configPath string, logger *slog.Logger, ids []string) error {
+	srv, closeFn, err := setup(configPath, logger)
+	if err != nil {
+		return err
+	}
+	defer closeFn()
+	var jobs []*Job
+	if len(ids) == 0 {
+		if jobs, err = srv.queue.Recent(math.MaxInt32); err != nil {
+			return err
+		}
+	}
+	for _, id := range ids {
+		n, err := strconv.ParseInt(id, 10, 64)
+		if err != nil {
+			return fmt.Errorf("job id %q: %w", id, err)
+		}
+		j, err := srv.queue.Get(n)
+		if err != nil {
+			return fmt.Errorf("job %d: %w", n, err)
+		}
+		jobs = append(jobs, j)
+	}
+	for _, j := range jobs {
+		if j.State != stateDone {
+			continue
+		}
+		var base *Job
+		if j.BaseID != 0 {
+			base, err = srv.queue.Get(j.BaseID)
+		} else {
+			base, err = srv.queue.Baseline(j.Repo, j.Branch, j.FinishedAt)
+		}
+		if err != nil {
+			return fmt.Errorf("job %d: baseline: %w", j.ID, err)
+		}
+		report, err := readReport(j.ReportPath)
+		if err != nil {
+			return fmt.Errorf("job %d: %w", j.ID, err)
+		}
+		out, _, err := srv.renderJob(j, report, j.ReportPath, base)
+		if err != nil {
+			return fmt.Errorf("job %d: %w", j.ID, err)
+		}
+		if err := srv.queue.SetResult(j.ID, out.Outcome, out.Summary, baseID(base)); err != nil {
+			return err
+		}
+		logger.Info("rendered", "job", j.ID, "base", baseID(base), "outcome", out.Outcome, "summary", out.Summary)
+	}
+	return nil
 }
 
 // enqueueOne queues a replay of a PR's or a branch's current head. A running
@@ -167,7 +226,10 @@ func enqueueOne(ctx context.Context, configPath string, logger *slog.Logger, rep
 		if err != nil {
 			return err
 		}
-		return srv.enqueueFor(repo, eventPullRequest, pr.Base, pr.Number, pr.HeadSHA)
+		if err := srv.enqueueFor(repo, eventPullRequest, pr.Base, pr.Number, pr.HeadSHA); err != nil {
+			return err
+		}
+		return srv.queue.SetPRInfo(jobKey(repo, eventPullRequest, pr.Base, pr.Number), pr.Title, pr.Author)
 	}
 	sha, err := srv.gh.BranchHead(ctx, repo, target)
 	if err != nil {

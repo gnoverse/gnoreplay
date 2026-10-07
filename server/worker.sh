@@ -24,10 +24,11 @@ if [ {{.PowerOffMinutes}} -gt 0 ]; then
 fi
 
 # api <method> <path> [curl args...] talks to the coordinator for this job.
+# Retries span about 4 minutes, so a coordinator restart loses nothing.
 api() {
 	local method=$1 path=$2
 	shift 2
-	curl -fsS --retry 5 --retry-all-errors -X "$method" \
+	curl -fsS --retry 8 --retry-all-errors -X "$method" \
 		-H "Authorization: Bearer $TOKEN" "$URL/worker/$JOB/$path" "$@"
 }
 

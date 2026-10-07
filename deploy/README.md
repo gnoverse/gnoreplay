@@ -101,12 +101,14 @@ DigitalOcean has no spending cap, so the limits are ours. A worker droplet lives
 
 Workers also power themselves off at 4h, which stops them working but not billing: only deletion does.
 
-Beyond that, spending is bounded by the account's droplet limit (3 for new accounts: the coordinator and 2 workers, so at most 2 × $0.125/h ≈ $6/day), and you can set a **spend alert** (*Billing → Spend alerts*, email only) as a last notice.
+Beyond that, spending is bounded by `workers` (at most `workers` × $0.125/h: about $6/day for 2, $12/day for 4) and by the account's droplet limit (3 for new accounts: the coordinator and 2 workers; ask support to raise it before setting more workers), and you can set a **spend alert** (*Billing → Spend alerts*, email only) as a last notice.
 
-To stop everything at once: `systemctl stop gnoreplay-server && doctl compute droplet delete --tag-name gnoreplay-worker`.
+To stop everything at once: `systemctl stop gnoreplay-server && doctl compute droplet delete --tag-name gnoreplay-worker` (stopping the server alone leaves running workers to the next start, see below).
 
 ## Operating
 
 - Worker droplets are named `gnoreplay-job-<id>` and tagged `gnoreplay-worker`. The server deletes each when its replay ends, fails, is superseded or times out, and at startup and every 5 minutes deletes any it does not own or that is over `max_age`.
+- Restarting the server (e.g. to deploy) keeps running replays: it leaves their workers running, and the next process resumes them, within the same time limits. Deploy within a few minutes of stopping: that is how long workers retry posting a result to a stopped server.
+- After a change to how results are rendered, run `gnoreplay-server -config /etc/gnoreplay/config.toml rerender` (as the `gnoreplay` user) to update the pages of past replays.
 - A worker's log is in its job's page when it fails, and on the worker in `/root/gnoreplay/<job>/worker.log` while it runs (SSH in with your key).
 - A governance halt on mainnet stops the reference node: it needs the upgraded binary, like any node.

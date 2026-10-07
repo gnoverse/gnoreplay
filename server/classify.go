@@ -118,26 +118,43 @@ type Outcome struct {
 	Body    string
 }
 
-// render reports a replay. A commit diverges when it changes a tx result or a
-// block compared to its base; gas-only changes pass, with their count in the
-// summary.
-func render(job *Job, r *Report, c Classification, reportURL string) Outcome {
-	newConsensus, newGas := 0, 0
-	for _, d := range c.New {
+// splitConsensus separates the diffs that would fork the chain from gas-only
+// ones.
+func splitConsensus(ds []Diff) (consensus, gas []Diff) {
+	for _, d := range ds {
 		if d.consensus() {
-			newConsensus++
+			consensus = append(consensus, d)
 		} else {
-			newGas++
+			gas = append(gas, d)
+		}
+	}
+	return consensus, gas
+}
+
+// render reports a replay, compared with base's (nil if there was none). A
+// commit diverges when it changes a tx result or a block compared to its
+// base; gas-only changes pass, with their count in the summary.
+func render(job *Job, r *Report, c Classification, reportURL string, base *Job) Outcome {
+	newConsensus, newGas := splitConsensus(c.New)
+
+	newResults := 0
+	for _, d := range newConsensus {
+		if d.Kind == "result" {
+			newResults++
 		}
 	}
 
 	out := Outcome{Outcome: outcomePass}
 	switch {
-	case newConsensus > 0:
+	case len(newConsensus) > 0 && newResults == 0:
+		// E.g. a stdlib change: its source is in the state from genesis on.
 		out.Outcome = outcomeDiverges
-		out.Summary = fmt.Sprintf("%d new divergence(s) from %s history", newConsensus, r.ChainID)
-	case newGas > 0:
-		out.Summary = fmt.Sprintf("Same results; %d tx(s) use different gas", newGas)
+		out.Summary = fmt.Sprintf("Every tx result is the same, but the app hash differs from %s history", r.ChainID)
+	case len(newConsensus) > 0:
+		out.Outcome = outcomeDiverges
+		out.Summary = fmt.Sprintf("%d new divergence(s) from %s history", len(newConsensus), r.ChainID)
+	case len(newGas) > 0:
+		out.Summary = fmt.Sprintf("Same results; %d tx(s) use different gas", len(newGas))
 	default:
 		out.Summary = fmt.Sprintf("%s history replays identically (%d blocks)", r.ChainID, r.Blocks)
 		if len(c.Inherited) > 0 {
@@ -170,6 +187,9 @@ func render(job *Job, r *Report, c Classification, reportURL string) Outcome {
 		row("fixed vs `"+job.Branch+"`", c.Fixed)
 	}
 	s.WriteString("\n")
+	if base != nil {
+		fmt.Fprintf(&s, "Compared with `%s` at commit `%s` ([its replay](/jobs/%d)).\n\n", base.Branch, shortSHA(base.SHA), base.ID)
+	}
 	if r.FirstAppHashMismatch > 0 {
 		fmt.Fprintf(&s, "First app hash mismatch at height **%d**; diffs after it are marked *(after divergence)* and may be consequences of earlier ones.\n\n", r.FirstAppHashMismatch)
 	}
@@ -180,14 +200,16 @@ func render(job *Job, r *Report, c Classification, reportURL string) Outcome {
 		s.WriteString("Classification is partial: the reports were truncated or cover different heights.\n\n")
 	}
 	if reportURL != "" {
-		fmt.Fprintf(&s, "Full report (JSON): %s\n\n", reportURL)
+		fmt.Fprintf(&s, "[Full report (JSON)](%s)\n\n", reportURL)
 	}
 	s.WriteString("A divergence is not necessarily a bug: intentional behavior changes are expected to be gated by height or shipped through a coordinated upgrade.\n\n")
 
-	writeDiffs(&s, "New", c.New)
-	if len(c.Fixed) > 0 {
-		writeDiffs(&s, "Fixed", c.Fixed)
-	}
+	// Listed apart, so each heading counts what the summary does.
+	writeDiffs(&s, "New divergences", newConsensus)
+	writeDiffs(&s, "New gas-only differences", newGas)
+	fixedConsensus, fixedGas := splitConsensus(c.Fixed)
+	writeDiffs(&s, "Fixed divergences", fixedConsensus)
+	writeDiffs(&s, "Fixed gas-only differences", fixedGas)
 	out.Body = s.String()
 	return out
 }

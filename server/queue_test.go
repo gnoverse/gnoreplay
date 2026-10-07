@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,6 +16,34 @@ func newTestQueue(t *testing.T) *Queue {
 	require.NoError(t, err)
 	t.Cleanup(func() { q.Close() })
 	return q
+}
+
+// A database from before the added columns gets them, and keeps its jobs.
+func TestMigrate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.db")
+	db, err := sql.Open("sqlite", path)
+	require.NoError(t, err)
+	_, err = db.Exec(`CREATE TABLE jobs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, repo TEXT NOT NULL, event TEXT NOT NULL,
+		branch TEXT NOT NULL, pr INTEGER NOT NULL DEFAULT 0, sha TEXT NOT NULL, priority INTEGER NOT NULL,
+		state TEXT NOT NULL, enqueued_at INTEGER NOT NULL, finished_at INTEGER NOT NULL DEFAULT 0,
+		report_path TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
+		error TEXT NOT NULL DEFAULT '');
+		INSERT INTO jobs (key, repo, event, branch, sha, priority, state, enqueued_at)
+		VALUES ('gnolang/gno#branch/master', 'gnolang/gno', 'push', 'master', 'abc', 3, 'done', 1);`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	for range 2 { // and again, once migrated
+		q, err := openQueue(path)
+		require.NoError(t, err)
+		j, err := q.Get(1)
+		require.NoError(t, err)
+		assert.Equal(t, "abc", j.SHA)
+		assert.True(t, j.StartedAt.IsZero())
+		require.NoError(t, q.SetPRInfo(j.Key, "title", "author"))
+		require.NoError(t, q.Close())
+	}
 }
 
 // testJob builds the job the poller would enqueue for a new head.
@@ -144,16 +173,20 @@ func TestRequeueAndBaseline(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, n)
 
-	base, err := q.Baseline("gnolang/gno", "master")
+	base, err := q.Baseline("gnolang/gno", "master", time.Now())
 	require.NoError(t, err)
 	require.NotNil(t, base)
 	assert.Equal(t, "base1", base.SHA)
+	// Or the last one completed before a time (a job's own excluded).
+	none, err := q.Baseline("gnolang/gno", "master", base.FinishedAt)
+	require.NoError(t, err)
+	assert.Nil(t, none)
 
 	again, err := q.Claim()
 	require.NoError(t, err)
 	assert.Equal(t, "base2", again.SHA)
 
-	none, err := q.Baseline("gnolang/gno", "chain/mainnet")
+	none, err = q.Baseline("gnolang/gno", "chain/mainnet", time.Now())
 	require.NoError(t, err)
 	assert.Nil(t, none)
 }
@@ -179,14 +212,15 @@ func TestCancelKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, other.ID, next.ID)
 
-	// The latest job of a key is kept, whatever its state.
-	latest, err := q.Latest(pr.Key)
+	// A key's jobs are kept, whatever their state.
+	jobs, err := q.ByKey(pr.Key, 10)
 	require.NoError(t, err)
-	assert.Equal(t, stateSuperseded, latest.State)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, stateSuperseded, jobs[0].State)
+	// Recent lists jobs that ran to an end.
 	recent, err := q.Recent(10)
 	require.NoError(t, err)
-	require.Len(t, recent, 2)
-	assert.Equal(t, other.ID, recent[0].ID, "newest first")
+	assert.Empty(t, recent)
 }
 
 func TestPriorityIgnoresUnknown(t *testing.T) {
