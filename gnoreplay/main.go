@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
 
 	"github.com/gnolang/gno/gno.land/pkg/gnoland"
 	"github.com/gnolang/gno/gnovm/pkg/gnoenv"
@@ -99,7 +100,7 @@ func run(logger *slog.Logger, dataDir, genesisFile, workDir string, opts replayO
 	}
 	opts.Genesis = genDoc
 
-	appDB, err := dbm.NewDB("gnolang", dbm.PebbleDBBackend, workDir)
+	appDB, err := pebbledb.NewPebbleDBWithOpts("gnolang", workDir, &pebble.Options{FS: noSyncFS{vfs.Default}})
 	if err != nil {
 		return nil, fmt.Errorf("open app db: %w", err)
 	}
