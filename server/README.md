@@ -67,8 +67,8 @@ Replays run in one of two places:
 
 What the box needs in both cases (except where noted):
 
-- **A reference node**: a non-validator `gnoland` node on the mainnet binary, syncing continuously (see `misc/deployments/mainnet.gno.land/VALIDATOR.md`; its governance halts stop it during the initial sync — restart it each time). Every node stores per-height tx results in `state.db`: these are what replays are compared against.
-- **The golden copy**: `scripts/refresh-golden.sh` (timer, e.g. every 4h) stops the node, reflinks its `blockstore.db` and `state.db` into a new snapshot, restarts it and atomically repoints `golden`. Use XFS or btrfs so copies are instant and free.
+- **The golden copy**: a recent `blockstore.db` and `state.db` of a mainnet node. Every node stores per-height tx results in `state.db`: these are what replays are compared against. `scripts/fetch-golden.sh` (timer, every 12h) downloads them from the newest snapshot on snapshots.gno.land, checks its sha256 and atomically repoints `golden`.
+- **Or a reference node** of the box's own: a non-validator `gnoland` node on the mainnet binary, syncing continuously (see `misc/deployments/mainnet.gno.land/VALIDATOR.md`; its governance halts stop it during the initial sync — restart it each time). `scripts/refresh-golden.sh` then makes the golden copy: it stops the node, reflinks its two DBs into a new snapshot, restarts it and repoints `golden`. Use XFS or btrfs so copies are instant and free.
 - **The server**: `go build` in this directory. It runs on the host (not in a container), with git. In local mode it also needs [microsandbox](https://microsandbox.dev) (`msb`, which needs KVM) for the job sandboxes in the example config, and 9 GB of RAM per concurrent replay.
 - **A read-only GitHub token** in `github.token_file`, for the GitHub API's rate limit and for private repos:
   - fine-grained (preferred): repositories `gnolang/gno` and `gnolang/gno-fixes`, permissions *Contents: read-only* and *Pull requests: read-only* (the org may need to approve it);

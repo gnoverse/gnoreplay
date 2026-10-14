@@ -93,9 +93,9 @@ type DigitalOceanConfig struct {
 }
 
 type ChainConfig struct {
-	// GoldenDir is a stopped copy of the reference node's data directory
-	// (at least db/blockstore.db and db/state.db). It is refreshed out of
-	// band; each job takes its own copy of it.
+	// GoldenDir is a copy of a mainnet node's data directory (at least
+	// db/blockstore.db and db/state.db). It is refreshed out of band; each
+	// job takes its own copy of it.
 	GoldenDir string `toml:"golden_dir"`
 	// Genesis is the chain's genesis.json.
 	Genesis string `toml:"genesis"`

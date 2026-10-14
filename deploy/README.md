@@ -1,6 +1,6 @@
 # Deploying on DigitalOcean
 
-One always-on **coordinator** droplet runs the server, a mainnet reference node and its chain snapshots. Each replay runs on its own **worker** droplet, created by the coordinator and deleted when the replay ends.
+One always-on **coordinator** droplet runs the server and keeps a recent copy of mainnet's chain data, from [snapshots.gno.land](https://snapshots.gno.land). Each replay runs on its own **worker** droplet, created by the coordinator and deleted when the replay ends.
 
 | | Size | Cost |
 |---|---|---|
@@ -43,25 +43,39 @@ Its firewall: inbound 22 (SSH) and 80/443 (the result pages, through Caddy); por
 On the droplet:
 
 ```bash
-apt-get update && apt-get install -y git caddy
+apt-get update && apt-get install -y git caddy jq zstd
 curl -fsSL https://go.dev/dl/go1.26.1.linux-amd64.tar.gz | tar -C /usr/local -xz
 useradd --system --create-home --home-dir /var/lib/gnoreplay gnoreplay
-mkdir -p /opt/gnoreplay/bin /etc/gnoreplay /var/lib/gnoland
+mkdir -p /opt/gnoreplay/bin /etc/gnoreplay
 git clone https://github.com/gnoverse/gnoreplay /opt/gnoreplay/src && ln -s src/gnoreplay /opt/gnoreplay/gnoreplay && ln -s src/server /opt/gnoreplay/server
 (cd /opt/gnoreplay/server && /usr/local/go/bin/go build -o /opt/gnoreplay/bin/gnoreplay-server .)
+```
+
+**Chain data.** Replays run the blocks a mainnet node stores in its `blockstore.db`, and compare against the tx results in its `state.db`. `gnoreplay-golden` ([`fetch-golden.sh`](../server/scripts/fetch-golden.sh)) downloads them from the newest snapshot on snapshots.gno.land every 12 hours: each snapshot is ~2 GB, served by the gno.land team, so not more often. If the download fails, replays keep the last copy.
+
+```bash
+cd /var/lib/gnoreplay
+curl -fsS -O https://snapshots.gno.land/genesis.json -O https://snapshots.gno.land/genesis.json.sha256
+sha256sum -c genesis.json.sha256
+chown -R gnoreplay: /var/lib/gnoreplay
+cp /opt/gnoreplay/src/deploy/systemd/* /etc/systemd/system/
+systemctl daemon-reload
+systemctl start gnoreplay-golden && systemctl enable --now gnoreplay-golden.timer
+```
+
+Or from a reference node of the coordinator's own, without depending on snapshots.gno.land: it takes ~2 GB of the coordinator's RAM, and must be upgraded at each mainnet governance halt, like any node. Syncing it from genesis loads 3.26M genesis accounts at once, which needs far more than 4 GB: seed `/var/lib/gnoland` instead with the whole data dir (`config/`, `secrets/`, `db/`) of a mainnet node that is already past genesis, started with the same `genesis.json`. The node then only syncs the blocks since. Mainnet's node settings are in `misc/deployments/mainnet.gno.land/VALIDATOR.md`; keep the RPC on `127.0.0.1:26657`. [`refresh-golden.sh`](../server/scripts/refresh-golden.sh) stops the node for each copy.
+
+```bash
 # The binary mainnet runs: the last row of misc/deployments/mainnet.gno.land/upgrades.json.
 git clone --depth 1 --branch chain/mainnet https://github.com/gnolang/gno /opt/gno
 (cd /opt/gno && CGO_ENABLED=0 /usr/local/go/bin/go build -o /opt/gnoreplay/bin/gnoland ./gno.land/cmd/gnoland)
-```
-
-**Chain data.** Syncing a node from genesis loads 3.26M genesis accounts at once, which needs far more than 4 GB. Seed `/var/lib/gnoland` instead with the whole data dir (`config/`, `secrets/`, `db/`) of a mainnet node that is already past genesis, and put the `genesis.json` it was started with in `/var/lib/gnoreplay/`. The node then only syncs the blocks since. Mainnet's node settings are in `misc/deployments/mainnet.gno.land/VALIDATOR.md`; keep the RPC on `127.0.0.1:26657`.
-
-```bash
-chown -R gnoreplay: /var/lib/gnoland /var/lib/gnoreplay
-cp /opt/gnoreplay/src/deploy/systemd/* /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now gnoland
+chown -R gnoreplay: /var/lib/gnoland
+systemctl enable --now gnoland
+mkdir -p /etc/systemd/system/gnoreplay-golden.service.d
+printf '[Service]\nExecStart=\nExecStart=/opt/gnoreplay/server/scripts/refresh-golden.sh\n' > /etc/systemd/system/gnoreplay-golden.service.d/node.conf
+systemctl daemon-reload
 # Once the node has caught up with mainnet:
-systemctl start gnoreplay-golden && systemctl enable --now gnoreplay-golden.timer
+systemctl start gnoreplay-golden
 ```
 
 **Server.** `/etc/gnoreplay/config.toml` from [`config.digitalocean.example.toml`](../server/config.digitalocean.example.toml) (the VPC id, your SSH key fingerprint, the droplet's private address for `[digitalocean] listen/url`), then the secrets, readable by `gnoreplay` only:
@@ -114,4 +128,4 @@ To stop everything at once: `systemctl stop gnoreplay-server && doctl compute dr
 - Restarting the server (e.g. to deploy) keeps running replays: it leaves their workers running, and the next process resumes them, within the same time limits. Deploy within a few minutes of stopping: that is how long workers retry posting a result to a stopped server.
 - After a change to how results are rendered, run `gnoreplay-server -config /etc/gnoreplay/config.toml rerender` (as the `gnoreplay` user) to update the pages of past replays.
 - A worker's log is in its job's page when it fails, and on the worker in `/root/gnoreplay/<job>/worker.log` while it runs (SSH in with your key).
-- A governance halt on mainnet stops the reference node: it needs the upgraded binary, like any node.
+- The chain data refreshes are logged in `journalctl -u gnoreplay-golden`: a failed one leaves replays on the previous copy.

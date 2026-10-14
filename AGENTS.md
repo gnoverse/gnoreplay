@@ -10,7 +10,7 @@ gnoreplay checks whether a change to [gnolang/gno](https://github.com/gnolang/gn
 | `server/` | The coordinator: polls GitHub, queues replays (SQLite), runs each on a worker (a disposable DigitalOcean droplet, or a local microsandbox VM), classifies the report against the base branch's, serves the results. |
 | `server/worker.sh` | The worker's cloud-init script (a Go template): downloads its inputs from the coordinator, builds the tool, replays, posts the report back. |
 | `server/page.html` | All HTML templates (embedded). |
-| `server/scripts/` | `refresh-golden.sh` (chain snapshot, systemd timer), `sync-viewers.sh` (who may see a private repo's results). |
+| `server/scripts/` | `fetch-golden.sh` (chain data from snapshots.gno.land, systemd timer; `refresh-golden.sh` takes it from a reference node instead), `sync-viewers.sh` (who may see a private repo's results). |
 | `deploy/` | DigitalOcean deployment, systemd units, `watchdog.sh` (deletes workers older than 4h, independently of the server). |
 
 ## Build & test
@@ -43,7 +43,7 @@ Server tests drive real code against fakes, not mocks of it: `fakeGitHub` (serve
 - **Memory.** The first commit after genesis (3.26M accounts) peaks above 8 GB with the default GC: workers set `GOMEMLIMIT` (12GiB on 16 GB droplets; 7GiB in a 9 GB VM).
 - **Log-only diffs are noise** (Go stack traces whose depth differs because the replay calls the app directly, goroutine IDs, `%#v` heap pointers in errors); they are counted, not classified.
 - **A gas cliff.** Mainnet tx at height 214792 (gnoswap `CollectFee` ×2 + `CollectReward` ×2) used 246,051,054 of 246,051,805 gas: any change adding more than 751 gas on that path makes it run out of gas, and everything after it diverges. Two changes have hit it already.
-- **Golden snapshots** of the reference node refresh every 4h, so replays started in the same window cover the same heights, and a PR replayed against a newer snapshot than its base's is classified as *partial*.
+- **Golden snapshots** come from snapshots.gno.land (since 2026-10-14; before, from a reference node on the coordinator, every 4h). They refresh every 12h: each is a ~2 GB download that the gno.land team serves. Replays started in the same window cover the same heights, and a PR replayed against a newer snapshot than its base's is classified as *partial*.
 - `doctl ... --format Created` is not a valid column: use `-o json` and `created_at`.
 
 ## Deploying

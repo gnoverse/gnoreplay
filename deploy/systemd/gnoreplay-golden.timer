@@ -1,9 +1,11 @@
+# Each refresh downloads a whole snapshot (~2 GB), served by the gno.land
+# team: twice a day is plenty.
 [Unit]
-Description=Refresh gnoreplay golden chain data every 4 hours
+Description=Refresh gnoreplay golden chain data every 12 hours
 
 [Timer]
 OnBootSec=15min
-OnUnitActiveSec=4h
+OnUnitActiveSec=12h
 
 [Install]
 WantedBy=timers.target

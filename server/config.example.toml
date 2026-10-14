@@ -26,8 +26,8 @@ client_id = "Ov23liXXXXXXXXXXXXXX"
 client_secret_file = "/etc/gnoreplay/github-oauth-secret"
 
 [chain]
-# Stopped copy of the reference node's data dir, refreshed by
-# scripts/refresh-golden.sh. Jobs copy db/blockstore.db and db/state.db.
+# Copy of a mainnet node's data dir, refreshed by scripts/fetch-golden.sh
+# (or refresh-golden.sh). Jobs copy db/blockstore.db and db/state.db.
 golden_dir = "/var/lib/gnoreplay/golden"
 genesis = "/var/lib/gnoreplay/genesis.json"
 

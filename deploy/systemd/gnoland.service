@@ -1,5 +1,5 @@
-# The mainnet reference node: its blocks and recorded tx results are what
-# replays run and are compared against.
+# A mainnet reference node, if the golden chain data is taken from it rather
+# than from snapshots.gno.land (see deploy/README.md).
 [Unit]
 Description=gno.land mainnet reference node (gnoreplay)
 After=network-online.target
