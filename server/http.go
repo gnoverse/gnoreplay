@@ -269,7 +269,11 @@ func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if rule.Event == eventPullRequest {
-			data.Rules = append(data.Rules, fmt.Sprintf("PRs into %s %s", rule.Repo, rule.Branch))
+			into := rule.Branch
+			if into == anyBranch {
+				into = "(any branch)"
+			}
+			data.Rules = append(data.Rules, fmt.Sprintf("PRs into %s %s", rule.Repo, into))
 			continue
 		}
 		data.Rules = append(data.Rules, fmt.Sprintf("pushes to %s %s", rule.Repo, rule.Branch))

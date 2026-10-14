@@ -230,4 +230,12 @@ func TestPriorityIgnoresUnknown(t *testing.T) {
 	assert.False(t, ok)
 	_, ok = cfg.priority("someone/gno", eventPush, "master")
 	assert.False(t, ok)
+
+	// gno-fixes PRs are replayed whatever their base, its pushes only on
+	// develop.
+	prio, ok := cfg.priority("gnolang/gno-fixes", eventPullRequest, "master")
+	assert.True(t, ok)
+	assert.Equal(t, len(cfg.Rules), prio)
+	_, ok = cfg.priority("gnolang/gno-fixes", eventPush, "master")
+	assert.False(t, ok)
 }

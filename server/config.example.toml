@@ -97,4 +97,4 @@ branch = "master"
 [[rules]]
 repo = "gnolang/gno-fixes"
 event = "pull_request"
-branch = "develop"
+branch = "*" # PRs into any branch

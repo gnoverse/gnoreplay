@@ -364,13 +364,18 @@ func TestServerEndToEnd(t *testing.T) {
 
 	// A PR of the private repo: invisible unless signed in and listed, even
 	// queued.
-	gh.setPulls("gnolang/gno-fixes", PullRequest{Number: 3, Base: "develop", HeadSHA: shaFixesPR})
+	gh.setPulls("gnolang/gno-fixes",
+		PullRequest{Number: 3, Base: "develop", HeadSHA: shaFixesPR},
+		PullRequest{Number: 4, Base: "master", HeadSHA: shaFixesPR}, // any base, untracked
+	)
 	poll()
 	_, index = get(anon, "/")
 	assert.NotContains(t, index, "gno-fixes")
 	assert.Contains(t, index, "a private repository's replay")
 	fixesPR := runNext()
 	assert.Equal(t, outcomeDiverges, fixesPR.Outcome)
+	otherBase := runNext()
+	assert.Equal(t, "gnolang/gno-fixes#pr/4", otherBase.Key)
 	for _, path := range []string{
 		fmt.Sprintf("/jobs/%d", fixesPR.ID), fmt.Sprintf("/reports/%d", fixesPR.ID),
 		"/gnolang/gno-fixes/pull/3",
@@ -393,6 +398,9 @@ func TestServerEndToEnd(t *testing.T) {
 	require.Equal(t, http.StatusOK, code)
 	assert.Contains(t, page, "PR #3")
 	assert.Contains(t, page, "gnolang/gno-fixes · into")
+	code, page = get(viewer, "/gnolang/gno-fixes/pull/4")
+	require.Equal(t, http.StatusOK, code)
+	assert.Contains(t, page, "No replay of <code>master</code> to compare with")
 	_, index = get(viewer, "/")
 	assert.Contains(t, index, "gnolang/gno-fixes")
 

@@ -197,7 +197,7 @@ func render(job *Job, r *Report, c Classification, reportURL string, base *Job) 
 		fmt.Fprintf(&s, "First app hash mismatch at height **%d**; diffs after it are marked *(after divergence)* and may be consequences of earlier ones.\n\n", r.FirstAppHashMismatch)
 	}
 	if c.NoBaseline && job.Event == eventPullRequest {
-		fmt.Fprintf(&s, "No completed replay of `%s` yet: all diffs are listed as new.\n\n", job.Branch)
+		fmt.Fprintf(&s, "No replay of `%s` to compare with: all diffs are listed as new.\n\n", job.Branch)
 	}
 	if c.Partial {
 		s.WriteString("Classification is partial: the reports were truncated or cover different heights.\n\n")

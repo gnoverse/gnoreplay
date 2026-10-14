@@ -43,6 +43,10 @@ func TestExampleConfig(t *testing.T) {
 	assert.True(t, cfg.Repos["gnolang/gno"].PublicReports)
 	assert.Equal(t, "4h0m0s", cfg.Job.RunTimeout.String())
 	assert.Nil(t, cfg.DigitalOcean)
+
+	// A branch is pushed to by name.
+	cfg.Rules = append(cfg.Rules, Rule{Repo: "gnolang/gno", Event: eventPush, Branch: anyBranch})
+	assert.ErrorContains(t, cfg.validate(), "only for pull_request rules")
 }
 
 func TestDigitalOceanExampleConfig(t *testing.T) {

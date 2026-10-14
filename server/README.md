@@ -54,7 +54,7 @@ Priority, highest first (the `rules` config; these are the defaults):
 3. Commits on `gnolang/gno` `master`
 4. Commits on `gnolang/gno-fixes` `develop`
 5. PRs to `master`
-6. PRs to `gno-fixes` `develop`
+6. PRs to `gno-fixes`, into any branch (`branch = "*"`). A PR into a branch whose commits aren't replayed has no baseline: all its diffs are listed as new.
 
 Within a level, jobs run in arrival order. A new push to the same branch or PR supersedes the queued or running job for it, so bursts of pushes don't pile up; closing a PR cancels its job. Jobs are not preempted by higher-priority arrivals.
 

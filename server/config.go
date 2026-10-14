@@ -127,7 +127,7 @@ type JobConfig struct {
 type Rule struct {
 	Repo string `toml:"repo"` // "owner/name"
 	// Event is "push" (commits on Branch) or "pull_request" (open PRs whose
-	// base is Branch).
+	// base is Branch, or any open PR if Branch is "*").
 	Event  string `toml:"event"`
 	Branch string `toml:"branch"`
 }
@@ -160,12 +160,15 @@ var defaultRules = []Rule{
 	{Repo: "gnolang/gno", Event: eventPush, Branch: "master"},
 	{Repo: "gnolang/gno-fixes", Event: eventPush, Branch: "develop"},
 	{Repo: "gnolang/gno", Event: eventPullRequest, Branch: "master"},
-	{Repo: "gnolang/gno-fixes", Event: eventPullRequest, Branch: "develop"},
+	// Fixes are also developed against other bases, e.g. master.
+	{Repo: "gnolang/gno-fixes", Event: eventPullRequest, Branch: anyBranch},
 }
 
 const (
 	eventPush        = "push"
 	eventPullRequest = "pull_request"
+	// anyBranch as a pull_request rule's branch matches PRs into any branch.
+	anyBranch = "*"
 )
 
 func loadConfig(path string) (*Config, error) {
@@ -280,6 +283,9 @@ func (c *Config) validate() error {
 		if r.Repo == "" || r.Branch == "" {
 			return fmt.Errorf("rules[%d]: repo and branch are required", i)
 		}
+		if r.Branch == anyBranch && r.Event != eventPullRequest {
+			return fmt.Errorf("rules[%d]: branch %q is only for pull_request rules", i, anyBranch)
+		}
 	}
 	return nil
 }
@@ -299,7 +305,7 @@ func (c *Config) repos() []string {
 // if no rule matches it.
 func (c *Config) priority(repo, event, branch string) (int, bool) {
 	for i, r := range c.Rules {
-		if r.Repo == repo && r.Event == event && r.Branch == branch {
+		if r.Repo == repo && r.Event == event && (r.Branch == branch || r.Branch == anyBranch) {
 			return i + 1, true
 		}
 	}
