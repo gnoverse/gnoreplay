@@ -166,8 +166,14 @@ func TestReplay(t *testing.T) {
 
 	t.Run("same binary", func(t *testing.T) {
 		app := newTestApp(t)
-		r, err := replay(src, app, memdb.NewMemDB(), replayOptions{Genesis: genDoc})
+		var progress []int64
+		r, err := replay(src, app, memdb.NewMemDB(), replayOptions{Genesis: genDoc, Progress: func(height, total int64, _ float64) {
+			assert.Equal(t, tip, total)
+			progress = append(progress, height)
+		}})
 		require.NoError(t, err)
+		// Once genesis is replayed; the test chain takes less than 30s.
+		assert.Equal(t, []int64{0}, progress)
 		if _, ok := app.(deferredCommitter); ok {
 			assert.Positive(t, r.FlushPoints, "the app's commits are held, as in block sync")
 		} else {

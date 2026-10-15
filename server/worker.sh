@@ -72,9 +72,19 @@ go -C src/contribs/gnoreplay mod tidy || fail "go mod tidy"
 go -C src/contribs/gnoreplay build -o "$WORK/gnoreplay" . || fail "build"
 
 step "replay"
+# The replay's progress, for the coordinator's pages, as the replay updates
+# it. One try each: the next one comes soon enough.
+(
+	while sleep {{.ProgressSeconds}}; do
+		[ -s progress.json ] && curl -fsS -m 10 -o /dev/null -H "Authorization: Bearer $TOKEN" \
+			--data-binary @progress.json "$URL/worker/$JOB/progress"
+	done
+) &
+reporter=$!
 GNOROOT="$WORK/src" ./gnoreplay --data-dir data --genesis genesis.json --work-dir work \
-	--max-diffs 0 --out report.json --log-level warn
+	--max-diffs 0 --out report.json --progress progress.json
 rc=$?
+kill $reporter
 # 2: diffs found, a result like any other.
 if [ $rc -ne 0 ] && [ $rc -ne 2 ]; then
 	fail "gnoreplay exited with $rc"

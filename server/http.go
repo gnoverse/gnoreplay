@@ -129,9 +129,25 @@ func result(j *Job) string {
 	case stateSkipped:
 		return "not replayed: " + j.Summary
 	case stateRunning:
-		return "replaying"
+		return "replaying" + progress(j.Progress)
 	}
 	return "waiting for a worker"
+}
+
+// progress is how far a running replay got, as its worker last reported.
+func progress(p *Progress) string {
+	switch {
+	case p == nil || p.Tip == 0:
+		return ""
+	case p.Height == 0:
+		return ": genesis done"
+	}
+	s := fmt.Sprintf(": block %d of %d (%d%%)", p.Height, p.Tip, p.Height*100/p.Tip)
+	if p.BlocksPerSecond > 0 && p.Height < p.Tip {
+		// At the pace so far, which history's busier stretches vary.
+		s += ", about " + formatDuration(time.Duration(float64(p.Tip-p.Height)/p.BlocksPerSecond*float64(time.Second))) + " left"
+	}
+	return s
 }
 
 func firstLine(s string) string {
@@ -517,12 +533,16 @@ func (s *Server) serveQueue(w http.ResponseWriter, r *http.Request) {
 		SHA      string    `json:"sha,omitempty"`
 		Enqueued time.Time `json:"enqueued_at"`
 		Started  time.Time `json:"started_at,omitzero"`
+		Progress *Progress `json:"progress,omitempty"`
 	}
 	out := make([]entry, 0, len(jobs))
 	for _, j := range jobs {
 		e := entry{State: j.State, Priority: j.Priority, Enqueued: j.EnqueuedAt, Started: j.StartedAt}
 		if s.canSee(r, j.Repo) {
 			e.Repo, e.Event, e.Branch, e.PR, e.SHA = j.Repo, j.Event, j.Branch, j.PR, j.SHA
+			if j.State == stateRunning {
+				e.Progress = j.Progress
+			}
 		}
 		out = append(out, e)
 	}

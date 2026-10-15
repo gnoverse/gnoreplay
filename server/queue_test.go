@@ -46,6 +46,42 @@ func TestMigrate(t *testing.T) {
 	}
 }
 
+// A running job's progress is kept until it runs again.
+func TestProgress(t *testing.T) {
+	cfg := &Config{}
+	cfg.setDefaults()
+	q := newTestQueue(t)
+	_, err := q.Enqueue(testJob(t, cfg, "gnolang/gno", eventPush, "master", 0, "abc", time.Now()))
+	require.NoError(t, err)
+	j, err := q.Claim()
+	require.NoError(t, err)
+	require.NoError(t, q.SetProgress(j.ID, Progress{Height: 25, Tip: 50, BlocksPerSecond: 5, At: time.Unix(1, 0)}))
+	got, err := q.Get(j.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.Progress)
+	assert.True(t, got.Progress.At.Equal(time.Unix(1, 0)))
+	got.Progress.At = time.Time{}
+	assert.Equal(t, Progress{Height: 25, Tip: 50, BlocksPerSecond: 5}, *got.Progress)
+	assert.Equal(t, "replaying: block 25 of 50 (50%), about 5s left", result(got))
+
+	// A restart requeues it: it starts over.
+	n, err := q.Requeue()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+	require.NoError(t, q.SetProgress(j.ID, Progress{Height: 30, Tip: 50}), "ignored for a queued job")
+	j, err = q.Claim()
+	require.NoError(t, err)
+	assert.Nil(t, j.Progress)
+	got, err = q.Get(j.ID)
+	require.NoError(t, err)
+	assert.Nil(t, got.Progress)
+	assert.Equal(t, "replaying", result(got))
+	require.NoError(t, q.SetProgress(j.ID, Progress{Tip: 50}))
+	got, err = q.Get(j.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "replaying: genesis done", result(got))
+}
+
 // testJob builds the job the poller would enqueue for a new head.
 func testJob(t *testing.T, cfg *Config, repo, event, branch string, pr int, sha string, at time.Time) *Job {
 	t.Helper()

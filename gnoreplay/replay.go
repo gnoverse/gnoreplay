@@ -51,6 +51,9 @@ type replayOptions struct {
 	StopOnFirst bool  // stop after the first block with a result or app hash divergence
 	MaxDiffs    int   // diffs kept in the report; counts stay exact
 	Logger      *slog.Logger
+	// Progress, if set, is told the last height replayed (0 once genesis is),
+	// with the blocks per second so far, whenever the replay logs it.
+	Progress func(height, tip int64, blocksPerSecond float64)
 }
 
 // replay re-executes every recorded block of src on app as a syncing node
@@ -116,6 +119,9 @@ func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions
 	}
 	r.Timing.GenesisSeconds = time.Since(start).Seconds()
 	logger.Info("genesis replayed", "txs", len(gotGenesis.DeliverTxs), "elapsed", time.Since(start))
+	if opts.Progress != nil {
+		opts.Progress(firstHeight-1, tip, 0)
+	}
 
 	blockExec := sm.NewBlockExecutor(stateDB, tmLogger, proxyApp.Consensus(), mock.Mempool{})
 	blocksStart := time.Now()
@@ -235,9 +241,12 @@ func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions
 
 		if time.Since(lastLog) > 30*time.Second {
 			lastLog = time.Now()
-			logger.Info("replaying", "height", height, "tip", tip,
-				"blocks/s", float64(r.Blocks)/time.Since(blocksStart).Seconds(),
+			rate := float64(r.Blocks) / time.Since(blocksStart).Seconds()
+			logger.Info("replaying", "height", height, "tip", tip, "blocks/s", rate,
 				"result_diffs", r.Counts.Result, "gas_diffs", r.Counts.Gas)
+			if opts.Progress != nil {
+				opts.Progress(height, tip, rate)
+			}
 		}
 	}
 

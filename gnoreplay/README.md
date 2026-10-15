@@ -34,6 +34,7 @@ gnoreplay --data-dir <node data dir> --genesis genesis.json --out report.json
 | `--stop-on-first` | Stop at the first block with a result or app hash divergence. |
 | `--max-diffs` | Diffs listed in the report (default 1000; counts stay exact). |
 | `--out` | Write the JSON report here. |
+| `--progress` | Keep this file updated with the replay's progress (`height`, `tip`, `blocks_per_second`), whenever it is logged: once genesis is replayed, then every 30 seconds. |
 
 Exit status: `0` no consensus-relevant diffs, `1` error, `2` result or block diffs found.
 

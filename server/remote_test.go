@@ -247,6 +247,7 @@ func newRemoteEnv(t *testing.T) *remoteEnv {
 	workerWorkDir = filepath.Join(root, "workers")
 	// Never schedule this machine's shutdown.
 	workerPowerOff = false
+	workerProgressInterval = 50 * time.Millisecond
 	workerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e.handler.Load().(http.Handler).ServeHTTP(w, r)
 	}))
@@ -360,9 +361,21 @@ func TestRemoteReplay(t *testing.T) {
 	assert.Equal(t, 1, running)
 	assert.NotContains(t, machines.labels(worker), labelJob)
 
-	// A slow replay, on it again.
+	// A slow replay, on it again. Its worker reports its progress, which
+	// pages and the queue show.
 	slow, finished := start(shaSlow)
 	assert.Equal(t, strconv.FormatInt(slow.ID, 10), machines.labels(worker)[labelJob])
+	require.Eventually(t, func() bool {
+		j, err := q.Get(slow.ID)
+		return err == nil && j.Progress != nil
+	}, 30*time.Second, 50*time.Millisecond)
+	got, err := q.Get(slow.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "replaying: block 25 of 50 (50%), about 5s left", result(got))
+	assert.WithinDuration(t, time.Now(), got.Progress.At, time.Minute)
+	rec := httptest.NewRecorder()
+	srv.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/queue", nil))
+	assert.Contains(t, rec.Body.String(), `"progress":{"height":25,"tip":50,"blocks_per_second":5,`)
 
 	// The reaper spares a busy machine at the end of its billing hour, and
 	// takes one it doesn't know for an idle one...
@@ -393,7 +406,7 @@ func TestRemoteReplay(t *testing.T) {
 	// Superseded by a new push: the job stops, and its machine is idle.
 	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPush, "master", 0, shaClean))
 	wait(finished)
-	got, err := q.Get(slow.ID)
+	got, err = q.Get(slow.ID)
 	require.NoError(t, err)
 	assert.Equal(t, stateSuperseded, got.State)
 	_, deleted, running = machines.names()
@@ -610,7 +623,7 @@ func TestWorkerScriptPowerOff(t *testing.T) {
 		var b strings.Builder
 		require.NoError(t, workerTmpl.Execute(&b, map[string]string{
 			"URL": "http://10.0.0.1:8081", "JobID": "1", "Token": "t", "WorkDir": "/w",
-			"GoVersion": "1.26.1", "GoMemLimit": "12GiB", "PowerOffMinutes": minutes,
+			"GoVersion": "1.26.1", "GoMemLimit": "12GiB", "PowerOffMinutes": minutes, "ProgressSeconds": "60",
 		}))
 		return b.String()
 	}

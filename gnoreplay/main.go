@@ -38,6 +38,7 @@ func main() {
 		maxDiffs    = flag.Int("max-diffs", 1000, "maximum number of diffs listed in the report (counts stay exact); 0 for no limit")
 		out         = flag.String("out", "", "write the JSON report to this file")
 		logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
+		progress    = flag.String("progress", "", "keep this file updated with the replay's progress (JSON: height, tip, blocks_per_second)")
 	)
 	flag.Parse()
 
@@ -47,12 +48,18 @@ func main() {
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	report, err := run(logger, *dataDir, *genesisFile, *workDir, replayOptions{
+	opts := replayOptions{
 		ToHeight:    *toHeight,
 		StopOnFirst: *stopOnFirst,
 		MaxDiffs:    *maxDiffs,
 		Logger:      logger,
-	})
+	}
+	if *progress != "" {
+		opts.Progress = func(height, tip int64, blocksPerSecond float64) {
+			writeProgress(*progress, height, tip, blocksPerSecond, logger)
+		}
+	}
+	report, err := run(logger, *dataDir, *genesisFile, *workDir, opts)
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -69,6 +76,25 @@ func main() {
 	}
 	if report.Counts.Result > 0 || report.Counts.Block > 0 {
 		os.Exit(2)
+	}
+}
+
+// writeProgress replaces path with the progress, whole: whoever reads it
+// (the worker, which posts it to the coordinator) never sees half of it.
+func writeProgress(path string, height, tip int64, blocksPerSecond float64, logger *slog.Logger) {
+	bz, err := json.Marshal(struct {
+		Height          int64   `json:"height"`
+		Tip             int64   `json:"tip"`
+		BlocksPerSecond float64 `json:"blocks_per_second"`
+	}{height, tip, blocksPerSecond})
+	if err == nil {
+		err = os.WriteFile(path+".tmp", bz, 0o644)
+	}
+	if err == nil {
+		err = os.Rename(path+".tmp", path)
+	}
+	if err != nil {
+		logger.Warn("write progress", "err", err)
 	}
 }
 

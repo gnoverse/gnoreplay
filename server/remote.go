@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -44,6 +45,9 @@ var workerWorkDir = "/root/gnoreplay"
 // workerPowerOff makes workers schedule their own power-off at max_age.
 // Tests, which run the worker script on the test machine, turn it off.
 var workerPowerOff = true
+
+// workerProgressInterval is how often workers post the replay's progress.
+var workerProgressInterval = time.Minute
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
@@ -125,6 +129,7 @@ func (s *Server) replayRemote(ctx context.Context, j *Job, dir string, log io.Wr
 		"WorkDir":   filepath.Join(workerWorkDir, strconv.FormatInt(j.ID, 10)),
 		"GoVersion": h.GoVersion, "GoMemLimit": h.GoMemLimit,
 		"PowerOffMinutes": strconv.Itoa(powerOff),
+		"ProgressSeconds": strconv.FormatFloat(workerProgressInterval.Seconds(), 'f', -1, 64),
 	}); err != nil {
 		return err
 	}
@@ -523,6 +528,19 @@ func (s *Server) workerRoutes() http.Handler {
 			return
 		}
 		sess.signal()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	mux.HandleFunc("POST /worker/{id}/progress", s.withSession(func(w http.ResponseWriter, r *http.Request, _ *session, id int64) {
+		var p Progress
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&p); err != nil || p.Height < 0 || p.Height > p.Tip {
+			http.Error(w, "invalid progress", http.StatusBadRequest)
+			return
+		}
+		p.At = time.Now()
+		if err := s.queue.SetProgress(id, p); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	mux.HandleFunc("POST /worker/{id}/fail", s.withSession(func(w http.ResponseWriter, r *http.Request, sess *session, _ int64) {

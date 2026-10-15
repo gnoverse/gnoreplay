@@ -96,7 +96,11 @@ func main() {
 	flag.String("work-dir", "", "")
 	flag.String("max-diffs", "", "")
 	flag.String("log-level", "", "")
+	progress := flag.String("progress", "", "")
 	flag.Parse()
+	if *progress != "" {
+		os.WriteFile(*progress, []byte(` + "`" + `{"height":25,"tip":50,"blocks_per_second":5}` + "`" + `), 0o644)
+	}
 	if _, err := os.Stat(filepath.Join(*dataDir, "db", "state.db", "MARKER")); err != nil {
 		panic(err)
 	}

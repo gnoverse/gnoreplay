@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -49,6 +50,17 @@ type Job struct {
 	Outcome string
 	Summary string
 	Error   string
+	// Progress is how far the replay got, as its worker last reported, or
+	// nil.
+	Progress *Progress
+}
+
+// Progress is how far a running replay got.
+type Progress struct {
+	Height          int64     `json:"height"` // the last one replayed; 0 once genesis is
+	Tip             int64     `json:"tip"`
+	BlocksPerSecond float64   `json:"blocks_per_second"` // since the first block
+	At              time.Time `json:"at"`                // when the server got it
 }
 
 const (
@@ -89,7 +101,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 	title       TEXT    NOT NULL DEFAULT '',
 	author      TEXT    NOT NULL DEFAULT '',
 	replay_sha  TEXT    NOT NULL DEFAULT '',
-	replay_note TEXT    NOT NULL DEFAULT ''
+	replay_note TEXT    NOT NULL DEFAULT '',
+	progress    TEXT    NOT NULL DEFAULT '' -- JSON Progress
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state, priority, enqueued_at);
 CREATE INDEX IF NOT EXISTS jobs_key ON jobs (key, state);
@@ -121,6 +134,7 @@ var addedColumns = []struct{ table, column, decl string }{
 	{"jobs", "author", "TEXT NOT NULL DEFAULT ''"},
 	{"jobs", "replay_sha", "TEXT NOT NULL DEFAULT ''"},
 	{"jobs", "replay_note", "TEXT NOT NULL DEFAULT ''"},
+	{"jobs", "progress", "TEXT NOT NULL DEFAULT ''"},
 }
 
 func migrate(db *sql.DB) error {
@@ -250,10 +264,11 @@ func (q *Queue) Claim() (*Job, error) {
 	}
 	j := jobs[0]
 	j.StartedAt = time.Now()
-	if _, err := tx.Exec(`UPDATE jobs SET state = ?, started_at = ? WHERE id = ?`, stateRunning, j.StartedAt.UnixNano(), j.ID); err != nil {
+	// A requeued job starts over: its last run's progress is gone.
+	if _, err := tx.Exec(`UPDATE jobs SET state = ?, started_at = ?, progress = '' WHERE id = ?`, stateRunning, j.StartedAt.UnixNano(), j.ID); err != nil {
 		return nil, err
 	}
-	j.State = stateRunning
+	j.State, j.Progress = stateRunning, nil
 	return j, tx.Commit()
 }
 
@@ -359,6 +374,16 @@ func (q *Queue) SetPRInfo(key, title, author string) error {
 	return err
 }
 
+// SetProgress records how far a running job's replay got.
+func (q *Queue) SetProgress(id int64, p Progress) error {
+	bz, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	_, err = q.db.Exec(`UPDATE jobs SET progress = ? WHERE id = ? AND state = ?`, string(bz), id, stateRunning)
+	return err
+}
+
 // Requeue puts jobs left running by a previous process back in the queue,
 // except those with a session: they run on worker machines, and are resumed.
 func (q *Queue) Requeue() (int64, error) {
@@ -454,7 +479,7 @@ func (q *Queue) MarkSynced(repo string) error {
 }
 
 const jobColumns = `id, key, repo, event, branch, pr, sha, priority, state, enqueued_at, started_at, finished_at,
-	report_path, outcome, summary, base_id, error, title, author, replay_sha, replay_note`
+	report_path, outcome, summary, base_id, error, title, author, replay_sha, replay_note, progress`
 
 func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 	if err != nil {
@@ -465,10 +490,17 @@ func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 	for rows.Next() {
 		j := &Job{}
 		var enq, start, fin int64
+		var progress string
 		if err := rows.Scan(&j.ID, &j.Key, &j.Repo, &j.Event, &j.Branch, &j.PR, &j.SHA, &j.Priority, &j.State,
 			&enq, &start, &fin, &j.ReportPath, &j.Outcome, &j.Summary, &j.BaseID, &j.Error, &j.Title, &j.Author,
-			&j.ReplaySHA, &j.ReplayNote); err != nil {
+			&j.ReplaySHA, &j.ReplayNote, &progress); err != nil {
 			return nil, err
+		}
+		if progress != "" {
+			j.Progress = &Progress{}
+			if err := json.Unmarshal([]byte(progress), j.Progress); err != nil {
+				return nil, fmt.Errorf("job %d: progress: %w", j.ID, err)
+			}
 		}
 		j.EnqueuedAt = time.Unix(0, enq)
 		if start != 0 {
