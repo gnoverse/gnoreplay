@@ -107,6 +107,9 @@ func run(logger *slog.Logger, dataDir, genesisFile, workDir string, opts replayO
 		defer os.RemoveAll(tmp)
 		workDir = tmp
 	}
+	if err := prepareWorkDir(workDir); err != nil {
+		return nil, err
+	}
 
 	srcDBDir := filepath.Join(dataDir, "db")
 	bsDB, err := openReadOnly("blockstore", srcDBDir)
@@ -141,7 +144,41 @@ func run(logger *slog.Logger, dataDir, genesisFile, workDir string, opts replayO
 	}
 	defer replayStateDB.Close()
 
-	return replay(Source{Blocks: store.NewBlockStore(bsDB), StateDB: stateDB}, app, replayStateDB, opts)
+	r, err := replay(Source{Blocks: store.NewBlockStore(bsDB), StateDB: stateDB}, app, replayStateDB, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkReplayCoverage(r, dataDir); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// prepareWorkDir removes the app and state DBs of an earlier run, keeping the
+// genesis cache: a stale DB would be taken for this replay's own state (the
+// handshake trusts what it finds), and every block would then fail against
+// it, or the handshake would panic.
+func prepareWorkDir(workDir string) error {
+	for _, name := range []string{"gnolang", "state"} {
+		if err := os.RemoveAll(filepath.Join(workDir, name+".db")); err != nil {
+			return fmt.Errorf("clear %s of an earlier run: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// checkReplayCoverage rejects a report that compared nothing: an empty
+// blockstore, or a state DB with no recorded responses, would otherwise be
+// published as a clean pass.
+func checkReplayCoverage(r *Report, dataDir string) error {
+	if r.Blocks == 0 {
+		return fmt.Errorf("no blocks to replay in %s", filepath.Join(dataDir, "db"))
+	}
+	if r.MissingResponses == r.Blocks {
+		return fmt.Errorf("none of the %d replayed heights has recorded responses in %s: nothing to compare",
+			r.Blocks, filepath.Join(dataDir, "db", "state.db"))
+	}
+	return nil
 }
 
 // newApp builds the application the way `gnoland start` does (see

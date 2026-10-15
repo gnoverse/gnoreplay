@@ -1,6 +1,9 @@
 package main
 
 import (
+	"io/fs"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,6 +23,7 @@ import (
 	"github.com/gnolang/gno/tm2/pkg/crypto/ed25519"
 	"github.com/gnolang/gno/tm2/pkg/crypto/keys"
 	"github.com/gnolang/gno/tm2/pkg/db/memdb"
+	"github.com/gnolang/gno/tm2/pkg/db/pebbledb"
 	"github.com/gnolang/gno/tm2/pkg/log"
 	"github.com/gnolang/gno/tm2/pkg/sdk/bank"
 	"github.com/gnolang/gno/tm2/pkg/std"
@@ -32,6 +36,16 @@ func recordChain(t *testing.T) (Source, *bft.GenesisDoc) {
 
 	cfg := integration.TestingMinimalNodeConfig(gnoenv.RootDir())
 	node, remote := integration.TestingInMemoryNode(t, log.NewNoopLogger(), cfg)
+	sendTestTxs(t, remote, cfg.Genesis.ChainID)
+	require.NoError(t, node.Stop())
+
+	// The in-memory node keeps the blockstore, state and app in one DB.
+	return Source{Blocks: store.NewBlockStore(cfg.DB), StateDB: cfg.DB}, cfg.Genesis
+}
+
+// sendTestTxs sends a successful MsgRun, a panicking MsgRun and a bank send.
+func sendTestTxs(t *testing.T, remote, chainID string) {
+	t.Helper()
 
 	kb := keys.NewInMemory()
 	_, err := kb.CreateAccount(integration.DefaultAccount_Name, integration.DefaultAccount_Seed, "", "", 0, 0)
@@ -42,7 +56,7 @@ func recordChain(t *testing.T) (Source, *bft.GenesisDoc) {
 		Signer: &gnoclient.SignerFromKeybase{
 			Keybase: kb,
 			Account: integration.DefaultAccount_Name,
-			ChainID: cfg.Genesis.ChainID,
+			ChainID: chainID,
 		},
 		RPCClient: rpc,
 	}
@@ -78,11 +92,54 @@ func main() { panic("boom") }
 		Amount:      std.MustParseCoins(ugnot.ValueString(1000)),
 	})
 	require.NoError(t, err)
+}
 
+// recordChainOnDisk is recordChain with the node's DBs written under root, as
+// run() reads them: data/db/blockstore.db and data/db/state.db.
+func recordChainOnDisk(t *testing.T, root string) (dataDir, genesisFile string) {
+	t.Helper()
+
+	dataDir = filepath.Join(root, "data")
+	require.NoError(t, os.MkdirAll(filepath.Join(dataDir, "db"), 0o755))
+	db, err := pebbledb.NewPebbleDB("blockstore", filepath.Join(dataDir, "db"))
+	require.NoError(t, err)
+
+	cfg := integration.TestingMinimalNodeConfig(gnoenv.RootDir())
+	cfg.DB = db
+	node, remote := integration.TestingInMemoryNode(t, log.NewNoopLogger(), cfg)
+	sendTestTxs(t, remote, cfg.Genesis.ChainID)
 	require.NoError(t, node.Stop())
+	_ = db.Close()
 
-	// The in-memory node keeps the blockstore, state and app in one DB.
-	return Source{Blocks: store.NewBlockStore(cfg.DB), StateDB: cfg.DB}, cfg.Genesis
+	// The node keeps its blockstore, state and app in one DB; run() opens
+	// the two it reads as separate, read-only ones.
+	require.NoError(t, cpDir(filepath.Join(dataDir, "db", "blockstore.db"), filepath.Join(dataDir, "db", "state.db")))
+	genesisFile = filepath.Join(root, "genesis.json")
+	require.NoError(t, cfg.Genesis.SaveAs(genesisFile))
+	return dataDir, genesisFile
+}
+
+// cpDir copies a directory tree, as the node's one DB becomes both of the
+// source's for a run() test.
+func cpDir(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		bz, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, bz, 0o644)
+	})
 }
 
 func newTestApp(t *testing.T) abci.Application {

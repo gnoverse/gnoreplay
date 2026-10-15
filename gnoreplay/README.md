@@ -29,7 +29,7 @@ gnoreplay --data-dir <node data dir> --genesis genesis.json --out report.json
 |---|---|
 | `--data-dir` | Source node data directory. Its `db/blockstore.db` and `db/state.db` are opened read-only; the node must be stopped (or use a copy/snapshot). |
 | `--genesis` | The source chain's `genesis.json`. |
-| `--work-dir` | Where the replay's app and state DBs and genesis cache live (default: a temporary directory, removed on exit). |
+| `--work-dir` | Where the replay's app and state DBs and genesis cache live (default: a temporary directory, removed on exit). The app and state DBs of an earlier run are removed at start, keeping the genesis cache, so a reused directory is safe. |
 | `--to` | Last height to replay (default: the source tip). |
 | `--stop-on-first` | Stop at the first block with a result or app hash divergence. |
 | `--max-diffs` | Diffs listed in the report (default 1000; counts stay exact). |
