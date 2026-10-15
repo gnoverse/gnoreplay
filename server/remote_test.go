@@ -37,6 +37,7 @@ type fakeMachines struct {
 	rebuilt     []string                // names, at each rebuild
 	deleted     []string                // names
 	failRebuild bool
+	failCreate  int // the next creates that fail
 }
 
 type fakeMachine struct {
@@ -75,6 +76,10 @@ func (m *fakeMachine) machine(id string) Machine {
 func (f *fakeMachines) Create(_ context.Context, name, userData string, labels map[string]string) (Machine, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failCreate > 0 {
+		f.failCreate--
+		return Machine{}, errors.New("shared core limit exceeded")
+	}
 	f.nextID++
 	id := strconv.Itoa(f.nextID)
 	m := &fakeMachine{name: name, created: time.Now(), labels: maps.Clone(labels)}
@@ -426,10 +431,42 @@ func TestRemoteReplay(t *testing.T) {
 	machines.failRebuild = false
 	machines.mu.Unlock()
 
+	// While the provider refuses new machines, a job keeps its place and
+	// retries, until its run timeout.
+	createRetry = 10 * time.Millisecond
+	t.Cleanup(func() { createRetry = time.Minute })
+	machines.mu.Lock()
+	machines.failCreate = 3
+	machines.mu.Unlock()
+	machines.age(worker, time.Hour+56*time.Minute)
+	require.NoError(t, srv.reap(ctx)) // no idle machine left
+	ok = run(shaClean)
+	require.Equal(t, stateDone, ok.State, ok.Error)
+	created, _, running = machines.names()
+	require.Len(t, created, 3)
+	assert.Equal(t, 1, running)
+	worker = created[2]
+	machines.mu.Lock()
+	machines.failCreate = 1 << 30
+	machines.mu.Unlock()
+	machines.age(worker, time.Hour+56*time.Minute)
+	require.NoError(t, srv.reap(ctx))
+	cfg.Job.RunTimeout.Duration = 50 * time.Millisecond
+	failed = run(shaClean)
+	cfg.Job.RunTimeout.Duration = 3*time.Hour + 30*time.Minute
+	assert.Equal(t, stateFailed, failed.State)
+	assert.Contains(t, failed.Error, "create worker: shared core limit exceeded")
+	machines.mu.Lock()
+	machines.failCreate = 0
+	machines.mu.Unlock()
+
 	// A job that has run on its worker for longer than max_age is cancelled,
 	// and the worker deleted; the job fails with the reason, for good (not
 	// requeued).
 	stuck, finished := start(shaSlow)
+	created, _, _ = machines.names()
+	worker = created[len(created)-1]
+	assert.Equal(t, strconv.FormatInt(stuck.ID, 10), machines.labels(worker)[labelJob])
 	backdate(srv, stuck.ID, cfg.Hetzner.MaxAge.Duration+time.Minute)
 	require.NoError(t, srv.reap(ctx))
 	wait(finished)

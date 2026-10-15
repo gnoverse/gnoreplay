@@ -128,21 +128,57 @@ func (s *Server) replayRemote(ctx context.Context, j *Job, dir string, log io.Wr
 	}); err != nil {
 		return err
 	}
-	m, err := s.assignMachine(ctx, j.ID, userData.String(), log)
+	m, err := s.assignMachine(ctx, j.ID, userData.String(), sess.created.Add(s.cfg.Job.RunTimeout.Duration), log)
 	if err != nil {
 		return err
 	}
 	return s.awaitWorker(ctx, sess, m, log)
 }
 
+// createRetry is how often a job retries creating its worker machine.
+var createRetry = time.Minute
+
 // assignMachine starts userData on a worker machine for the job: the idle one
 // whose billing hour ends first (that hour is paid for already), reinstalled,
-// or else a new one.
-func (s *Server) assignMachine(ctx context.Context, jobID int64, userData string, log io.Writer) (Machine, error) {
+// or else a new one. The provider may refuse new machines for a while (out of
+// capacity, a project limit, an outage): the job then keeps its place and
+// tries again, taking a machine that becomes idle meanwhile, until deadline.
+func (s *Server) assignMachine(ctx context.Context, jobID int64, userData string, deadline time.Time, log io.Writer) (Machine, error) {
+	for {
+		if m, ok, err := s.reuseMachine(ctx, jobID, userData, log); ok || err != nil {
+			return m, err
+		}
+		m, err := s.prov.Create(ctx, newMachineName(), userData, workerLabels(jobID, time.Now()))
+		if err == nil {
+			s.mu.Lock()
+			s.machines[m.ID] = &workerMachine{Machine: m, job: jobID, since: time.Now()}
+			s.mu.Unlock()
+			fmt.Fprintf(log, "worker machine %s (%s) created\n", m.Name, m.ID)
+			return m, nil
+		}
+		if ctx.Err() != nil {
+			return Machine{}, ctx.Err()
+		}
+		if time.Now().Add(createRetry).After(deadline) {
+			return Machine{}, fmt.Errorf("create worker: %w", err)
+		}
+		s.logger.Error("create worker machine: retrying", "job", jobID, "in", createRetry, "err", err)
+		fmt.Fprintf(log, "worker machine not created, retrying in %s: %v\n", createRetry, err)
+		select {
+		case <-ctx.Done():
+			return Machine{}, ctx.Err()
+		case <-time.After(createRetry):
+		}
+	}
+}
+
+// reuseMachine gives the job an idle machine, reinstalled, if there is one
+// that can be.
+func (s *Server) reuseMachine(ctx context.Context, jobID int64, userData string, log io.Writer) (Machine, bool, error) {
 	for {
 		m, ok := s.takeIdle(jobID)
 		if !ok {
-			break
+			return Machine{}, false, nil
 		}
 		err := s.prov.Rebuild(ctx, m.ID, userData)
 		if err == nil {
@@ -152,25 +188,16 @@ func (s *Server) assignMachine(ctx context.Context, jobID int64, userData string
 		}
 		if err == nil {
 			fmt.Fprintf(log, "worker machine %s (%s) reinstalled\n", m.Name, m.ID)
-			return m, nil
+			return m, true, nil
 		}
 		if ctx.Err() != nil {
 			s.releaseMachine(ctx, m, log)
-			return Machine{}, ctx.Err()
+			return Machine{}, false, ctx.Err()
 		}
 		s.logger.Error("reinstall worker machine", "machine", m.Name, "err", err)
 		fmt.Fprintf(log, "worker machine %s (%s) not reinstalled: %v\n", m.Name, m.ID, err)
 		s.deleteMachine(m, log)
 	}
-	m, err := s.prov.Create(ctx, newMachineName(), userData, workerLabels(jobID, time.Now()))
-	if err != nil {
-		return Machine{}, fmt.Errorf("create worker: %w", err)
-	}
-	s.mu.Lock()
-	s.machines[m.ID] = &workerMachine{Machine: m, job: jobID, since: time.Now()}
-	s.mu.Unlock()
-	fmt.Fprintf(log, "worker machine %s (%s) created\n", m.Name, m.ID)
-	return m, nil
 }
 
 // takeIdle gives the job the idle machine whose billing hour ends first.
