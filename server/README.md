@@ -62,7 +62,7 @@ Within a level, jobs run in arrival order. A new push to the same branch or PR s
 
 Replays run in one of two places:
 
-- **On worker machines** (`[digitalocean]` in the config): each replay gets its own droplet, created for it and deleted when it ends; the droplet is the sandbox. The coordinator only needs ~4 GB. Step by step: [`deploy/README.md`](../deploy/README.md), config: [`config.digitalocean.example.toml`](config.digitalocean.example.toml).
+- **On worker machines** (`[hetzner]` in the config): each replay runs on a Hetzner Cloud server of its own, reinstalled from scratch for it; the server is the sandbox. A worker that finished its replay runs the next one, and one left idle is deleted at the end of its billing hour (Hetzner bills started hours). The coordinator only needs 2 GB of RAM, and disk for the reports (~0.2 GB a day). Step by step: [`deploy/README.md`](../deploy/README.md), config: [`config.hetzner.example.toml`](config.hetzner.example.toml).
 - **On the server's own box**, in local sandboxes (`config.example.toml`): one bigger machine with KVM, described below.
 
 What the box needs in both cases (except where noted):
@@ -79,7 +79,7 @@ What the box needs in both cases (except where noted):
 
 PR code is untrusted.
 
-- **Worker machines** hold nothing but their own job: the coordinator checks out the commit and serves it, with the chain data, on its private address to a token valid for that job only, and takes the report back the same way. They get no GitHub or cloud credentials, and no inbound connections (cloud firewall). They live in a VPC of their own, so they can't reach anything but the coordinator's worker endpoint; they keep outbound internet access for Go and its modules.
+- **Worker machines** hold nothing but their own job: the coordinator checks out the commit and serves it, with the chain data, on its private address to a token valid for that job only, and takes the report back the same way. They get no GitHub or cloud credentials, and no inbound connections from the internet (cloud firewall). They live in a private network of their own, so they can't reach anything but the coordinator's worker endpoint (and each other's SSH, which takes keys only); they keep outbound internet access for Go and its modules. A worker is reinstalled from scratch, its disk wiped, before each job: a job's PR code runs as root, and must not reach the next job, e.g. a `gno-fixes` one's source.
 - **Local mode**: builds and replays run in microsandbox VMs that mount only the data dir, with a minimal environment; the replay VM has no network.
 
 The GitHub token stays on the coordinator: it goes to `git fetch` there through that command's environment only. Keep the token, OAuth secret and viewers files outside `data_dir` (which holds `session.key`, the key signing session cookies, created on first start).

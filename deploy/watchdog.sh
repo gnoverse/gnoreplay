@@ -1,46 +1,58 @@
 #!/usr/bin/env bash
-# Deletes gnoreplay worker droplets older than MAX_AGE, whatever their job's
-# state. A failsafe independent of gnoreplay-server (which enforces the same
-# limit itself): run it from a timer on the coordinator, and from somewhere
-# else (e.g. the scheduled GitHub workflow) in case the coordinator is down.
+# Deletes gnoreplay worker servers that have run one job, or been idle, for
+# too long. A failsafe independent of gnoreplay-server (which enforces the
+# same limits itself): run it from a timer on the coordinator, and from
+# somewhere else (e.g. the scheduled GitHub workflow) in case the coordinator
+# is down. The server labels each worker with the job it runs (gnoreplay-job,
+# absent while idle), and since when (gnoreplay-since, in Unix seconds).
 #
-#   DO_TOKEN or DO_TOKEN_FILE  DigitalOcean API token (droplet read + delete)
-#   TAG                        worker tag                 (default gnoreplay-worker)
-#   MAX_AGE                    max age in seconds         (default 14400, 4h)
-#   DO_API                     API base URL               (default https://api.digitalocean.com)
+#   HCLOUD_TOKEN or HCLOUD_TOKEN_FILE  Hetzner Cloud API token (read & write)
+#   MAX_AGE     max time on one job, in seconds     (default 14400, 4h)
+#   MAX_IDLE    max time idle, in seconds           (default 3900, 65 min: the
+#               server deletes idle workers before their billing hour ends)
+#   HCLOUD_API  API base URL                        (default https://api.hetzner.cloud/v1)
 #
 # Exits non-zero if the API could not be read or a deletion failed.
 set -euo pipefail
 
-TAG=${TAG:-gnoreplay-worker}
 MAX_AGE=${MAX_AGE:-14400}
-DO_API=${DO_API:-https://api.digitalocean.com}
-if [ -z "${DO_TOKEN:-}" ] && [ -n "${DO_TOKEN_FILE:-}" ]; then
-	DO_TOKEN=$(tr -d '[:space:]' <"$DO_TOKEN_FILE")
+MAX_IDLE=${MAX_IDLE:-3900}
+HCLOUD_API=${HCLOUD_API:-https://api.hetzner.cloud/v1}
+if [ -z "${HCLOUD_TOKEN:-}" ] && [ -n "${HCLOUD_TOKEN_FILE:-}" ]; then
+	HCLOUD_TOKEN=$(tr -d '[:space:]' <"$HCLOUD_TOKEN_FILE")
 fi
-: "${DO_TOKEN:?DO_TOKEN or DO_TOKEN_FILE is required}"
+: "${HCLOUD_TOKEN:?HCLOUD_TOKEN or HCLOUD_TOKEN_FILE is required}"
 
 api() {
-	curl -fsS --retry 3 -H "Authorization: Bearer $DO_TOKEN" "$@"
+	curl -fsS --retry 3 -H "Authorization: Bearer $HCLOUD_TOKEN" "$@"
 }
 
 now=$(date -u +%s)
 failed=0
-url="$DO_API/v2/droplets?tag_name=$TAG&per_page=200"
-while [ -n "$url" ]; do
-	page=$(api "$url")
-	while read -r id name created; do
+page=1
+while [ -n "$page" ]; do
+	res=$(api "$HCLOUD_API/servers?label_selector=gnoreplay%3Dworker&per_page=50&page=$page")
+	while read -r id name job since created; do
 		[ -n "$id" ] || continue
-		age=$((now - $(date -u -d "$created" +%s)))
-		if [ "$age" -le "$MAX_AGE" ]; then
+		# Without a valid label, from the server's creation.
+		case $since in
+		'' | *[!0-9]*) since=$(date -u -d "$created" +%s) ;;
+		esac
+		if [ "$job" = - ]; then
+			state=idle limit=$MAX_IDLE
+		else
+			state="on job $job" limit=$MAX_AGE
+		fi
+		age=$((now - since))
+		if [ "$age" -le "$limit" ]; then
 			continue
 		fi
-		echo "deleting droplet $id ($name): created $created, ${age}s ago > ${MAX_AGE}s"
-		if ! api -X DELETE "$DO_API/v2/droplets/$id" -o /dev/null; then
-			echo "failed to delete droplet $id ($name)" >&2
+		echo "deleting server $id ($name): $state for ${age}s > ${limit}s"
+		if ! api -X DELETE "$HCLOUD_API/servers/$id" -o /dev/null; then
+			echo "failed to delete server $id ($name)" >&2
 			failed=1
 		fi
-	done < <(jq -r '.droplets[] | "\(.id) \(.name) \(.created_at)"' <<<"$page")
-	url=$(jq -r '.links.pages.next // empty' <<<"$page")
+	done < <(jq -r '.servers[] | "\(.id) \(.name) \(.labels["gnoreplay-job"] // "-") \(.labels["gnoreplay-since"] // "-") \(.created)"' <<<"$res")
+	page=$(jq -r '.meta.pagination.next_page // empty' <<<"$res")
 done
 exit $failed

@@ -22,10 +22,14 @@ import (
 	"time"
 )
 
-// Remote replays run on a disposable machine per job (see Provisioner): the
-// machine is the sandbox. It downloads the job's inputs from the coordinator's
-// private worker endpoints with a per-job token, replays, and posts back the
-// report; the coordinator then deletes it. Workers get no other credentials.
+// Remote replays run on worker machines (see Provisioner), one job at a time:
+// the machine is the sandbox. It downloads the job's inputs from the
+// coordinator's private worker endpoints with a per-job token, replays, and
+// posts back the report. Workers get no other credentials. The provider bills
+// started hours: a worker that finished its job is kept for the next one,
+// reinstalled from scratch first, so that nothing of a job (PR code runs as
+// root) reaches the next; one left idle is deleted in the last minutes of its
+// billing hour.
 
 //go:embed worker.sh
 var workerScript string
@@ -57,7 +61,24 @@ type session struct {
 
 const workerFailed = "worker-failed.log"
 
-func machineName(jobID int64) string { return fmt.Sprintf("gnoreplay-job-%d", jobID) }
+// workerMachine is a worker machine this process knows: running job, or idle
+// (job 0), since since.
+type workerMachine struct {
+	Machine
+	job   int64
+	since time.Time
+}
+
+// idleMargin: an idle worker is deleted this close to the end of its billing
+// hour, unless a job takes it first.
+const idleMargin = 5 * time.Minute
+
+// hourLeft is what remains of a machine's current billing hour.
+func hourLeft(created, now time.Time) time.Duration {
+	return time.Hour - now.Sub(created)%time.Hour
+}
+
+func newMachineName() string { return "gnoreplay-worker-" + strings.ToLower(rand.Text()[:8]) }
 
 func (s *Server) addSession(id int64, sess *session) {
 	s.mu.Lock()
@@ -79,7 +100,7 @@ func (s *Server) endSession(ctx context.Context, id int64) {
 	}
 }
 
-// replayRemote runs the job on a new machine, which saves its report as
+// replayRemote runs the job on a worker machine, which saves its report as
 // report.json in dir.
 func (s *Server) replayRemote(ctx context.Context, j *Job, dir string, log io.Writer) error {
 	token := rand.Text()
@@ -94,36 +115,117 @@ func (s *Server) replayRemote(ctx context.Context, j *Job, dir string, log io.Wr
 	defer s.endSession(ctx, j.ID)
 
 	var userData strings.Builder
-	do := s.cfg.DigitalOcean
+	h := s.cfg.Hetzner
 	powerOff := 0
 	if workerPowerOff {
-		powerOff = int(do.MaxAge.Minutes())
+		powerOff = int(h.MaxAge.Minutes())
 	}
 	if err := workerTmpl.Execute(&userData, map[string]string{
-		"URL": strings.TrimRight(do.URL, "/"), "JobID": strconv.FormatInt(j.ID, 10), "Token": token,
+		"URL": strings.TrimRight(h.URL, "/"), "JobID": strconv.FormatInt(j.ID, 10), "Token": token,
 		"WorkDir":   filepath.Join(workerWorkDir, strconv.FormatInt(j.ID, 10)),
-		"GoVersion": do.GoVersion, "GoMemLimit": do.GoMemLimit,
+		"GoVersion": h.GoVersion, "GoMemLimit": h.GoMemLimit,
 		"PowerOffMinutes": strconv.Itoa(powerOff),
 	}); err != nil {
 		return err
 	}
-	m, err := s.prov.Create(ctx, machineName(j.ID), userData.String())
+	m, err := s.assignMachine(ctx, j.ID, userData.String(), log)
 	if err != nil {
-		return fmt.Errorf("create worker: %w", err)
+		return err
 	}
-	fmt.Fprintf(log, "worker machine %s (%s) created\n", m.Name, m.ID)
 	return s.awaitWorker(ctx, sess, m, log)
 }
 
-// awaitWorker waits for the worker's result, then deletes its machine. A
+// assignMachine starts userData on a worker machine for the job: the idle one
+// whose billing hour ends first (that hour is paid for already), reinstalled,
+// or else a new one.
+func (s *Server) assignMachine(ctx context.Context, jobID int64, userData string, log io.Writer) (Machine, error) {
+	for {
+		m, ok := s.takeIdle(jobID)
+		if !ok {
+			break
+		}
+		err := s.prov.Rebuild(ctx, m.ID, userData)
+		if err == nil {
+			// Only once it runs the job: a restart finds the job's machine
+			// by this label.
+			err = s.prov.SetLabels(ctx, m.ID, workerLabels(jobID, time.Now()))
+		}
+		if err == nil {
+			fmt.Fprintf(log, "worker machine %s (%s) reinstalled\n", m.Name, m.ID)
+			return m, nil
+		}
+		if ctx.Err() != nil {
+			s.releaseMachine(ctx, m, log)
+			return Machine{}, ctx.Err()
+		}
+		s.logger.Error("reinstall worker machine", "machine", m.Name, "err", err)
+		fmt.Fprintf(log, "worker machine %s (%s) not reinstalled: %v\n", m.Name, m.ID, err)
+		s.deleteMachine(m, log)
+	}
+	m, err := s.prov.Create(ctx, newMachineName(), userData, workerLabels(jobID, time.Now()))
+	if err != nil {
+		return Machine{}, fmt.Errorf("create worker: %w", err)
+	}
+	s.mu.Lock()
+	s.machines[m.ID] = &workerMachine{Machine: m, job: jobID, since: time.Now()}
+	s.mu.Unlock()
+	fmt.Fprintf(log, "worker machine %s (%s) created\n", m.Name, m.ID)
+	return m, nil
+}
+
+// takeIdle gives the job the idle machine whose billing hour ends first.
+func (s *Server) takeIdle(jobID int64) (Machine, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	var best *workerMachine
+	for _, w := range s.machines {
+		if w.job == 0 && (best == nil || hourLeft(w.Created, now) < hourLeft(best.Created, now)) {
+			best = w
+		}
+	}
+	if best == nil {
+		return Machine{}, false
+	}
+	best.job, best.since = jobID, now
+	return best.Machine, true
+}
+
+// releaseMachine makes a job's machine idle: the next job reinstalls it, or
+// it is deleted at the end of its billing hour. A stopping server leaves it
+// to the next start.
+func (s *Server) releaseMachine(ctx context.Context, m Machine, log io.Writer) {
+	if shuttingDown(ctx) {
+		return
+	}
+	s.mu.Lock()
+	_, known := s.machines[m.ID]
+	s.mu.Unlock()
+	if !known {
+		return // deleted meanwhile, over its max age
+	}
+	// Labelled before another job can take it, not to overwrite that job's
+	// labels.
+	now := time.Now()
+	labelCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	err := s.prov.SetLabels(labelCtx, m.ID, workerLabels(0, now))
+	cancel()
+	if err != nil {
+		// deploy/watchdog.sh then takes it for busy, until its max age.
+		s.logger.Error("label idle worker machine", "machine", m.Name, "err", err)
+	}
+	s.mu.Lock()
+	if w := s.machines[m.ID]; w != nil {
+		w.job, w.since = 0, now
+	}
+	s.mu.Unlock()
+	fmt.Fprintf(log, "worker machine %s released\n", m.Name)
+}
+
+// awaitWorker waits for the worker's result, then releases its machine. A
 // stopping server leaves the machine running for the next start to resume.
 func (s *Server) awaitWorker(ctx context.Context, sess *session, m Machine, log io.Writer) error {
-	// Machines cost money until deleted, whatever happens to the job.
-	defer func() {
-		if !shuttingDown(ctx) {
-			s.deleteMachine(m, log)
-		}
-	}()
+	defer s.releaseMachine(ctx, m, log)
 	timeout := time.NewTimer(time.Until(sess.created.Add(s.cfg.Job.RunTimeout.Duration)))
 	defer timeout.Stop()
 	for {
@@ -166,8 +268,8 @@ type resumable struct {
 }
 
 // start readies a new server process: jobs left on worker machines that still
-// exist are resumed (the returned ones), other interrupted jobs are queued
-// again, and machines no job owns are deleted.
+// run them are resumed (the returned ones), other interrupted jobs are queued
+// again, and the other machines are idle.
 func (s *Server) start(ctx context.Context) ([]resumable, error) {
 	var resume []resumable
 	if s.prov != nil {
@@ -179,9 +281,11 @@ func (s *Server) start(ctx context.Context) ([]resumable, error) {
 		if err != nil {
 			return nil, fmt.Errorf("list worker machines: %w", err)
 		}
-		byName := map[string]Machine{}
+		byJob := map[int64]Machine{}
 		for _, m := range machines {
-			byName[m.Name] = m
+			if job, err := strconv.ParseInt(m.Labels[labelJob], 10, 64); err == nil {
+				byJob[job] = m
+			}
 		}
 		for _, st := range stored {
 			j, err := s.queue.Get(st.JobID)
@@ -189,14 +293,17 @@ func (s *Server) start(ctx context.Context) ([]resumable, error) {
 				return nil, err
 			}
 			running := err == nil && j.State == stateRunning
-			m, ok := byName[machineName(st.JobID)]
+			m, ok := byJob[st.JobID]
 			if running && ok {
 				sess := &session{tokenHash: st.TokenHash, dir: s.jobDir(j.ID), created: st.Created, done: make(chan struct{}, 1)}
 				s.addSession(j.ID, sess)
+				s.mu.Lock()
+				s.machines[m.ID] = &workerMachine{Machine: m, job: j.ID, since: st.Created}
+				s.mu.Unlock()
 				resume = append(resume, resumable{job: j, sess: sess, machine: m})
 				continue
 			}
-			// The job ended, or its machine is gone (never created, or
+			// The job ended, or no machine runs it (never given one, or
 			// deleted at its max age): the job runs again (Requeue below),
 			// unless it ran out of time.
 			if err := s.queue.DeleteSession(st.JobID); err != nil {
@@ -204,7 +311,7 @@ func (s *Server) start(ctx context.Context) ([]resumable, error) {
 			}
 			if running && time.Since(st.Created) > s.cfg.Job.RunTimeout.Duration {
 				if _, err := s.queue.Finish(j.ID, Job{State: stateFailed, Error: fmt.Sprintf(
-					"worker machine %s is gone, and the job ran out of time (%s)", machineName(j.ID), s.cfg.Job.RunTimeout.Duration)}); err != nil {
+					"no worker machine runs the job anymore, and it ran out of time (%s)", s.cfg.Job.RunTimeout.Duration)}); err != nil {
 					return nil, err
 				}
 			}
@@ -216,7 +323,7 @@ func (s *Server) start(ctx context.Context) ([]resumable, error) {
 		s.logger.Info("requeued interrupted jobs", "count", n)
 	}
 	if s.prov != nil {
-		// Machines of resumed jobs have sessions again, and are spared.
+		// The other machines become idle ones.
 		if err := s.reap(ctx); err != nil {
 			return nil, fmt.Errorf("reap worker machines: %w", err)
 		}
@@ -235,13 +342,13 @@ func (s *Server) resumeJob(ctx context.Context, r resumable) {
 		defer s.endSession(ctx, j.ID)
 		logFile, err := os.OpenFile(filepath.Join(r.sess.dir, "job.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
-			s.deleteMachine(r.machine, io.Discard)
+			s.releaseMachine(ctx, r.machine, io.Discard)
 			return nil, "", err
 		}
 		defer logFile.Close()
 		// Cancelled before this process tracked it: nothing to wait for.
 		if cur, err := s.queue.Get(j.ID); err == nil && cur.State != stateRunning {
-			s.deleteMachine(r.machine, logFile)
+			s.releaseMachine(ctx, r.machine, logFile)
 			return nil, "", errSuperseded
 		}
 		logger.Info("replay resumed", "machine", r.machine.Name)
@@ -254,6 +361,9 @@ func (s *Server) resumeJob(ctx context.Context, r resumable) {
 }
 
 func (s *Server) deleteMachine(m Machine, log io.Writer) {
+	s.mu.Lock()
+	delete(s.machines, m.ID)
+	s.mu.Unlock()
 	var err error
 	for attempt := range 5 {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -265,7 +375,7 @@ func (s *Server) deleteMachine(m Machine, log io.Writer) {
 		}
 		time.Sleep(time.Duration(attempt+1) * 5 * time.Second)
 	}
-	// The reaper deletes it later.
+	// The reaper finds it again, as an idle machine.
 	s.logger.Error("delete worker machine", "machine", m.Name, "id", m.ID, "err", err)
 }
 
@@ -276,37 +386,69 @@ func tail(s string, n int) string {
 	return "…" + s[len(s)-n:]
 }
 
-// reap deletes worker machines that no running job owns (left over from a
-// crash or a failed delete), and any older than max_age whatever owns it,
-// cancelling that job. It runs at startup, before any job, and then
-// periodically. (deploy/watchdog.sh enforces max_age too, without the
-// server.)
+// reap keeps the worker machines in check. It runs at startup, before any
+// job, and then every minute:
+//   - a machine that has run its job for longer than max_age is deleted, and
+//     its job cancelled;
+//   - an idle one is deleted in the last minutes of its billing hour;
+//   - one this process doesn't know (left by a previous one, or by a failed
+//     create) becomes an idle one.
+//
+// (deploy/watchdog.sh deletes machines busy or idle for too long too,
+// without the server.)
 func (s *Server) reap(ctx context.Context) error {
 	machines, err := s.prov.List(ctx)
 	if err != nil {
 		return err
 	}
+	now := time.Now()
+	maxAge := s.cfg.Hetzner.MaxAge.Duration
+	var overAge []workerMachine
+	var expired []Machine
+	listed := map[string]bool{}
+	s.mu.Lock()
 	for _, m := range machines {
-		id, err := strconv.ParseInt(strings.TrimPrefix(m.Name, "gnoreplay-job-"), 10, 64)
-		s.mu.Lock()
-		_, active := s.sessions[id]
-		s.mu.Unlock()
-		active = active && err == nil
-		tooOld := time.Since(m.Created) > s.cfg.DigitalOcean.MaxAge.Duration
-		if active && !tooOld {
-			continue
+		listed[m.ID] = true
+		w := s.machines[m.ID]
+		if w == nil {
+			if job, err := strconv.ParseInt(m.Labels[labelJob], 10, 64); err == nil && s.sessions[job] != nil {
+				continue // created for a job, which records it once created
+			}
+			w = &workerMachine{Machine: m, since: now}
+			s.machines[m.ID] = w
+			s.logger.Info("idle worker machine found", "machine", m.Name, "created", m.Created)
 		}
-		if active {
-			s.logger.Error("worker machine exceeded its max age: cancelling its job",
-				"machine", m.Name, "created", m.Created, "max_age", s.cfg.DigitalOcean.MaxAge)
-			s.cancelCause(id, fmt.Errorf("worker machine %s exceeded its max age (%s) and was deleted",
-				m.Name, s.cfg.DigitalOcean.MaxAge))
+		switch {
+		case w.job != 0 && now.Sub(w.since) > maxAge:
+			overAge = append(overAge, *w)
+			delete(s.machines, m.ID)
+		case w.job == 0 && hourLeft(m.Created, now) <= idleMargin:
+			expired = append(expired, m)
+			delete(s.machines, m.ID)
 		}
+	}
+	for id, w := range s.machines {
+		if !listed[id] && w.job == 0 {
+			delete(s.machines, id) // deleted by someone else
+		}
+	}
+	s.mu.Unlock()
+
+	for _, w := range overAge {
+		s.logger.Error("worker machine ran its job past its max age: cancelling it",
+			"machine", w.Name, "job", w.job, "since", w.since, "max_age", maxAge)
+		s.cancelCause(w.job, fmt.Errorf("worker machine %s ran the job for longer than its max age (%s), and was deleted",
+			w.Name, maxAge))
+		if err := s.prov.Delete(ctx, w.ID); err != nil {
+			s.logger.Error("delete worker machine", "machine", w.Name, "err", err)
+		}
+	}
+	for _, m := range expired {
 		if err := s.prov.Delete(ctx, m.ID); err != nil {
-			s.logger.Error("reap worker machine", "machine", m.Name, "err", err)
+			s.logger.Error("delete idle worker machine", "machine", m.Name, "err", err)
 			continue
 		}
-		s.logger.Info("reaped worker machine", "machine", m.Name, "created", m.Created)
+		s.logger.Info("deleted idle worker machine at the end of its billing hour", "machine", m.Name, "created", m.Created)
 	}
 	return nil
 }

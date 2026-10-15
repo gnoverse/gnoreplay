@@ -42,31 +42,32 @@ func TestExampleConfig(t *testing.T) {
 	cfg.GitHub.OAuth = oauth
 	assert.True(t, cfg.Repos["gnolang/gno"].PublicReports)
 	assert.Equal(t, "4h0m0s", cfg.Job.RunTimeout.String())
-	assert.Nil(t, cfg.DigitalOcean)
+	assert.Nil(t, cfg.Hetzner)
 
 	// A branch is pushed to by name.
 	cfg.Rules = append(cfg.Rules, Rule{Repo: "gnolang/gno", Event: eventPush, Branch: anyBranch})
 	assert.ErrorContains(t, cfg.validate(), "only for pull_request rules")
 }
 
-func TestDigitalOceanExampleConfig(t *testing.T) {
-	cfg := loadExample(t, "config.digitalocean.example.toml")
-	require.NotNil(t, cfg.DigitalOcean)
-	assert.Equal(t, "m-2vcpu-16gb", cfg.DigitalOcean.Size)
-	assert.Equal(t, "gnoreplay-worker", cfg.DigitalOcean.Tag)
+func TestHetznerExampleConfig(t *testing.T) {
+	cfg := loadExample(t, "config.hetzner.example.toml")
+	require.NotNil(t, cfg.Hetzner)
+	assert.Equal(t, "cpx42", cfg.Hetzner.ServerType)
+	assert.Equal(t, "ubuntu-24.04", cfg.Hetzner.Image)
+	assert.Equal(t, []int64{12345678}, cfg.Hetzner.SSHKeys)
 	assert.Equal(t, defaultRules, cfg.Rules)
 
-	assert.Equal(t, "4h0m0s", cfg.DigitalOcean.MaxAge.String())
+	assert.Equal(t, "4h0m0s", cfg.Hetzner.MaxAge.String())
 
 	// A job must time out before its worker is deleted from under it.
-	cfg.Job.RunTimeout = cfg.DigitalOcean.MaxAge
-	assert.ErrorContains(t, cfg.validate(), "must be below digitalocean.max_age")
+	cfg.Job.RunTimeout = cfg.Hetzner.MaxAge
+	assert.ErrorContains(t, cfg.validate(), "must be below hetzner.max_age")
 	cfg.Job.RunTimeout.Duration = time.Hour
 
-	// Workers must get a VPC of their own and an SSH key.
-	cfg.DigitalOcean.VPCUUID = ""
-	assert.ErrorContains(t, cfg.validate(), "vpc_uuid")
-	cfg.DigitalOcean.VPCUUID = "x"
-	cfg.DigitalOcean.SSHKeys = nil
+	// Workers must get a network of their own and an SSH key.
+	cfg.Hetzner.Network = 0
+	assert.ErrorContains(t, cfg.validate(), "hetzner.network")
+	cfg.Hetzner.Network = 1
+	cfg.Hetzner.SSHKeys = nil
 	assert.ErrorContains(t, cfg.validate(), "ssh_keys")
 }

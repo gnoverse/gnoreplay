@@ -18,15 +18,15 @@ type Config struct {
 	// DataDir holds the job DB, git mirrors, job work dirs and reports.
 	DataDir string `toml:"data_dir"`
 	// Workers is the number of replays run concurrently: local sandboxes, or
-	// worker droplets with [digitalocean].
+	// worker servers with [hetzner].
 	Workers int `toml:"workers"`
 
 	GitHub GitHubConfig `toml:"github"`
 	Chain  ChainConfig  `toml:"chain"`
 	Job    JobConfig    `toml:"job"`
-	// DigitalOcean, when set, runs each replay on its own worker droplet
+	// Hetzner, when set, runs each replay on a worker server of its own
 	// instead of in a local sandbox.
-	DigitalOcean *DigitalOceanConfig `toml:"digitalocean"`
+	Hetzner *HetznerConfig `toml:"hetzner"`
 
 	// Rules select what is replayed and its priority: the first matching rule
 	// wins, and its position is the priority (earlier runs first). Branches
@@ -59,24 +59,25 @@ type OAuthConfig struct {
 	ClientSecretFile string `toml:"client_secret_file"`
 }
 
-// DigitalOceanConfig runs replays on disposable droplets: the droplet is the
-// sandbox. Each gets a startup script that downloads the job's inputs from the
-// coordinator over the private network, replays, and posts back the report;
-// the coordinator then deletes it.
-type DigitalOceanConfig struct {
-	// TokenFile holds an API token that can create, read and delete droplets.
-	TokenFile string `toml:"token_file"`
-	Region    string `toml:"region"`
-	Size      string `toml:"size"`
-	Image     string `toml:"image"`
-	// VPCUUID is the private network workers join. Use a VPC of their own:
-	// PR code runs on them and can reach anything else in it.
-	VPCUUID string `toml:"vpc_uuid"`
-	// SSHKeys are key fingerprints (or IDs) set on workers. One is required:
-	// without it, DigitalOcean emails a root password for every droplet.
-	SSHKeys []string `toml:"ssh_keys"`
-	// Tag marks the worker droplets, for firewalls and cleanup.
-	Tag string `toml:"tag"`
+// HetznerConfig runs replays on Hetzner Cloud servers: the server is the
+// sandbox, reinstalled from scratch for each job, with a startup script that
+// downloads the job's inputs from the coordinator over the private network,
+// replays, and posts back the report. Hetzner bills started hours from a
+// server's creation: a server that finished a job runs the next one, and one
+// left idle is deleted at the end of its billing hour.
+type HetznerConfig struct {
+	// TokenFile holds an API token (read & write) of the project workers are
+	// created in.
+	TokenFile  string `toml:"token_file"`
+	Location   string `toml:"location"`
+	ServerType string `toml:"server_type"`
+	Image      string `toml:"image"`
+	// Network is the ID of the private network workers join. Use one of
+	// their own: PR code runs on them and can reach anything else in it.
+	Network int64 `toml:"network"`
+	// SSHKeys are the IDs of SSH keys set on workers. One is required:
+	// without it, Hetzner emails a root password for every server.
+	SSHKeys []int64 `toml:"ssh_keys"`
 	// Listen is the coordinator's private address that workers download
 	// their inputs from, and URL how they reach it ("http://10.x.y.z:8081").
 	Listen string `toml:"listen"`
@@ -86,9 +87,10 @@ type DigitalOceanConfig struct {
 	GoVersion string `toml:"go_version"`
 	// GoMemLimit is the replay's GOMEMLIMIT on the worker.
 	GoMemLimit string `toml:"go_mem_limit"`
-	// MaxAge is how long a worker may exist, from its creation, whatever
-	// its job's state: older ones are deleted (and their job cancelled).
-	// job.run_timeout must leave room for the worker's boot and build.
+	// MaxAge is how long a worker may run one job, from when it was given
+	// it, whatever the job's state: the worker is then deleted (and its job
+	// cancelled). job.run_timeout must leave room for the worker's boot and
+	// build.
 	MaxAge Duration `toml:"max_age"`
 }
 
@@ -208,30 +210,24 @@ func (c *Config) setDefaults() {
 	}
 	if c.Job.RunTimeout.Duration == 0 {
 		c.Job.RunTimeout.Duration = 4 * time.Hour
-		if c.DigitalOcean != nil {
+		if c.Hetzner != nil {
 			// Below the workers' max age, so jobs time out before their
 			// worker is deleted from under them.
 			c.Job.RunTimeout.Duration = 3*time.Hour + 30*time.Minute
 		}
 	}
-	if do := c.DigitalOcean; do != nil {
-		if do.MaxAge.Duration == 0 {
-			do.MaxAge.Duration = 4 * time.Hour
+	if h := c.Hetzner; h != nil {
+		if h.MaxAge.Duration == 0 {
+			h.MaxAge.Duration = 4 * time.Hour
 		}
-		if do.Size == "" {
-			do.Size = "m-2vcpu-16gb"
+		if h.Image == "" {
+			h.Image = "ubuntu-24.04"
 		}
-		if do.Image == "" {
-			do.Image = "ubuntu-24-04-x64"
+		if h.GoVersion == "" {
+			h.GoVersion = "1.26.1"
 		}
-		if do.Tag == "" {
-			do.Tag = "gnoreplay-worker"
-		}
-		if do.GoVersion == "" {
-			do.GoVersion = "1.26.1"
-		}
-		if do.GoMemLimit == "" {
-			do.GoMemLimit = "12GiB"
+		if h.GoMemLimit == "" {
+			h.GoMemLimit = "12GiB"
 		}
 	}
 }
@@ -262,18 +258,18 @@ func (c *Config) validate() error {
 			return fmt.Errorf("repos.%q.viewers_file needs github.oauth to sign viewers in", name)
 		}
 	}
-	if do := c.DigitalOcean; do != nil {
+	if h := c.Hetzner; h != nil {
 		switch {
-		case do.TokenFile == "" || do.Region == "":
-			return fmt.Errorf("digitalocean.token_file and digitalocean.region are required")
-		case do.VPCUUID == "":
-			return fmt.Errorf("digitalocean.vpc_uuid is required: workers must not share a private network")
-		case len(do.SSHKeys) == 0:
-			return fmt.Errorf("digitalocean.ssh_keys is required (otherwise every droplet's root password is emailed)")
-		case do.Listen == "" || do.URL == "":
-			return fmt.Errorf("digitalocean.listen and digitalocean.url are required")
-		case c.Job.RunTimeout.Duration >= do.MaxAge.Duration:
-			return fmt.Errorf("job.run_timeout (%s) must be below digitalocean.max_age (%s)", c.Job.RunTimeout, do.MaxAge)
+		case h.TokenFile == "" || h.Location == "" || h.ServerType == "":
+			return fmt.Errorf("hetzner.token_file, hetzner.location and hetzner.server_type are required")
+		case h.Network == 0:
+			return fmt.Errorf("hetzner.network is required: workers must not share a private network")
+		case len(h.SSHKeys) == 0:
+			return fmt.Errorf("hetzner.ssh_keys is required (otherwise every server's root password is emailed)")
+		case h.Listen == "" || h.URL == "":
+			return fmt.Errorf("hetzner.listen and hetzner.url are required")
+		case c.Job.RunTimeout.Duration >= h.MaxAge.Duration:
+			return fmt.Errorf("job.run_timeout (%s) must be below hetzner.max_age (%s)", c.Job.RunTimeout, h.MaxAge)
 		}
 	}
 	for i, r := range c.Rules {

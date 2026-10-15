@@ -1,7 +1,8 @@
 #!/bin/bash
 # gnoreplay worker: replays one job and posts the report back to the
-# coordinator, which then deletes this machine. Rendered by the coordinator
-# for each job and run once at boot (cloud-init user data).
+# coordinator, which then reinstalls this machine for another job, or deletes
+# it. Rendered by the coordinator for each job and run once at boot
+# (cloud-init user data).
 set -uo pipefail
 
 URL={{q .URL}}
@@ -16,9 +17,9 @@ mkdir -p "$WORK"
 LOG="$WORK/worker.log"
 exec >"$LOG" 2>&1
 
-# Last resort if nothing deletes this machine in time: power off at the max
-# age. (A powered-off droplet is still billed; the coordinator and the
-# watchdog delete it.)
+# Last resort if nothing stops this job in time: power off at the max age.
+# (A powered-off server is still billed; the coordinator and the watchdog
+# delete it.)
 if [ {{.PowerOffMinutes}} -gt 0 ]; then
 	shutdown -P +{{.PowerOffMinutes}} "gnoreplay: worker max age reached"
 fi

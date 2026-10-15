@@ -2,109 +2,160 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/digitalocean/godo"
+	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 )
 
 // Machine is a worker machine the provisioner created.
 type Machine struct {
 	ID      string
 	Name    string
-	Created time.Time // as reported by the provider
+	Created time.Time // as reported by the provider: billing hours count from here
+	Labels  map[string]string
 }
 
-// Provisioner creates and deletes the disposable machines replays run on.
+// Provisioner creates, reinstalls and deletes the machines replays run on.
 type Provisioner interface {
 	// Create boots a machine running userData (a shell script) at startup.
-	Create(ctx context.Context, name, userData string) (Machine, error)
+	Create(ctx context.Context, name, userData string, labels map[string]string) (Machine, error)
+	// Rebuild reinstalls a machine from its image, wiping its disk, and boots
+	// it running userData: nothing that ran on it before survives.
+	Rebuild(ctx context.Context, id, userData string) error
+	// SetLabels replaces a machine's labels.
+	SetLabels(ctx context.Context, id string, labels map[string]string) error
 	// Delete deletes a machine; deleting one that is already gone succeeds.
 	Delete(ctx context.Context, id string) error
 	// List returns the worker machines that exist.
 	List(ctx context.Context) ([]Machine, error)
 }
 
-type doProvisioner struct {
-	c   *godo.Client
-	cfg *DigitalOceanConfig
-}
+// Worker machines' labels, which deploy/watchdog.sh reads too.
+const (
+	labelRole  = "gnoreplay" // "worker" on every worker machine
+	labelJob   = "gnoreplay-job"
+	labelSince = "gnoreplay-since"
+)
 
-func newDOProvisioner(token string, cfg *DigitalOceanConfig) *doProvisioner {
-	return &doProvisioner{c: godo.NewFromToken(token), cfg: cfg}
-}
-
-func (p *doProvisioner) Create(ctx context.Context, name, userData string) (Machine, error) {
-	keys := make([]godo.DropletCreateSSHKey, len(p.cfg.SSHKeys))
-	for i, k := range p.cfg.SSHKeys {
-		if id, err := strconv.Atoi(k); err == nil {
-			keys[i] = godo.DropletCreateSSHKey{ID: id}
-		} else {
-			keys[i] = godo.DropletCreateSSHKey{Fingerprint: k}
-		}
+// workerLabels are the labels of a worker machine running job, or idle (job
+// 0), since then (Unix seconds).
+func workerLabels(job int64, since time.Time) map[string]string {
+	labels := map[string]string{labelRole: "worker", labelSince: strconv.FormatInt(since.Unix(), 10)}
+	if job != 0 {
+		labels[labelJob] = strconv.FormatInt(job, 10)
 	}
-	d, _, err := p.c.Droplets.Create(ctx, &godo.DropletCreateRequest{
-		Name:     name,
-		Region:   p.cfg.Region,
-		Size:     p.cfg.Size,
-		Image:    godo.DropletCreateImage{Slug: p.cfg.Image},
-		SSHKeys:  keys,
-		UserData: userData,
-		Tags:     []string{p.cfg.Tag},
-		VPCUUID:  p.cfg.VPCUUID,
+	return labels
+}
+
+type hetznerProvisioner struct {
+	c   *hcloud.Client
+	cfg *HetznerConfig
+}
+
+func newHetznerProvisioner(token string, cfg *HetznerConfig) *hetznerProvisioner {
+	return &hetznerProvisioner{c: hcloud.NewClient(hcloud.WithToken(token), hcloud.WithApplication("gnoreplay", "")), cfg: cfg}
+}
+
+func (p *hetznerProvisioner) Create(ctx context.Context, name, userData string, labels map[string]string) (Machine, error) {
+	keys := make([]*hcloud.SSHKey, len(p.cfg.SSHKeys))
+	for i, id := range p.cfg.SSHKeys {
+		keys[i] = &hcloud.SSHKey{ID: id}
+	}
+	res, _, err := p.c.Server.Create(ctx, hcloud.ServerCreateOpts{
+		Name:       name,
+		ServerType: &hcloud.ServerType{Name: p.cfg.ServerType},
+		Image:      &hcloud.Image{Name: p.cfg.Image},
+		Location:   &hcloud.Location{Name: p.cfg.Location},
+		SSHKeys:    keys,
+		UserData:   userData,
+		Labels:     labels,
+		Networks:   []*hcloud.Network{{ID: p.cfg.Network}},
 	})
 	if err != nil {
 		return Machine{}, err
 	}
-	return toMachine(d)
+	return toMachine(res.Server), nil
 }
 
-func toMachine(d *godo.Droplet) (Machine, error) {
-	created, err := time.Parse(time.RFC3339, d.Created)
+func toMachine(s *hcloud.Server) Machine {
+	return Machine{ID: strconv.FormatInt(s.ID, 10), Name: s.Name, Created: s.Created, Labels: s.Labels}
+}
+
+func serverRef(id string) (*hcloud.Server, error) {
+	n, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
-		return Machine{}, fmt.Errorf("droplet %d: created_at %q: %w", d.ID, d.Created, err)
+		return nil, err
 	}
-	return Machine{ID: strconv.Itoa(d.ID), Name: d.Name, Created: created}, nil
+	return &hcloud.Server{ID: n}, nil
 }
 
-func (p *doProvisioner) Delete(ctx context.Context, id string) error {
-	n, err := strconv.Atoi(id)
+func (p *hetznerProvisioner) Rebuild(ctx context.Context, id, userData string) error {
+	server, err := serverRef(id)
 	if err != nil {
 		return err
 	}
-	res, err := p.c.Droplets.Delete(ctx, n)
-	var errRes *godo.ErrorResponse
-	if errors.As(err, &errRes) && res != nil && res.StatusCode == http.StatusNotFound {
+	res, _, err := p.c.Server.RebuildWithResult(ctx, server, hcloud.ServerRebuildOpts{
+		Image:    &hcloud.Image{Name: p.cfg.Image},
+		UserData: &userData,
+	})
+	if err != nil {
+		return err
+	}
+	if err := p.c.Action.WaitFor(ctx, res.Action); err != nil {
+		return err
+	}
+	// Should a machine that was off (workers power themselves off at their
+	// max age) stay off once rebuilt, start it.
+	s, _, err := p.c.Server.GetByID(ctx, server.ID)
+	if err != nil {
+		return err
+	}
+	if s == nil {
+		return fmt.Errorf("server %s is gone", id)
+	}
+	if s.Status == hcloud.ServerStatusOff {
+		action, _, err := p.c.Server.Poweron(ctx, s)
+		if err != nil {
+			return err
+		}
+		return p.c.Action.WaitFor(ctx, action)
+	}
+	return nil
+}
+
+func (p *hetznerProvisioner) SetLabels(ctx context.Context, id string, labels map[string]string) error {
+	server, err := serverRef(id)
+	if err != nil {
+		return err
+	}
+	_, _, err = p.c.Server.Update(ctx, server, hcloud.ServerUpdateOpts{Labels: labels})
+	return err
+}
+
+func (p *hetznerProvisioner) Delete(ctx context.Context, id string) error {
+	server, err := serverRef(id)
+	if err != nil {
+		return err
+	}
+	_, _, err = p.c.Server.DeleteWithResult(ctx, server)
+	if hcloud.IsError(err, hcloud.ErrorCodeNotFound) {
 		return nil
 	}
 	return err
 }
 
-func (p *doProvisioner) List(ctx context.Context) ([]Machine, error) {
-	var out []Machine
-	opt := &godo.ListOptions{PerPage: 200}
-	for {
-		droplets, res, err := p.c.Droplets.ListByTag(ctx, p.cfg.Tag, opt)
-		if err != nil {
-			return nil, err
-		}
-		for i := range droplets {
-			m, err := toMachine(&droplets[i])
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, m)
-		}
-		if res.Links == nil || res.Links.IsLastPage() {
-			return out, nil
-		}
-		page, err := res.Links.CurrentPage()
-		if err != nil {
-			return nil, err
-		}
-		opt.Page = page + 1
+func (p *hetznerProvisioner) List(ctx context.Context) ([]Machine, error) {
+	servers, err := p.c.Server.AllWithOpts(ctx, hcloud.ServerListOpts{
+		ListOpts: hcloud.ListOpts{LabelSelector: labelRole + "=worker"},
+	})
+	if err != nil {
+		return nil, err
 	}
+	out := make([]Machine, len(servers))
+	for i, s := range servers {
+		out[i] = toMachine(s)
+	}
+	return out, nil
 }

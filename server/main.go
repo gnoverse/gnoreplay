@@ -86,13 +86,13 @@ func setup(configPath string, logger *slog.Logger) (*Server, func(), error) {
 			return nil, nil, fmt.Errorf("session key: %w", err)
 		}
 	}
-	if do := cfg.DigitalOcean; do != nil {
-		token, err := os.ReadFile(do.TokenFile)
+	if h := cfg.Hetzner; h != nil {
+		token, err := os.ReadFile(h.TokenFile)
 		if err != nil {
 			q.Close()
-			return nil, nil, fmt.Errorf("read digitalocean token: %w", err)
+			return nil, nil, fmt.Errorf("read hetzner token: %w", err)
 		}
-		srv.prov = newDOProvisioner(strings.TrimSpace(string(token)), do)
+		srv.prov = newHetznerProvisioner(strings.TrimSpace(string(token)), h)
 	}
 	return srv, func() { q.Close() }, nil
 }
@@ -120,9 +120,11 @@ func serve(parent context.Context, configPath string, logger *slog.Logger) error
 
 	var wg sync.WaitGroup
 	if srv.prov != nil {
-		wg.Go(func() { srv.reapLoop(ctx, 5*time.Minute) })
+		// Every minute: idle workers are deleted in the last minutes of their
+		// billing hour.
+		wg.Go(func() { srv.reapLoop(ctx, time.Minute) })
 		workerSrv := &http.Server{
-			Addr:              srv.cfg.DigitalOcean.Listen,
+			Addr:              srv.cfg.Hetzner.Listen,
 			Handler:           srv.workerRoutes(),
 			ReadHeaderTimeout: 10 * time.Second,
 		}
@@ -136,7 +138,7 @@ func serve(parent context.Context, configPath string, logger *slog.Logger) error
 				stop(errShutdown)
 			}
 		}()
-		logger.Info("worker machines", "provider", "digitalocean", "endpoint", srv.cfg.DigitalOcean.Listen)
+		logger.Info("worker machines", "provider", "hetzner", "endpoint", srv.cfg.Hetzner.Listen)
 	}
 	for range srv.cfg.Workers {
 		wg.Go(func() { srv.work(ctx, resume) })

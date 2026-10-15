@@ -40,13 +40,15 @@ type Server struct {
 
 	mu       sync.Mutex
 	running  map[int64]context.CancelCauseFunc
-	sessions map[int64]*session // remote jobs waiting for their worker
+	sessions map[int64]*session        // remote jobs waiting for their worker
+	machines map[string]*workerMachine // worker machines, by ID
 }
 
 func newServer(cfg *Config, q *Queue, gh GitHub, logger *slog.Logger) *Server {
 	return &Server{
 		cfg: cfg, queue: q, gh: gh, logger: logger, oauth: githubOAuth,
 		wake: make(chan struct{}, 1), running: map[int64]context.CancelCauseFunc{}, sessions: map[int64]*session{},
+		machines: map[string]*workerMachine{},
 	}
 }
 

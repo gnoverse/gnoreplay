@@ -4,7 +4,7 @@ Checks whether a change to [gnolang/gno](https://github.com/gnolang/gno) would e
 
 - [`gnoreplay/`](gnoreplay/) — the replay tool. It is built inside the gno tree under test (copied to `contribs/gnoreplay`), so each commit is checked with its own application code.
 - [`server/`](server/) — a service that replays every push and PR on the tracked branches in the background, and publishes the results on its own pages. It only reads from GitHub. Replays run either on the server's box, or each on its own disposable cloud machine.
-- [`deploy/`](deploy/) — deploying it on DigitalOcean.
+- [`deploy/`](deploy/) — deploying it on Hetzner Cloud.
 
 A full replay of mainnet takes 1h40m–2h on a 2-vCPU worker (about 650,000 blocks / 112,000 txs in October 2026) and grows with the chain, which is why this runs as a background service rather than a CI job.
 

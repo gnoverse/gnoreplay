@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,20 +24,25 @@ import (
 )
 
 // fakeMachines "boots" a machine by running its user data with bash, as a
-// droplet's cloud-init would, and deletes it by killing the script.
+// server's cloud-init would, rebuilds it by killing that script and running
+// the new user data, and deletes it by killing the script.
 type fakeMachines struct {
 	dir string
 
-	mu      sync.Mutex
-	nextID  int
-	running map[string]*fakeMachine // by ID
-	created []string                // names
-	deleted []string                // names
+	mu          sync.Mutex
+	nextID      int
+	boots       int
+	running     map[string]*fakeMachine // by ID
+	created     []string                // names
+	rebuilt     []string                // names, at each rebuild
+	deleted     []string                // names
+	failRebuild bool
 }
 
 type fakeMachine struct {
 	name    string
 	created time.Time
+	labels  map[string]string
 	cancel  context.CancelFunc
 	done    chan struct{}
 }
@@ -44,34 +51,97 @@ func newFakeMachines(dir string) *fakeMachines {
 	return &fakeMachines{dir: dir, running: map[string]*fakeMachine{}}
 }
 
-func (f *fakeMachines) Create(_ context.Context, name, userData string) (Machine, error) {
+// boot runs userData on m, with f.mu held.
+func (f *fakeMachines) boot(m *fakeMachine, userData string) error {
+	f.boots++
+	script := filepath.Join(f.dir, fmt.Sprintf("%s-%d.sh", m.name, f.boots))
+	if err := os.WriteFile(script, []byte(userData), 0o755); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	m.cancel, m.done = cancel, done
+	go func() {
+		defer close(done)
+		exec.CommandContext(ctx, "bash", script).Run()
+	}()
+	return nil
+}
+
+func (m *fakeMachine) machine(id string) Machine {
+	return Machine{ID: id, Name: m.name, Created: m.created, Labels: maps.Clone(m.labels)}
+}
+
+func (f *fakeMachines) Create(_ context.Context, name, userData string, labels map[string]string) (Machine, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextID++
 	id := strconv.Itoa(f.nextID)
-	script := filepath.Join(f.dir, name+".sh")
-	if err := os.WriteFile(script, []byte(userData), 0o755); err != nil {
+	m := &fakeMachine{name: name, created: time.Now(), labels: maps.Clone(labels)}
+	if err := f.boot(m, userData); err != nil {
 		return Machine{}, err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	m := &fakeMachine{name: name, created: time.Now(), cancel: cancel, done: make(chan struct{})}
-	go func() {
-		defer close(m.done)
-		exec.CommandContext(ctx, "bash", script).Run()
-	}()
 	f.running[id] = m
 	f.created = append(f.created, name)
-	return Machine{ID: id, Name: name, Created: m.created}, nil
+	return m.machine(id), nil
 }
 
-// orphan registers a machine no job owns, as if left by a crash.
-func (f *fakeMachines) orphan(name string) {
+func (f *fakeMachines) Rebuild(_ context.Context, id, userData string) error {
+	f.mu.Lock()
+	m, ok := f.running[id]
+	if !ok || f.failRebuild {
+		f.mu.Unlock()
+		return fmt.Errorf("rebuild %s: %w", id, errors.ErrUnsupported)
+	}
+	cancel, done := m.cancel, m.done
+	f.mu.Unlock()
+	cancel()
+	<-done
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rebuilt = append(f.rebuilt, m.name)
+	return f.boot(m, userData)
+}
+
+func (f *fakeMachines) SetLabels(_ context.Context, id string, labels map[string]string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m, ok := f.running[id]
+	if !ok {
+		return fmt.Errorf("machine %s not found", id)
+	}
+	m.labels = maps.Clone(labels)
+	return nil
+}
+
+// orphan registers a machine this process doesn't know, as if left by a
+// previous one: running job, or idle (job 0).
+func (f *fakeMachines) orphan(name string, job int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextID++
 	done := make(chan struct{})
 	close(done)
-	f.running[strconv.Itoa(f.nextID)] = &fakeMachine{name: name, created: time.Now(), cancel: func() {}, done: done}
+	f.running[strconv.Itoa(f.nextID)] = &fakeMachine{
+		name: name, created: time.Now(), labels: workerLabels(job, time.Now()), cancel: func() {}, done: done,
+	}
+}
+
+func (f *fakeMachines) labels(name string) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, m := range f.running {
+		if m.name == name {
+			return maps.Clone(m.labels)
+		}
+	}
+	return nil
+}
+
+func (f *fakeMachines) rebuilds() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.rebuilt...)
 }
 
 // age makes a machine look created d ago.
@@ -106,7 +176,7 @@ func (f *fakeMachines) List(context.Context) ([]Machine, error) {
 	defer f.mu.Unlock()
 	var out []Machine
 	for id, m := range f.running {
-		out = append(out, Machine{ID: id, Name: m.name, Created: m.created})
+		out = append(out, m.machine(id))
 	}
 	return out, nil
 }
@@ -156,12 +226,12 @@ func newRemoteEnv(t *testing.T) *remoteEnv {
 	require.NoError(t, os.WriteFile(filepath.Join(overlay, "main.go"), []byte(fakeTool), 0o644))
 
 	e.cfg = &Config{
-		DataDir:      filepath.Join(root, "data"),
-		Chain:        ChainConfig{GoldenDir: golden, Genesis: genesis},
-		GitHub:       GitHubConfig{GitURL: "file://" + filepath.Join(root, "remote") + "/"},
-		Repos:        map[string]RepoConfig{"gnolang/gno": {PublicReports: true}},
-		Job:          JobConfig{GnoreplayOverlay: overlay},
-		DigitalOcean: &DigitalOceanConfig{},
+		DataDir: filepath.Join(root, "data"),
+		Chain:   ChainConfig{GoldenDir: golden, Genesis: genesis},
+		GitHub:  GitHubConfig{GitURL: "file://" + filepath.Join(root, "remote") + "/"},
+		Repos:   map[string]RepoConfig{"gnolang/gno": {PublicReports: true}},
+		Job:     JobConfig{GnoreplayOverlay: overlay},
+		Hetzner: &HetznerConfig{},
 	}
 	e.cfg.setDefaults()
 	var err error
@@ -176,7 +246,7 @@ func newRemoteEnv(t *testing.T) *remoteEnv {
 		e.handler.Load().(http.Handler).ServeHTTP(w, r)
 	}))
 	t.Cleanup(workerSrv.Close)
-	e.cfg.DigitalOcean.URL = workerSrv.URL
+	e.cfg.Hetzner.URL = workerSrv.URL
 	e.restart()
 	return e
 }
@@ -188,6 +258,17 @@ func (e *remoteEnv) restart() *Server {
 	e.srv.prov = e.machines
 	e.handler.Store(e.srv.workerRoutes())
 	return e.srv
+}
+
+// backdate makes the machine running job look like it got it d earlier.
+func backdate(srv *Server, job int64, d time.Duration) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	for _, w := range srv.machines {
+		if w.job == job {
+			w.since = w.since.Add(-d)
+		}
+	}
 }
 
 func TestRemoteReplay(t *testing.T) {
@@ -211,8 +292,40 @@ func TestRemoteReplay(t *testing.T) {
 		require.NoError(t, err)
 		return done
 	}
+	// start runs a job in the background, until it is on its machine.
+	start := func(sha string) (*Job, chan struct{}) {
+		t.Helper()
+		require.NoError(t, srv.enqueueFor("gnolang/gno", eventPush, "master", 0, sha))
+		j, err := q.Claim()
+		require.NoError(t, err)
+		require.Equal(t, sha, j.SHA)
+		finished := make(chan struct{})
+		go func() {
+			defer close(finished)
+			srv.runJob(ctx, j)
+		}()
+		require.Eventually(t, func() bool {
+			ms, _ := machines.List(ctx)
+			for _, m := range ms {
+				if m.Labels[labelJob] == strconv.FormatInt(j.ID, 10) {
+					return true
+				}
+			}
+			return false
+		}, 30*time.Second, 50*time.Millisecond)
+		return j, finished
+	}
+	wait := func(finished chan struct{}) {
+		t.Helper()
+		select {
+		case <-finished:
+		case <-time.After(30 * time.Second):
+			t.Fatal("job did not stop")
+		}
+	}
 
-	// A replay on a worker machine, which is deleted once it reported.
+	// A replay on a new worker machine, which is kept, idle, once it
+	// reported.
 	ok := run(shaClean)
 	require.Equal(t, stateDone, ok.State, ok.Error)
 	assert.Equal(t, outcomePass, ok.Outcome)
@@ -220,49 +333,50 @@ func TestRemoteReplay(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 50, report.Blocks)
 	created, deleted, running := machines.names()
-	assert.Equal(t, []string{machineName(ok.ID)}, created)
-	assert.Equal(t, []string{machineName(ok.ID)}, deleted)
-	assert.Zero(t, running)
+	require.Len(t, created, 1)
+	worker := created[0]
+	assert.Empty(t, deleted)
+	assert.Equal(t, 1, running)
+	assert.Equal(t, "worker", machines.labels(worker)[labelRole])
+	assert.NotContains(t, machines.labels(worker), labelJob, "idle")
 	// The session is gone: its token no longer works.
 	assert.Empty(t, srv.sessions)
 
-	// The worker fails: the job fails with the worker's log, and the machine
-	// is deleted all the same.
+	// The next job runs on it, reinstalled. The worker fails: the job fails
+	// with the worker's log, and the machine is idle again.
 	failed := run(shaCrash)
 	assert.Equal(t, stateFailed, failed.State)
 	assert.Contains(t, failed.Error, "gnoreplay exited with 1")
 	assert.Contains(t, failed.Error, "==> replay")
-	_, deleted, running = machines.names()
-	assert.Contains(t, deleted, machineName(failed.ID))
-	assert.Zero(t, running)
+	created, deleted, running = machines.names()
+	assert.Equal(t, []string{worker}, created)
+	assert.Equal(t, []string{worker}, machines.rebuilds())
+	assert.Empty(t, deleted)
+	assert.Equal(t, 1, running)
+	assert.NotContains(t, machines.labels(worker), labelJob)
 
-	// A slow replay superseded by a new push: its machine is deleted. The
-	// reaper meanwhile spares it, but not a machine no job owns.
-	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPush, "master", 0, shaSlow))
-	slow, err := q.Claim()
-	require.NoError(t, err)
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		srv.runJob(ctx, slow)
-	}()
-	require.Eventually(t, func() bool {
-		srv.mu.Lock()
-		defer srv.mu.Unlock()
-		return srv.sessions[slow.ID] != nil
-	}, 30*time.Second, 50*time.Millisecond)
-	require.Eventually(t, func() bool { _, _, n := machines.names(); return n == 1 }, 30*time.Second, 50*time.Millisecond)
+	// A slow replay, on it again.
+	slow, finished := start(shaSlow)
+	assert.Equal(t, strconv.FormatInt(slow.ID, 10), machines.labels(worker)[labelJob])
 
-	machines.orphan("gnoreplay-job-999")
+	// The reaper spares a busy machine at the end of its billing hour, and
+	// takes one it doesn't know for an idle one...
+	machines.orphan("gnoreplay-worker-orphan", 0)
+	machines.age(worker, 56*time.Minute)
 	require.NoError(t, srv.reap(ctx))
 	_, deleted, running = machines.names()
-	assert.Contains(t, deleted, "gnoreplay-job-999")
-	assert.NotContains(t, deleted, machineName(slow.ID), "the running job's machine is spared")
+	assert.Empty(t, deleted)
+	assert.Equal(t, 2, running)
+	// ...which it deletes in the last minutes of its billing hour.
+	machines.age("gnoreplay-worker-orphan", time.Hour+56*time.Minute)
+	require.NoError(t, srv.reap(ctx))
+	_, deleted, running = machines.names()
+	assert.Equal(t, []string{"gnoreplay-worker-orphan"}, deleted)
 	assert.Equal(t, 1, running)
 
 	// Worker endpoints need the job's token.
 	for _, token := range []string{"", "wrong"} {
-		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/worker/%d/source", cfg.DigitalOcean.URL, slow.ID), nil)
+		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/worker/%d/source", cfg.Hetzner.URL, slow.ID), nil)
 		require.NoError(t, err)
 		req.Header.Set("Authorization", "Bearer "+token)
 		res, err := http.DefaultClient.Do(req)
@@ -271,45 +385,61 @@ func TestRemoteReplay(t *testing.T) {
 		assert.Equal(t, http.StatusNotFound, res.StatusCode, "token %q", token)
 	}
 
+	// Superseded by a new push: the job stops, and its machine is idle.
 	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPush, "master", 0, shaClean))
-	select {
-	case <-finished:
-	case <-time.After(30 * time.Second):
-		t.Fatal("superseded job did not stop")
-	}
-	_, deleted, running = machines.names()
-	assert.Contains(t, deleted, machineName(slow.ID))
-	assert.Zero(t, running)
+	wait(finished)
 	got, err := q.Get(slow.ID)
 	require.NoError(t, err)
 	assert.Equal(t, stateSuperseded, got.State)
-
-	// A worker older than max_age is deleted even though its job is still
-	// running; the job fails with the reason, for good (not requeued).
-	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPush, "master", 0, shaSlow))
-	stuck, err := q.Claim()
-	require.NoError(t, err)
-	require.Equal(t, shaSlow, stuck.SHA)
-	finished = make(chan struct{})
-	go func() {
-		defer close(finished)
-		srv.runJob(ctx, stuck)
-	}()
-	require.Eventually(t, func() bool { _, _, n := machines.names(); return n == 1 }, 30*time.Second, 50*time.Millisecond)
-	machines.age(machineName(stuck.ID), cfg.DigitalOcean.MaxAge.Duration+time.Minute)
-	require.NoError(t, srv.reap(ctx))
-	select {
-	case <-finished:
-	case <-time.After(30 * time.Second):
-		t.Fatal("job of an over-age worker did not stop")
-	}
 	_, deleted, running = machines.names()
-	assert.Contains(t, deleted, machineName(stuck.ID))
+	assert.NotContains(t, deleted, worker)
+	assert.Equal(t, 1, running)
+	assert.NotContains(t, machines.labels(worker), labelJob)
+	queued, err := q.Claim()
+	require.NoError(t, err)
+	_, err = q.Finish(queued.ID, Job{State: stateSuperseded})
+	require.NoError(t, err)
+
+	// Of two idle machines, a job takes the one whose billing hour ends
+	// first: it is paid for until then.
+	machines.age(worker, 30*time.Minute)
+	machines.orphan("gnoreplay-worker-soon", 0)
+	machines.age("gnoreplay-worker-soon", 50*time.Minute)
+	require.NoError(t, srv.reap(ctx))
+	ok = run(shaClean)
+	require.Equal(t, stateDone, ok.State, ok.Error)
+	assert.Equal(t, []string{worker, worker, "gnoreplay-worker-soon"}, machines.rebuilds())
+
+	// Machines that can't be reinstalled are deleted, and the job gets a new
+	// one.
+	machines.mu.Lock()
+	machines.failRebuild = true
+	machines.mu.Unlock()
+	ok = run(shaClean)
+	require.Equal(t, stateDone, ok.State, ok.Error)
+	created, deleted, running = machines.names()
+	assert.ElementsMatch(t, []string{"gnoreplay-worker-orphan", worker, "gnoreplay-worker-soon"}, deleted)
+	require.Len(t, created, 2)
+	assert.Equal(t, 1, running)
+	worker = created[1]
+	machines.mu.Lock()
+	machines.failRebuild = false
+	machines.mu.Unlock()
+
+	// A job that has run on its worker for longer than max_age is cancelled,
+	// and the worker deleted; the job fails with the reason, for good (not
+	// requeued).
+	stuck, finished := start(shaSlow)
+	backdate(srv, stuck.ID, cfg.Hetzner.MaxAge.Duration+time.Minute)
+	require.NoError(t, srv.reap(ctx))
+	wait(finished)
+	_, deleted, running = machines.names()
+	assert.Contains(t, deleted, worker)
 	assert.Zero(t, running)
 	got, err = q.Get(stuck.ID)
 	require.NoError(t, err)
 	assert.Equal(t, stateFailed, got.State)
-	assert.Contains(t, got.Error, "exceeded its max age (4h0m0s)")
+	assert.Contains(t, got.Error, "longer than its max age (4h0m0s)")
 	pending, err := q.Pending()
 	require.NoError(t, err)
 	assert.Empty(t, pending)
@@ -347,9 +477,12 @@ func TestRemoteResume(t *testing.T) {
 	got, err := q.Get(j.ID)
 	require.NoError(t, err)
 	assert.Equal(t, stateRunning, got.State)
-	_, deleted, running := machines.names()
+	created, deleted, running := machines.names()
+	require.Len(t, created, 1)
+	worker := created[0]
 	assert.Empty(t, deleted)
 	assert.Equal(t, 1, running)
+	assert.Equal(t, strconv.FormatInt(j.ID, 10), machines.labels(worker)[labelJob])
 	stored, err := q.Sessions()
 	require.NoError(t, err)
 	require.Len(t, stored, 1)
@@ -357,14 +490,14 @@ func TestRemoteResume(t *testing.T) {
 	assert.DirExists(t, e.srv.jobDir(j.ID))
 
 	// Meanwhile: a job interrupted before it had a machine, and a machine
-	// no job owns.
+	// labelled for a job that ended.
 	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPush, "chain/mainnet", 0, shaGated))
 	early, err := q.Claim()
 	require.NoError(t, err)
-	machines.orphan("gnoreplay-job-999")
+	machines.orphan("gnoreplay-worker-orphan", 999)
 
 	// The next process resumes the first job, queues the second again and
-	// deletes the orphan.
+	// takes the other machine for an idle one.
 	srv = e.restart()
 	ctx = context.Background()
 	resume, err := srv.start(ctx)
@@ -375,8 +508,13 @@ func TestRemoteResume(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, stateQueued, got.State)
 	_, deleted, running = machines.names()
-	assert.Equal(t, []string{"gnoreplay-job-999"}, deleted)
-	assert.Equal(t, 1, running)
+	assert.Empty(t, deleted)
+	assert.Equal(t, 2, running)
+	m, ok := srv.takeIdle(early.ID)
+	require.True(t, ok)
+	assert.Equal(t, "gnoreplay-worker-orphan", m.Name)
+	_, ok = srv.takeIdle(early.ID)
+	assert.False(t, ok, "the resumed job's machine is busy")
 
 	finished := make(chan struct{})
 	go func() {
@@ -393,9 +531,9 @@ func TestRemoteResume(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, stateDone, got.State, got.Error)
 	assert.Equal(t, outcomePass, got.Outcome)
-	_, deleted, running = machines.names()
-	assert.Contains(t, deleted, machineName(j.ID))
-	assert.Zero(t, running)
+	_, deleted, _ = machines.names()
+	assert.Empty(t, deleted)
+	assert.NotContains(t, machines.labels(worker), labelJob, "idle")
 	stored, err = q.Sessions()
 	require.NoError(t, err)
 	assert.Empty(t, stored)
@@ -409,17 +547,18 @@ func TestAwaitWorkerSavedResult(t *testing.T) {
 	srv := newServer(cfg, newTestQueue(t), newFakeGitHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	machines := newFakeMachines(t.TempDir())
 	srv.prov = machines
-	machines.orphan("gnoreplay-job-1")
+	machines.orphan("gnoreplay-worker-1", 1)
 	ms, err := machines.List(context.Background())
 	require.NoError(t, err)
+	srv.machines[ms[0].ID] = &workerMachine{Machine: ms[0], job: 1, since: time.Now()}
 
 	dir := t.TempDir()
 	sess := &session{dir: dir, created: time.Now(), done: make(chan struct{}, 1)}
 	require.NoError(t, os.WriteFile(filepath.Join(dir, workerFailed), []byte("boom"), 0o644))
 	err = srv.awaitWorker(context.Background(), sess, ms[0], io.Discard)
 	assert.ErrorContains(t, err, "worker failed:\nboom")
-	_, deleted, _ := machines.names()
-	assert.Equal(t, []string{"gnoreplay-job-1"}, deleted)
+	assert.NotContains(t, machines.labels("gnoreplay-worker-1"), labelJob, "released")
+	assert.Zero(t, srv.machines[ms[0].ID].job)
 
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "report.json"), []byte("{}"), 0o644))
 	assert.NoError(t, srv.awaitWorker(context.Background(), sess, Machine{ID: "gone"}, io.Discard))
