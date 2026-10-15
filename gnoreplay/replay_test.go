@@ -17,6 +17,7 @@ import (
 	"github.com/gnolang/gno/tm2/pkg/bft/store"
 	bft "github.com/gnolang/gno/tm2/pkg/bft/types"
 	"github.com/gnolang/gno/tm2/pkg/crypto"
+	"github.com/gnolang/gno/tm2/pkg/crypto/ed25519"
 	"github.com/gnolang/gno/tm2/pkg/crypto/keys"
 	"github.com/gnolang/gno/tm2/pkg/db/memdb"
 	"github.com/gnolang/gno/tm2/pkg/log"
@@ -105,16 +106,41 @@ func (a *mutatingApp) DeliverTx(req abci.RequestDeliverTx) abci.ResponseDeliverT
 	return res
 }
 
+// validatorApp simulates a binary whose EndBlocker adds a validator at height.
+type validatorApp struct {
+	abci.Application
+	height int64
+}
+
+func (a *validatorApp) EndBlock(req abci.RequestEndBlock) abci.ResponseEndBlock {
+	res := a.Application.EndBlock(req)
+	if req.Height == a.height {
+		key := ed25519.GenPrivKey().PubKey()
+		res.ValidatorUpdates = append(res.ValidatorUpdates, abci.ValidatorUpdate{Address: key.Address(), PubKey: key, Power: 1})
+	}
+	return res
+}
+
+// versionApp simulates a binary reporting another app version, which every
+// recorded block header contradicts.
+type versionApp struct{ abci.Application }
+
+func (a versionApp) Info(req abci.RequestInfo) abci.ResponseInfo {
+	res := a.Application.Info(req)
+	res.AppVersion = "replay test"
+	return res
+}
+
 func TestReplay(t *testing.T) {
 	if testing.Short() {
-		// Boots a node and replays its chain three times.
+		// Boots a node and replays its chain six times.
 		t.Skip("skipping in -short mode")
 	}
 	src, genDoc := recordChain(t)
 	tip := src.Blocks.Height()
 
 	t.Run("same binary", func(t *testing.T) {
-		r, err := replay(src, newTestApp(t), replayOptions{Genesis: genDoc})
+		r, err := replay(src, newTestApp(t), memdb.NewMemDB(), replayOptions{Genesis: genDoc})
 		require.NoError(t, err)
 		assert.Equal(t, tip, r.ToHeight)
 		assert.EqualValues(t, tip, r.Blocks)
@@ -135,8 +161,9 @@ func TestReplay(t *testing.T) {
 				res.GasUsed += 7
 			}
 		}}
-		r, err := replay(src, app, replayOptions{Genesis: genDoc})
+		r, err := replay(src, app, memdb.NewMemDB(), replayOptions{Genesis: genDoc})
 		require.NoError(t, err)
+		assert.EqualValues(t, tip, r.Blocks, "the next block validates against the recorded results hash")
 		assert.Equal(t, 1, r.Counts.Result)
 		assert.Equal(t, 1, r.Counts.Gas)
 		// The panicking MsgRun fails the same way on replay: no diff for it.
@@ -165,15 +192,36 @@ func TestReplay(t *testing.T) {
 		forked := *genDoc
 		forked.AppState = state
 
-		r, err := replay(src, newTestApp(t), replayOptions{Genesis: &forked})
+		r, err := replay(src, newTestApp(t), memdb.NewMemDB(), replayOptions{Genesis: &forked})
 		require.NoError(t, err)
+		assert.EqualValues(t, tip, r.Blocks, "the next blocks validate against the recorded app hashes")
 		assert.EqualValues(t, 1, r.FirstAppHashMismatch)
 		assert.Equal(t, 1, r.Counts.Block, "only the first app hash mismatch is listed")
 
-		stopped, err := replay(src, newTestApp(t), replayOptions{Genesis: &forked, StopOnFirst: true})
+		stopped, err := replay(src, newTestApp(t), memdb.NewMemDB(), replayOptions{Genesis: &forked, StopOnFirst: true})
 		require.NoError(t, err)
 		assert.Equal(t, r.FirstAppHashMismatch, stopped.ToHeight)
 		assert.EqualValues(t, 1, stopped.Blocks)
+	})
+
+	t.Run("changed validator updates", func(t *testing.T) {
+		app := &validatorApp{Application: newTestApp(t), height: 1}
+		r, err := replay(src, app, memdb.NewMemDB(), replayOptions{Genesis: genDoc})
+		require.NoError(t, err)
+		assert.EqualValues(t, tip, r.Blocks, "the next blocks validate against the recorded validator sets")
+		require.Equal(t, 1, r.Counts.Block)
+		assert.EqualValues(t, 1, r.Diffs[0].Height)
+		assert.Equal(t, "validator updates differ", r.Diffs[0].Detail)
+	})
+
+	t.Run("rejected block", func(t *testing.T) {
+		r, err := replay(src, versionApp{newTestApp(t)}, memdb.NewMemDB(), replayOptions{Genesis: genDoc})
+		require.NoError(t, err)
+		assert.Zero(t, r.Blocks)
+		assert.EqualValues(t, 1, r.ToHeight)
+		require.Equal(t, 1, r.Counts.Block)
+		assert.Contains(t, r.Diffs[0].Detail, "block not applied")
+		assert.Contains(t, r.Diffs[0].Detail, "AppVersion")
 	})
 }
 

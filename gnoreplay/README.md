@@ -2,7 +2,7 @@
 
 `gnoreplay` re-executes every block stored in a gnoland node's data directory with the application code it was built from, and compares each response against the one the chain recorded. It answers: *would this binary execute the chain's history the same way?*
 
-It drives the gno.land ABCI application directly — `InitChain`, then `BeginBlock` / `DeliverTx` / `EndBlock` / `Commit` for every stored block — with the recorded headers, commits and signed txs. Nothing is faked: heights, timestamps, signatures, gas meters and EndBlocker all run as they did on the chain. No networking or consensus is involved.
+It executes the chain as a node syncing from genesis does, through tm2's own code: the genesis handshake (`InitChain`), then `ApplyBlock` for every stored block, which validates the recorded block against tm2's state (header, commit signatures, time), runs it on the gno.land application and updates that state. Changes to tm2's block execution are therefore replayed too, not only the application's. Nothing is faked: heights, timestamps, signatures, gas meters and EndBlocker all run as they did on the chain. No networking or consensus is involved: tm2's state lives in a DB of the replay's own, and the app is reached in-process, as `gnoland start` reaches it.
 
 ## Building
 
@@ -15,7 +15,7 @@ go build -o gnoreplay .
 go test ./...
 ```
 
-It only uses stable gno.land APIs (`gnoland.NewAppWithOptions`, `gnoland.LoadStreamingGenesisDoc`, the tm2 block and state stores), and builds unchanged on `master` and `chain/mainnet`.
+It only uses stable gno.land and tm2 APIs (`gnoland.NewAppWithOptions`, `gnoland.LoadStreamingGenesisDoc`, the tm2 block and state stores, its handshaker and block executor), and builds unchanged on `master` and `chain/mainnet`.
 
 ## Usage
 
@@ -27,7 +27,7 @@ gnoreplay --data-dir <node data dir> --genesis genesis.json --out report.json
 |---|---|
 | `--data-dir` | Source node data directory. Its `db/blockstore.db` and `db/state.db` are opened read-only; the node must be stopped (or use a copy/snapshot). |
 | `--genesis` | The source chain's `genesis.json`. |
-| `--work-dir` | Where the replayed app DB and genesis cache live (default: a temporary directory, removed on exit). |
+| `--work-dir` | Where the replay's app and state DBs and genesis cache live (default: a temporary directory, removed on exit). |
 | `--to` | Last height to replay (default: the source tip). |
 | `--stop-on-first` | Stop at the first block with a result or app hash divergence. |
 | `--max-diffs` | Diffs listed in the report (default 1000; counts stay exact). |
@@ -45,12 +45,12 @@ Memory: the first commit writes the whole genesis state at once. For mainnet (3.
 |---|---|
 | `result` | A tx's `Error`, `Data` or `Events` differ. These feed `LastResultsHash`: the binary would fork from the recorded chain. |
 | `gas` | Only `GasUsed` differs. Not consensus-relevant by itself, but a tx that now needs more gas than its `gas_wanted` fails. |
-| `block` | Block-level: app hash mismatch (first one only), validator updates, tx count. |
+| `block` | Block-level: app hash mismatch (first one only), validator or consensus params updates, tx count, or a block tm2 does not apply (below). |
 | log-only | Only the nondeterministic `Log` differs: counted, not listed. |
 
 Genesis txs are compared against the results the node stored at height 0.
 
-The replay does not stop at a divergence. Diffs at heights after the first app hash mismatch have `after_divergence: true` — they may be consequences of an earlier diff rather than independent changes.
+The replay does not stop at a divergence. Diffs at heights after the first app hash mismatch have `after_divergence: true` — they may be consequences of an earlier diff rather than independent changes. To go on, where a block's results, app hash, validator or consensus params updates diverged, tm2's state takes the values the chain recorded, which the next block's header is checked against (the app keeps its own state). Any other disagreement means tm2 itself derives its state differently: `ApplyBlock` refuses the block, as a node built from the code would, and the replay stops there with a `block not applied` diff.
 
 Governance halts recorded in the chain's history are ignored during replay.
 

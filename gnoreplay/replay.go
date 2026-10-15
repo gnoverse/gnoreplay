@@ -9,10 +9,16 @@ import (
 
 	"github.com/gnolang/gno/tm2/pkg/amino"
 	abci "github.com/gnolang/gno/tm2/pkg/bft/abci/types"
+	"github.com/gnolang/gno/tm2/pkg/bft/appconn"
+	cs "github.com/gnolang/gno/tm2/pkg/bft/consensus"
+	"github.com/gnolang/gno/tm2/pkg/bft/mempool/mock"
+	"github.com/gnolang/gno/tm2/pkg/bft/proxy"
 	sm "github.com/gnolang/gno/tm2/pkg/bft/state"
 	"github.com/gnolang/gno/tm2/pkg/bft/store"
 	bft "github.com/gnolang/gno/tm2/pkg/bft/types"
 	dbm "github.com/gnolang/gno/tm2/pkg/db"
+	"github.com/gnolang/gno/tm2/pkg/db/memdb"
+	"github.com/gnolang/gno/tm2/pkg/log"
 	"github.com/gnolang/gno/tm2/pkg/sdk"
 )
 
@@ -31,11 +37,13 @@ type replayOptions struct {
 	Logger      *slog.Logger
 }
 
-// replay re-executes every recorded block of src on app and compares each
-// response against the recorded one. It keeps going after a divergence, so a
-// single run lists every affected tx; diffs found once the app hash has
+// replay re-executes every recorded block of src on app as a syncing node
+// does: tm2's genesis handshake, then its ApplyBlock for each block, which
+// keeps tm2's state in stateDB (empty at the start). It compares each
+// response against the recorded one, and keeps going after a divergence, so
+// a single run lists every affected tx; diffs found once the app hash has
 // diverged are flagged, as they may be a consequence of an earlier one.
-func replay(src Source, app abci.Application, opts replayOptions) (*Report, error) {
+func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions) (*Report, error) {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -54,39 +62,53 @@ func replay(src Source, app abci.Application, opts replayOptions) (*Report, erro
 
 	r := newReport(genDoc.ChainID, firstHeight, tip, opts.MaxDiffs)
 
-	// Genesis.
-	validators := make([]*bft.Validator, len(genDoc.Validators))
-	for i, val := range genDoc.Validators {
-		validators[i] = bft.NewValidator(val.PubKey, val.Power)
+	baseApp, _ := app.(*sdk.BaseApp)
+	genesis := &genesisCheck{Application: app}
+	// tm2 logs every block, and returns its errors: those are what we report.
+	tmLogger := log.NewNoopLogger()
+	proxyApp := appconn.NewAppConns(proxy.NewLocalClientCreator(genesis))
+	proxyApp.SetLogger(tmLogger)
+	if err := proxyApp.Start(); err != nil {
+		return nil, fmt.Errorf("start app connections: %w", err)
 	}
-	csParams := genDoc.ConsensusParams
-	initRes := app.InitChain(abci.RequestInitChain{
-		Time:            genDoc.GenesisTime,
-		ChainID:         genDoc.ChainID,
-		ConsensusParams: &csParams,
-		Validators:      bft.NewValidatorSet(validators).ABCIValidatorUpdates(),
-		AppState:        genDoc.AppState,
-		InitialHeight:   genDoc.InitialHeight,
-	})
-	if initRes.Error != nil {
-		return nil, fmt.Errorf("InitChain: %v", initRes.Error)
+	defer proxyApp.Stop()
+
+	// Genesis, as a node's first start does it: the handshake, on an empty
+	// block store, sends InitChain and stores the genesis tx results at
+	// height 0.
+	state, err := sm.LoadStateFromDBOrGenesisDoc(stateDB, genDoc)
+	if err != nil {
+		return nil, err
 	}
-	// The handshaker stores genesis tx results at height 0.
+	handshaker := cs.NewHandshaker(stateDB, state, store.NewBlockStore(memdb.NewMemDB()), genDoc)
+	handshaker.SetLogger(tmLogger)
+	if err := handshaker.Handshake(proxyApp); err != nil {
+		return nil, fmt.Errorf("handshake: %w", err)
+	}
+	if genesis.err != nil {
+		return nil, fmt.Errorf("InitChain: %v", genesis.err)
+	}
+	state = sm.LoadState(stateDB)
+	gotGenesis, err := sm.LoadABCIResponses(stateDB, 0)
+	if err != nil {
+		return nil, err
+	}
 	if want, err := loadResponses(src.StateDB, 0); err != nil {
 		return nil, err
 	} else if want != nil {
-		r.compareTxs(0, nil, want.DeliverTxs, initRes.TxResponses)
+		r.compareTxs(0, nil, want.DeliverTxs, gotGenesis.DeliverTxs)
 	}
 	r.Timing.GenesisSeconds = time.Since(start).Seconds()
-	logger.Info("genesis replayed", "txs", len(initRes.TxResponses), "elapsed", time.Since(start))
+	logger.Info("genesis replayed", "txs", len(gotGenesis.DeliverTxs), "elapsed", time.Since(start))
 
-	baseApp, _ := app.(*sdk.BaseApp)
+	blockExec := sm.NewBlockExecutor(stateDB, tmLogger, proxyApp.Consensus(), mock.Mempool{})
 	blocksStart := time.Now()
 	lastLog := time.Now()
 
 	for height := firstHeight; height <= tip; height++ {
 		block := src.Blocks.LoadBlock(height)
-		if block == nil {
+		meta := src.Blocks.LoadBlockMeta(height)
+		if block == nil || meta == nil {
 			return nil, fmt.Errorf("block %d missing from blockstore", height)
 		}
 		want, err := loadResponses(src.StateDB, height)
@@ -99,43 +121,75 @@ func replay(src Source, app abci.Application, opts replayOptions) (*Report, erro
 			baseApp.SetHaltHeight(0)
 		}
 
-		commitInfo := lastCommitInfo(src.StateDB, block, firstHeight)
-		app.BeginBlock(abci.RequestBeginBlock{
-			Hash:           block.Hash(),
-			Header:         block.Header.Copy(),
-			LastCommitInfo: &commitInfo,
-		})
-		got := make([]abci.ResponseDeliverTx, len(block.Txs))
-		for i, tx := range block.Txs {
-			got[i] = app.DeliverTx(abci.RequestDeliverTx{Tx: tx})
+		next, err := blockExec.ApplyBlock(state, meta.BlockID, block)
+		if err != nil {
+			// A node built from this code would stop here too.
+			r.addBlockDiff(height, fmt.Sprintf("block not applied: %v", err))
+			r.ToHeight = height
+			break
 		}
-		endRes := app.EndBlock(abci.RequestEndBlock{Height: height})
-		appHash := app.Commit().Data
+		got, err := sm.LoadABCIResponses(stateDB, height)
+		if err != nil {
+			return nil, err
+		}
 
-		diverged := false
+		var resultsDiverged, valsDiverged, paramsDiverged bool
 		if want != nil {
-			diverged = r.compareTxs(height, block.Txs, want.DeliverTxs, got)
-			if !sameValidatorUpdates(want.EndBlock.ValidatorUpdates, endRes.ValidatorUpdates) {
+			resultsDiverged = r.compareTxs(height, block.Txs, want.DeliverTxs, got.DeliverTxs)
+			if !sameValidatorUpdates(want.EndBlock.ValidatorUpdates, got.EndBlock.ValidatorUpdates) {
 				r.addBlockDiff(height, "validator updates differ")
-				diverged = true
+				valsDiverged = true
+			}
+			if !sameConsensusParams(want.EndBlock.ConsensusParams, got.EndBlock.ConsensusParams) {
+				r.addBlockDiff(height, "consensus params updates differ")
+				paramsDiverged = true
 			}
 		} else {
 			r.MissingResponses++
 		}
-		if wantHash := recordedAppHash(src, height); wantHash != nil && !bytes.Equal(wantHash, appHash) {
-			if r.FirstAppHashMismatch == 0 {
-				r.FirstAppHashMismatch = height
-				r.addBlockDiff(height, fmt.Sprintf("app hash %X, recorded %X", appHash, wantHash))
-			}
-			diverged = true
+		wantHash := recordedAppHash(src, height)
+		hashDiverged := wantHash != nil && !bytes.Equal(wantHash, next.AppHash)
+		if hashDiverged && r.FirstAppHashMismatch == 0 {
+			r.FirstAppHashMismatch = height
+			r.addBlockDiff(height, fmt.Sprintf("app hash %X, recorded %X", next.AppHash, wantHash))
 		}
 		r.Blocks++
 		r.Txs += int64(len(block.Txs))
 
-		if diverged && opts.StopOnFirst {
+		if opts.StopOnFirst && (resultsDiverged || valsDiverged || paramsDiverged || hashDiverged) {
 			r.ToHeight = height
 			break
 		}
+
+		// ApplyBlock checks the next block's header against tm2's state.
+		// Where this block diverged, the state takes what the chain recorded
+		// (the app keeps its own), so that the replay goes on; any other
+		// disagreement is a change in tm2 itself, and the next block is not
+		// applied.
+		if hashDiverged {
+			next.AppHash = wantHash
+		}
+		if resultsDiverged {
+			next.LastResultsHash = want.ResultsHash()
+		}
+		if valsDiverged || paramsDiverged {
+			if valsDiverged {
+				if next.NextValidators, err = sm.LoadValidators(src.StateDB, height+2); err != nil {
+					return nil, err
+				}
+				next.LastHeightValidatorsChanged = height + 2
+			}
+			if paramsDiverged {
+				if next.ConsensusParams, err = sm.LoadConsensusParams(src.StateDB, height+1); err != nil {
+					return nil, err
+				}
+				next.LastHeightConsensusParamsChanged = height + 1
+			}
+			// Saved whole at their change heights, where tm2 loads them from.
+			sm.SaveState(stateDB, next)
+		}
+		state = next
+
 		if time.Since(lastLog) > 30*time.Second {
 			lastLog = time.Now()
 			logger.Info("replaying", "height", height, "tip", tip,
@@ -171,35 +225,30 @@ func recordedAppHash(src Source, height int64) []byte {
 	return nil
 }
 
-// lastCommitInfo mirrors getBeginBlockLastCommitInfo in tm2/pkg/bft/state,
-// without its panics: a source missing validator history still replays.
-func lastCommitInfo(stateDB dbm.DB, block *bft.Block, initialHeight int64) abci.LastCommitInfo {
-	info := abci.LastCommitInfo{Round: int32(block.LastCommit.Round())}
-	if block.Height <= initialHeight {
-		return info
-	}
-	vals, err := sm.LoadValidators(stateDB, block.Height-1)
-	if err != nil {
-		return info
-	}
-	info.Votes = make([]abci.VoteInfo, len(vals.Validators))
-	for i, val := range vals.Validators {
-		var vote *bft.CommitSig
-		if i < len(block.LastCommit.Precommits) {
-			vote = block.LastCommit.Precommits[i]
-		}
-		info.Votes[i] = abci.VoteInfo{
-			Address:         val.Address,
-			Power:           val.VotingPower,
-			SignedLastBlock: vote != nil,
-		}
-	}
-	return info
+// genesisCheck keeps InitChain's error, which the handshake ignores: a
+// genesis that fails to load stops the replay rather than diverging at every
+// block.
+type genesisCheck struct {
+	abci.Application
+	err error
+}
+
+func (a *genesisCheck) InitChain(req abci.RequestInitChain) abci.ResponseInitChain {
+	res := a.Application.InitChain(req)
+	a.err = res.Error
+	return res
 }
 
 func sameValidatorUpdates(a, b []abci.ValidatorUpdate) bool {
 	return bytes.Equal(
 		amino.MustMarshal(abci.ResponseEndBlock{ValidatorUpdates: a}),
 		amino.MustMarshal(abci.ResponseEndBlock{ValidatorUpdates: b}),
+	)
+}
+
+func sameConsensusParams(a, b *abci.ConsensusParams) bool {
+	return bytes.Equal(
+		amino.MustMarshal(abci.ResponseEndBlock{ConsensusParams: a}),
+		amino.MustMarshal(abci.ResponseEndBlock{ConsensusParams: b}),
 	)
 }

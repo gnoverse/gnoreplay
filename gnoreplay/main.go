@@ -32,7 +32,7 @@ func main() {
 	var (
 		dataDir     = flag.String("data-dir", "gnoland-data", "source node data directory (its db/ is opened read-only)")
 		genesisFile = flag.String("genesis", "genesis.json", "genesis.json of the source chain")
-		workDir     = flag.String("work-dir", "", "directory for the replayed app DB and genesis cache (default: a temporary directory, removed on exit)")
+		workDir     = flag.String("work-dir", "", "directory for the replay's app and state DBs and genesis cache (default: a temporary directory, removed on exit)")
 		toHeight    = flag.Int64("to", 0, "last height to replay (default: source tip)")
 		stopOnFirst = flag.Bool("stop-on-first", false, "stop at the first block with a result or app hash divergence")
 		maxDiffs    = flag.Int("max-diffs", 1000, "maximum number of diffs listed in the report (counts stay exact); 0 for no limit")
@@ -109,8 +109,13 @@ func run(logger *slog.Logger, dataDir, genesisFile, workDir string, opts replayO
 		return nil, err
 	}
 	defer app.Close()
+	replayStateDB, err := pebbledb.NewPebbleDBWithOpts("state", workDir, &pebble.Options{FS: noSyncFS{vfs.Default}})
+	if err != nil {
+		return nil, fmt.Errorf("open replay state db: %w", err)
+	}
+	defer replayStateDB.Close()
 
-	return replay(Source{Blocks: store.NewBlockStore(bsDB), StateDB: stateDB}, app, opts)
+	return replay(Source{Blocks: store.NewBlockStore(bsDB), StateDB: stateDB}, app, replayStateDB, opts)
 }
 
 // newApp builds the application the way `gnoland start` does (see

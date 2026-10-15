@@ -2,11 +2,12 @@ package main
 
 import "github.com/cockroachdb/pebble/vfs"
 
-// noSyncFS is the filesystem of the replay's own app DB: its files are
-// written as usual, but never synced. tm2 syncs each block commit, which on
-// cloud disks costs ~1.7ms a block, about 15% of a mainnet replay; the DB is
-// thrown away after the replay, so durability buys nothing. (Pebble's
-// DisableWAL would refuse tm2's synced writes instead.)
+// noSyncFS is the filesystem of the replay's own DBs (the app's, and tm2's
+// state): their files are written as usual, but never synced. tm2 syncs each
+// block commit, which on cloud disks costs ~1.7ms a block, about 15% of a
+// mainnet replay; the DBs are thrown away after the replay, so durability
+// buys nothing. (Pebble's DisableWAL would refuse tm2's synced writes
+// instead.)
 type noSyncFS struct{ vfs.FS }
 
 func (fs noSyncFS) Create(name string) (vfs.File, error) {
