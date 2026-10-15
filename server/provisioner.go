@@ -58,6 +58,12 @@ func newHetznerProvisioner(token string, cfg *HetznerConfig) *hetznerProvisioner
 	return &hetznerProvisioner{c: hcloud.NewClient(hcloud.WithToken(token), hcloud.WithApplication("gnoreplay", "")), cfg: cfg}
 }
 
+// newWorkerProvisioner builds the provisioner setup uses; tests replace it
+// with a fake, so paths like serve's startup need no Hetzner API.
+var newWorkerProvisioner = func(token string, cfg *HetznerConfig) Provisioner {
+	return newHetznerProvisioner(token, cfg)
+}
+
 func (p *hetznerProvisioner) Create(ctx context.Context, name, userData string, labels map[string]string) (Machine, error) {
 	keys := make([]*hcloud.SSHKey, len(p.cfg.SSHKeys))
 	for i, id := range p.cfg.SSHKeys {

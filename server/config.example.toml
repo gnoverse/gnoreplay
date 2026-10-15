@@ -36,23 +36,26 @@ genesis = "/var/lib/gnoreplay/genesis.json"
 # contribs/gnoreplay and built there.
 gnoreplay_overlay = "/opt/gnoreplay/gnoreplay"
 # PR code is untrusted: build and replay each run in a microsandbox VM
-# (https://microsandbox.dev) with the job dir mounted at the same path, so
-# no host secret is reachable and a runaway job can't OOM the host.
-# "{job}" is the job ID, "{src}" the checkout. Environment variables do not
-# cross into a VM: pass them with -e.
+# (https://microsandbox.dev) that mounts only the job's own directory and the
+# shared Go caches, never the whole data dir, which also holds other jobs'
+# files, the git mirrors and the session key. "{job}" is the job ID, "{src}"
+# the checkout, "{jobdir}" the job's directory and "{data}" the data dir.
+# Environment variables do not cross into a VM: pass them with -e.
 #
 # The build needs the Go module proxy (network) and a Go image.
 build_sandbox = ["msb", "run", "-q", "-n", "gnoreplay-build-{job}", "--replace",
   "-m", "4G", "-c", "4", "-u", "1000:1000", "--net", "public",
-  "--mount-dir", "/var/lib/gnoreplay:/var/lib/gnoreplay:uid=1000,gid=1000",
-  "-e", "HOME=/tmp", "-e", "GOMODCACHE=/var/lib/gnoreplay/gomod", "-e", "GOCACHE=/var/lib/gnoreplay/gocache",
+  "--mount-dir", "{jobdir}:{jobdir}:uid=1000,gid=1000",
+  "--mount-dir", "{data}/gomod:{data}/gomod:uid=1000,gid=1000",
+  "--mount-dir", "{data}/gocache:{data}/gocache:uid=1000,gid=1000",
+  "-e", "HOME=/tmp", "-e", "GOMODCACHE={data}/gomod", "-e", "GOCACHE={data}/gocache",
   "golang:1.26", "--"]
 # The replay needs no network. Measured on mainnet: the first commit (all
 # 3.26M genesis accounts) peaks above 8G with Go's default GC; GOMEMLIMIT=7GiB
 # in a 9G VM completes. Budget 9G per worker.
 run_sandbox = ["msb", "run", "-q", "-n", "gnoreplay-run-{job}", "--replace",
   "-m", "9G", "-c", "4", "-u", "1000:1000", "--no-net",
-  "--mount-dir", "/var/lib/gnoreplay:/var/lib/gnoreplay:uid=1000,gid=1000",
+  "--mount-dir", "{jobdir}:{jobdir}:uid=1000,gid=1000",
   "-e", "HOME=/tmp", "-e", "GNOROOT={src}", "-e", "GOMEMLIMIT=7GiB",
   "debian:bookworm-slim", "--"]
 # msb keeps stopped VMs; remove the job's after it ends.

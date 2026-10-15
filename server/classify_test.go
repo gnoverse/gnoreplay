@@ -52,7 +52,7 @@ func TestRender(t *testing.T) {
 	out = render(job, gasOnly, classify(gasOnly, clean), "", nil)
 	assert.Equal(t, outcomePass, out.Outcome)
 	assert.Contains(t, out.Summary, "1 tx(s) use different gas")
-	assert.Contains(t, out.Body, "gas_used 1 -> 2")
+	assert.Contains(t, out.Body, "gas\\_used 1 \\-\\> 2")
 	assert.NotContains(t, out.Body, "Compared with")
 
 	// Divergences and gas-only differences are listed apart: each heading
@@ -94,6 +94,41 @@ func TestRender(t *testing.T) {
 	out = render(job, broken, classify(broken, broken), "", nil)
 	assert.Equal(t, outcomePass, out.Outcome)
 	assert.Contains(t, out.Summary, "2 inherited from master")
+
+	// A replay that stopped at a block, or only changed validator updates,
+	// has no result diff and no app hash mismatch: it is not the benign
+	// app-hash-only shape.
+	stopped := &Report{ChainID: "gnoland-1", ToHeight: 3, Blocks: 1, Txs: 2, Diffs: []Diff{
+		{Kind: "block", Height: 2, Index: -1, Detail: "block not applied: panic: boom"},
+	}}
+	out = render(job, stopped, classify(stopped, clean), "", nil)
+	assert.Equal(t, outcomeDiverges, out.Outcome)
+	assert.Contains(t, out.Summary, "1 new divergence(s)")
+	assert.NotContains(t, out.Summary, "app hash")
+
+	// Report text is escaped: it comes from the code under test and must not
+	// become markdown on the page.
+	hostile := &Report{ChainID: "gnoland-1", ToHeight: 5, Blocks: 2, Txs: 2, Diffs: []Diff{{
+		Kind: "block", Height: 3, Index: -1,
+		Detail: "block not applied: panic: boom\n[click](https://evil.example/)\n![p](https://evil.example/x.png)",
+	}}}
+	out = render(job, hostile, classify(hostile, clean), "", nil)
+	assert.NotContains(t, out.Body, "](https://evil.example")
+	assert.NotContains(t, out.Body, "![p](https://evil")
+
+	// Heights with no recorded responses are not compared: the summary says
+	// so instead of claiming the history replays identically.
+	unchecked := &Report{ChainID: "gnoland-1", ToHeight: 5, Blocks: 5, Txs: 2, MissingResponses: 5}
+	out = render(job, unchecked, classify(unchecked, clean), "", nil)
+	assert.Equal(t, outcomePass, out.Outcome)
+	assert.Contains(t, out.Summary, "Nothing was compared: 5 height(s) had no recorded responses")
+	assert.Contains(t, out.Body, "5 height(s) had no recorded responses to compare")
+	assert.True(t, classify(unchecked, clean).Partial)
+
+	partly := &Report{ChainID: "gnoland-1", ToHeight: 5, Blocks: 5, Txs: 2, MissingResponses: 2}
+	out = render(job, partly, classify(partly, clean), "", nil)
+	assert.Contains(t, out.Summary, "replays identically")
+	assert.Contains(t, out.Summary, "2 height(s) had no recorded responses")
 }
 
 func indexOf(s, sub string) int {

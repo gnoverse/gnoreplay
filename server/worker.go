@@ -239,7 +239,7 @@ func (s *Server) replay(ctx context.Context, j *Job, logger *slog.Logger) (*Repo
 	if len(s.cfg.Job.CleanupCommand) > 0 {
 		defer func() {
 			// Not tied to ctx: a cancelled job still needs cleaning up.
-			args := sandbox(s.cfg.Job.CleanupCommand, j, src)
+			args := s.sandbox(s.cfg.Job.CleanupCommand, j, src)
 			if err := s.run(context.Background(), nil, jobDir, nil, logFile, args[0], args[1:]...); err != nil {
 				logger.Error("cleanup", "err", err)
 			}
@@ -309,10 +309,10 @@ func (s *Server) replayLocal(ctx context.Context, j *Job, jobDir, src, reportFil
 	defer cancel()
 	// The tool's go.sum was resolved against another tree. go -C rather than
 	// the process's dir: a VM sandbox doesn't inherit it.
-	if err := s.run(buildCtx, sandbox(s.cfg.Job.BuildSandbox, j, src), toolDir, nil, logFile, "go", "-C", toolDir, "mod", "tidy"); err != nil {
+	if err := s.run(buildCtx, s.sandbox(s.cfg.Job.BuildSandbox, j, src), toolDir, nil, logFile, "go", "-C", toolDir, "mod", "tidy"); err != nil {
 		return fmt.Errorf("go mod tidy: %w", err)
 	}
-	if err := s.run(buildCtx, sandbox(s.cfg.Job.BuildSandbox, j, src), toolDir, nil, logFile, "go", "-C", toolDir, "build", "-o", bin, "."); err != nil {
+	if err := s.run(buildCtx, s.sandbox(s.cfg.Job.BuildSandbox, j, src), toolDir, nil, logFile, "go", "-C", toolDir, "build", "-o", bin, "."); err != nil {
 		return fmt.Errorf("build: %w", err)
 	}
 
@@ -322,9 +322,15 @@ func (s *Server) replayLocal(ctx context.Context, j *Job, jobDir, src, reportFil
 	if err := os.MkdirAll(filepath.Join(dataDir, "db"), 0o755); err != nil {
 		return err
 	}
+	// Resolved once: a refresh may swap the golden symlink while this runs,
+	// and both DBs must come from the same snapshot (as on the worker path).
+	golden, err := filepath.EvalSymlinks(s.cfg.Chain.GoldenDir)
+	if err != nil {
+		return fmt.Errorf("resolve golden dir: %w", err)
+	}
 	for _, name := range []string{"blockstore.db", "state.db"} {
 		args := substitute(s.cfg.Job.CopyCommand,
-			"{src}", filepath.Join(s.cfg.Chain.GoldenDir, "db", name),
+			"{src}", filepath.Join(golden, "db", name),
 			"{dst}", filepath.Join(dataDir, "db", name))
 		if err := s.run(ctx, nil, jobDir, nil, logFile, args[0], args[1:]...); err != nil {
 			return fmt.Errorf("copy %s: %w", name, err)
@@ -334,7 +340,7 @@ func (s *Server) replayLocal(ctx context.Context, j *Job, jobDir, src, reportFil
 	step("replay")
 	runCtx, cancelRun := context.WithTimeout(ctx, s.cfg.Job.RunTimeout.Duration)
 	defer cancelRun()
-	err := s.run(runCtx, sandbox(s.cfg.Job.RunSandbox, j, src), jobDir, []string{"GNOROOT=" + src}, logFile, bin,
+	err = s.run(runCtx, s.sandbox(s.cfg.Job.RunSandbox, j, src), jobDir, []string{"GNOROOT=" + src}, logFile, bin,
 		"--data-dir", dataDir,
 		"--genesis", s.cfg.Chain.Genesis,
 		"--work-dir", filepath.Join(jobDir, "work"),
@@ -524,9 +530,17 @@ func substitute(tmpl []string, oldnew ...string) []string {
 	return out
 }
 
-// sandbox expands a sandbox prefix (or the cleanup command) for a job.
-func sandbox(prefix []string, j *Job, src string) []string {
-	return substitute(prefix, "{job}", fmt.Sprint(j.ID), "{src}", src)
+// sandbox expands a sandbox prefix (or the cleanup command) for a job:
+// "{job}" is the job ID, "{src}" the checkout, "{jobdir}" the job's own
+// directory and "{data}" the data dir. A sandbox should mount the job dir and
+// what it needs, never the whole data dir, which holds other jobs' files, the
+// git mirrors and the session key.
+func (s *Server) sandbox(prefix []string, j *Job, src string) []string {
+	return substitute(prefix,
+		"{job}", fmt.Sprint(j.ID),
+		"{src}", src,
+		"{jobdir}", s.jobDir(j.ID),
+		"{data}", s.cfg.DataDir)
 }
 
 func copyDir(src, dst string) error {

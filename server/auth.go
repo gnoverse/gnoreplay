@@ -112,10 +112,17 @@ func (s *Server) serveLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 // localPath returns next if it is a path on this server, else "/": sign-in
-// must not redirect elsewhere.
+// must not redirect elsewhere. Control characters are refused because
+// browsers drop tab and newline before parsing a URL, which would turn e.g.
+// "/\t/evil.example" into a cross-site one.
 func localPath(next string) string {
 	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || strings.HasPrefix(next, "/\\") {
 		return "/"
+	}
+	for _, r := range next {
+		if r < 0x20 || r == 0x7f {
+			return "/"
+		}
 	}
 	return next
 }

@@ -31,8 +31,10 @@ func TestWatchdogScript(t *testing.T) {
 	}
 	ago := func(d time.Duration) time.Time { return time.Now().Add(-d) }
 	worker := func(id int, job int64, since time.Duration) server {
-		return server{id, "gnoreplay-worker-" + strconv.Itoa(id), ago(10 * time.Hour).UTC().Format(time.RFC3339),
-			workerLabels(job, ago(since))}
+		return server{
+			id, "gnoreplay-worker-" + strconv.Itoa(id), ago(10 * time.Hour).UTC().Format(time.RFC3339),
+			workerLabels(job, ago(since)),
+		}
 	}
 	pages := [][]server{
 		{

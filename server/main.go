@@ -92,7 +92,7 @@ func setup(configPath string, logger *slog.Logger) (*Server, func(), error) {
 			q.Close()
 			return nil, nil, fmt.Errorf("read hetzner token: %w", err)
 		}
-		srv.prov = newHetznerProvisioner(strings.TrimSpace(string(token)), h)
+		srv.prov = newWorkerProvisioner(strings.TrimSpace(string(token)), h)
 	}
 	return srv, func() { q.Close() }, nil
 }
@@ -119,6 +119,9 @@ func serve(parent context.Context, configPath string, logger *slog.Logger) error
 	close(resume)
 
 	var wg sync.WaitGroup
+	// The worker endpoint's own failure: reported at the end, so it does not
+	// come out as a clean stop (the process must not exit 0 with it down).
+	workerErr := make(chan error, 1)
 	if srv.prov != nil {
 		// Every minute: idle workers are deleted in the last minutes of their
 		// billing hour.
@@ -135,8 +138,11 @@ func serve(parent context.Context, configPath string, logger *slog.Logger) error
 		go func() {
 			if err := workerSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 				logger.Error("worker endpoint", "err", err)
+				workerErr <- err
 				stop(errShutdown)
+				return
 			}
+			workerErr <- nil
 		}()
 		logger.Info("worker machines", "provider", "hetzner", "endpoint", srv.cfg.Hetzner.Listen)
 	}
@@ -161,6 +167,11 @@ func serve(parent context.Context, configPath string, logger *slog.Logger) error
 	stop(errShutdown) // if it failed to start
 	wg.Wait()
 	if errors.Is(err, http.ErrServerClosed) {
+		if srv.prov != nil {
+			if werr := <-workerErr; werr != nil {
+				return fmt.Errorf("worker endpoint: %w", werr)
+			}
+		}
 		return nil
 	}
 	return err
@@ -176,7 +187,7 @@ func rerender(configPath string, logger *slog.Logger, ids []string) error {
 	defer closeFn()
 	var jobs []*Job
 	if len(ids) == 0 {
-		if jobs, err = srv.queue.Recent(math.MaxInt32); err != nil {
+		if jobs, err = srv.queue.Recent(nil, math.MaxInt32); err != nil {
 			return err
 		}
 	}
@@ -199,7 +210,16 @@ func rerender(configPath string, logger *slog.Logger, ids []string) error {
 		if j.BaseID != 0 {
 			base, err = srv.queue.Get(j.BaseID)
 		} else {
-			base, err = srv.queue.Baseline(j.Repo, j.Branch, j.FinishedAt)
+			// A job rendered without a baseline keeps none: re-derive the
+			// one it would have had when it started, not one that finished
+			// while it ran, which rerendering must not turn into a result
+			// the job never had. Jobs from before started_at was recorded
+			// fall back to their finish.
+			at := j.StartedAt
+			if at.IsZero() {
+				at = j.FinishedAt
+			}
+			base, err = srv.queue.Baseline(j.Repo, j.Branch, at)
 		}
 		if err != nil {
 			return fmt.Errorf("job %d: baseline: %w", j.ID, err)

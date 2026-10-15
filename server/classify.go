@@ -16,6 +16,7 @@ type Report struct {
 	Blocks               int64  `json:"blocks"`
 	Txs                  int64  `json:"txs"`
 	FirstAppHashMismatch int64  `json:"first_app_hash_mismatch"`
+	MissingResponses     int64  `json:"missing_responses"`
 	Counts               struct {
 		Result int `json:"result"`
 		Gas    int `json:"gas"`
@@ -72,8 +73,8 @@ type Classification struct {
 	Fixed     []Diff // diverges on the base, not here
 	// NoBaseline is set when there was no base report: every diff is New.
 	NoBaseline bool
-	// Partial is set when either report was truncated, or they cover
-	// different heights: classification is best-effort.
+	// Partial is set when either report was truncated, they cover
+	// different heights, or a report has heights it could not compare.
 	Partial bool
 }
 
@@ -82,7 +83,7 @@ func classify(r, base *Report) Classification {
 		return Classification{New: r.Diffs, NoBaseline: true}
 	}
 	c := Classification{
-		Partial: r.Truncated || base.Truncated || r.ToHeight != base.ToHeight,
+		Partial: r.Truncated || base.Truncated || r.ToHeight != base.ToHeight || r.MissingResponses > 0,
 	}
 	baseIDs := make(map[string]bool, len(base.Diffs))
 	for _, d := range base.Diffs {
@@ -146,7 +147,7 @@ func render(job *Job, r *Report, c Classification, reportURL string, base *Job) 
 
 	out := Outcome{Outcome: outcomePass}
 	switch {
-	case len(newConsensus) > 0 && newResults == 0:
+	case len(newConsensus) > 0 && newResults == 0 && r.FirstAppHashMismatch > 0:
 		// E.g. a stdlib change: its source is in the state from genesis on.
 		out.Outcome = outcomeDiverges
 		out.Summary = fmt.Sprintf("Every tx result is the same, but the app hash differs from %s history", r.ChainID)
@@ -159,6 +160,13 @@ func render(job *Job, r *Report, c Classification, reportURL string, base *Job) 
 		out.Summary = fmt.Sprintf("%s history replays identically (%d blocks)", r.ChainID, r.Blocks)
 		if len(c.Inherited) > 0 {
 			out.Summary = fmt.Sprintf("No new divergences (%d inherited from %s)", len(c.Inherited), job.Branch)
+		}
+	}
+	if r.MissingResponses > 0 {
+		if r.MissingResponses >= r.Blocks && len(c.New) == 0 && len(c.Inherited) == 0 {
+			out.Summary = fmt.Sprintf("Nothing was compared: %d height(s) had no recorded responses", r.MissingResponses)
+		} else {
+			out.Summary += fmt.Sprintf("; %d height(s) had no recorded responses", r.MissingResponses)
 		}
 	}
 
@@ -200,7 +208,10 @@ func render(job *Job, r *Report, c Classification, reportURL string, base *Job) 
 		fmt.Fprintf(&s, "No replay of `%s` to compare with: all diffs are listed as new.\n\n", job.Branch)
 	}
 	if c.Partial {
-		s.WriteString("Classification is partial: the reports were truncated or cover different heights.\n\n")
+		s.WriteString("Classification is partial: a report was truncated, covered different heights, or had heights it could not compare.\n\n")
+	}
+	if r.MissingResponses > 0 {
+		fmt.Fprintf(&s, "%d height(s) had no recorded responses to compare and were not checked.\n\n", r.MissingResponses)
 	}
 	if reportURL != "" {
 		fmt.Fprintf(&s, "[Full report (JSON)](%s)\n\n", reportURL)
@@ -253,10 +264,14 @@ func writeDiffs(w *strings.Builder, heading string, ds []Diff) {
 		}
 		w.WriteString("\n")
 		if len(d.Msgs) > 0 {
-			fmt.Fprintf(w, "  - msgs: `%s`\n", strings.Join(d.Msgs, "`, `"))
+			spans := make([]string, len(d.Msgs))
+			for i, m := range d.Msgs {
+				spans[i] = codeSpan(m)
+			}
+			fmt.Fprintf(w, "  - msgs: %s\n", strings.Join(spans, ", "))
 		}
 		if d.Detail != "" {
-			fmt.Fprintf(w, "  - %s\n", d.Detail)
+			fmt.Fprintf(w, "  - %s\n", mdText(oneLine(d.Detail)))
 		}
 		if d.Kind == "result" && d.Recorded != nil && d.Replayed != nil {
 			fmt.Fprintf(w, "  - recorded: %s\n  - replayed: %s\n", describeResult(d.Recorded), describeResult(d.Replayed))
@@ -269,7 +284,56 @@ func describeResult(r *Result) string {
 	if r.Error == "" {
 		return fmt.Sprintf("ok (gas %d)", r.GasUsed)
 	}
-	return fmt.Sprintf("`%s` (gas %d)", truncateStr(oneLine(r.Error), 300), r.GasUsed)
+	return fmt.Sprintf("%s (gas %d)", codeSpan(truncateStr(oneLine(r.Error), 300)), r.GasUsed)
+}
+
+// mdText escapes s for use as markdown text: the report carries text from the
+// code under test, which must not become links, images, code or emphasis on a
+// page. Every ASCII punctuation character is backslash-escaped, which markdown
+// renders literally.
+func mdText(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r < 0x80 && strings.ContainsRune(mdPunct, r) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+const mdPunct = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+
+// codeSpan wraps s in a markdown code span, with a delimiter longer than any
+// backtick run in s: a backtick in s cannot end the span early and start
+// markdown after it.
+func codeSpan(s string) string {
+	d := strings.Repeat("`", longestBacktickRun(s)+1)
+	if strings.HasPrefix(s, "`") || strings.HasSuffix(s, "`") || strings.HasPrefix(s, " ") || strings.HasSuffix(s, " ") {
+		s = " " + s + " "
+	}
+	return d + s + d
+}
+
+// mdFence returns a code fence a backtick run in s cannot close early.
+func mdFence(s string) string {
+	return strings.Repeat("`", max(3, longestBacktickRun(s)+1))
+}
+
+func longestBacktickRun(s string) (longest int) {
+	run := 0
+	for _, r := range s {
+		if r == '`' {
+			run++
+			if run > longest {
+				longest = run
+			}
+			continue
+		}
+		run = 0
+	}
+	return longest
 }
 
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }

@@ -48,6 +48,19 @@ func (s *Server) canSee(r *http.Request, repo string) bool {
 	return v != nil && s.allowed(repo, v.ID)
 }
 
+// visibleRepos lists the repos the request may see, for query-level
+// filtering: filtering after a query's LIMIT lets other repos' jobs consume
+// the limit and hide results the request may see.
+func (s *Server) visibleRepos(r *http.Request) []string {
+	var out []string
+	for repo := range s.cfg.Repos {
+		if s.canSee(r, repo) {
+			out = append(out, repo)
+		}
+	}
+	return out
+}
+
 func (s *Server) visible(r *http.Request, jobs []*Job) []*Job {
 	var out []*Job
 	for _, j := range jobs {
@@ -246,7 +259,7 @@ type branchView struct {
 const recentSize = 50
 
 func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
-	recent, err := s.queue.Recent(recentSize)
+	recent, err := s.queue.Recent(s.visibleRepos(r), recentSize)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -395,7 +408,8 @@ func jobBody(j *Job) (template.HTML, error) {
 		}
 		md = string(bz)
 	case stateFailed:
-		md = "The replay did not complete, so nothing was checked.\n\n```\n" + j.Error + "\n```\n"
+		fence := mdFence(j.Error)
+		md = "The replay did not complete, so nothing was checked.\n\n" + fence + "\n" + j.Error + "\n" + fence + "\n"
 	case stateSuperseded:
 		md = "Not checked: superseded by a newer push, or the PR was closed."
 	case stateSkipped:
@@ -454,6 +468,7 @@ func (s *Server) serveSearch(w http.ResponseWriter, r *http.Request) {
 // search returns the jobs q designates, and whether it designates commits
 // (rather than PRs or branches).
 func (s *Server) search(r *http.Request, q string) (jobs []*Job, bySHA bool, err error) {
+	repos := s.visibleRepos(r)
 	if m := githubPath.FindStringSubmatch(q); m != nil {
 		repo, kind, rest := m[1], m[2], m[3]
 		switch kind {
@@ -466,13 +481,13 @@ func (s *Server) search(r *http.Request, q string) (jobs []*Job, bySHA bool, err
 		case "tree":
 			jobs, err = s.queue.ByKey(jobKey(repo, eventPush, rest, 0), searchSize)
 		case "commit":
-			jobs, err = s.queue.BySHA(rest, searchSize)
+			jobs, err = s.queue.BySHA(repos, rest, searchSize)
 			bySHA = true
 		}
 		return s.visible(r, jobs), bySHA, err
 	}
 	if n, err := strconv.Atoi(strings.TrimPrefix(q, "#")); err == nil && n > 0 {
-		jobs, err := s.queue.ByPR(n, searchSize)
+		jobs, err := s.queue.ByPR(repos, n, searchSize)
 		if err != nil {
 			return nil, false, err
 		}
@@ -482,7 +497,7 @@ func (s *Server) search(r *http.Request, q string) (jobs []*Job, bySHA bool, err
 		}
 	}
 	if hexPrefix.MatchString(q) {
-		jobs, err := s.queue.BySHA(q, searchSize)
+		jobs, err := s.queue.BySHA(repos, q, searchSize)
 		if err != nil {
 			return nil, false, err
 		}
@@ -490,13 +505,13 @@ func (s *Server) search(r *http.Request, q string) (jobs []*Job, bySHA bool, err
 			return jobs, true, nil
 		}
 	}
-	if jobs, err = s.queue.ByBranch(q, searchSize); err != nil {
+	if jobs, err = s.queue.ByBranch(repos, q, searchSize); err != nil {
 		return nil, false, err
 	}
 	if jobs = s.visible(r, jobs); len(jobs) > 0 {
 		return jobs, false, nil
 	}
-	jobs, err = s.queue.ByTitle(q, searchSize)
+	jobs, err = s.queue.ByTitle(repos, q, searchSize)
 	return s.visible(r, jobs), false, err
 }
 

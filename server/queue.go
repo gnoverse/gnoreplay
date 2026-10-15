@@ -128,6 +128,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 // addedColumns were added to tables after their first release: databases
 // created before get them on open.
 var addedColumns = []struct{ table, column, decl string }{
+	{"jobs", "outcome", "TEXT NOT NULL DEFAULT ''"},
+	{"jobs", "summary", "TEXT NOT NULL DEFAULT ''"},
 	{"jobs", "started_at", "INTEGER NOT NULL DEFAULT 0"},
 	{"jobs", "base_id", "INTEGER NOT NULL DEFAULT 0"},
 	{"jobs", "title", "TEXT NOT NULL DEFAULT ''"},
@@ -310,11 +312,15 @@ func (q *Queue) Get(id int64) (*Job, error) {
 	return jobs[0], nil
 }
 
-// Recent lists the latest jobs that ran to an end, done or failed, newest
-// first.
-func (q *Queue) Recent(limit int) ([]*Job, error) {
-	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE state IN (?, ?)
-		ORDER BY finished_at DESC, id DESC LIMIT ?`, stateDone, stateFailed, limit))
+// Recent lists the latest jobs of the listed repos that ran to an end, done
+// or failed, newest first. A nil repos means every repo; filtering here, not
+// after the limit, keeps other repos' jobs from hiding these.
+func (q *Queue) Recent(repos []string, limit int) ([]*Job, error) {
+	where, reposArgs := repoWhere(repos)
+	args := append([]any{stateDone, stateFailed}, reposArgs...)
+	args = append(args, limit)
+	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE state IN (?, ?)`+where+`
+		ORDER BY finished_at DESC, id DESC LIMIT ?`, args...))
 }
 
 // ByKey lists the jobs of a branch or a PR, newest first.
@@ -322,30 +328,62 @@ func (q *Queue) ByKey(key string, limit int) ([]*Job, error) {
 	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE key = ? ORDER BY id DESC LIMIT ?`, key, limit))
 }
 
-// BySHA lists the jobs of the commits whose SHA starts with prefix, newest
-// first.
-func (q *Queue) BySHA(prefix string, limit int) ([]*Job, error) {
-	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE sha LIKE ? ESCAPE '\'
-		ORDER BY id DESC LIMIT ?`, likeEscape(strings.ToLower(prefix))+"%", limit))
+// BySHA lists the jobs of the listed repos whose commits' SHA starts with
+// prefix, newest first. A nil repos means every repo.
+func (q *Queue) BySHA(repos []string, prefix string, limit int) ([]*Job, error) {
+	where, reposArgs := repoWhere(repos)
+	args := append([]any{likeEscape(strings.ToLower(prefix)) + "%"}, reposArgs...)
+	args = append(args, limit)
+	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE sha LIKE ? ESCAPE '\'`+where+`
+		ORDER BY id DESC LIMIT ?`, args...))
 }
 
-// ByPR lists the jobs of the PRs numbered n, in any repo, newest first.
-func (q *Queue) ByPR(n, limit int) ([]*Job, error) {
-	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE event = ? AND pr = ?
-		ORDER BY id DESC LIMIT ?`, eventPullRequest, n, limit))
+// ByPR lists the jobs of the PRs numbered n, in the listed repos, newest
+// first. A nil repos means every repo.
+func (q *Queue) ByPR(repos []string, n, limit int) ([]*Job, error) {
+	where, reposArgs := repoWhere(repos)
+	args := append([]any{eventPullRequest, n}, reposArgs...)
+	args = append(args, limit)
+	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE event = ? AND pr = ?`+where+`
+		ORDER BY id DESC LIMIT ?`, args...))
 }
 
-// ByBranch lists the push jobs of a branch, in any repo, newest first.
-func (q *Queue) ByBranch(branch string, limit int) ([]*Job, error) {
-	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE event = ? AND branch = ?
-		ORDER BY id DESC LIMIT ?`, eventPush, branch, limit))
+// ByBranch lists the push jobs of a branch, in the listed repos, newest
+// first. A nil repos means every repo.
+func (q *Queue) ByBranch(repos []string, branch string, limit int) ([]*Job, error) {
+	where, reposArgs := repoWhere(repos)
+	args := append([]any{eventPush, branch}, reposArgs...)
+	args = append(args, limit)
+	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE event = ? AND branch = ?`+where+`
+		ORDER BY id DESC LIMIT ?`, args...))
 }
 
 // ByTitle lists the jobs of the PRs whose title contains text (ignoring
-// ASCII case), newest first.
-func (q *Queue) ByTitle(text string, limit int) ([]*Job, error) {
-	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE title LIKE ? ESCAPE '\'
-		ORDER BY id DESC LIMIT ?`, "%"+likeEscape(text)+"%", limit))
+// ASCII case), in the listed repos, newest first. A nil repos means every
+// repo.
+func (q *Queue) ByTitle(repos []string, text string, limit int) ([]*Job, error) {
+	where, reposArgs := repoWhere(repos)
+	args := append([]any{"%" + likeEscape(text) + "%"}, reposArgs...)
+	args = append(args, limit)
+	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE title LIKE ? ESCAPE '\'`+where+`
+		ORDER BY id DESC LIMIT ?`, args...))
+}
+
+// repoWhere builds the repo filter of a listing query: nil means every repo,
+// an empty list means none.
+func repoWhere(repos []string) (string, []any) {
+	if repos == nil {
+		return "", nil
+	}
+	if len(repos) == 0 {
+		return " AND 1=0", nil
+	}
+	ph := "?" + strings.Repeat(", ?", len(repos)-1)
+	args := make([]any, len(repos))
+	for i, r := range repos {
+		args[i] = r
+	}
+	return " AND repo IN (" + ph + ")", args
 }
 
 // likeEscape quotes the LIKE wildcards in s (with the escape character \).

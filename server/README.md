@@ -69,7 +69,7 @@ What the box needs in both cases (except where noted):
 
 - **The golden copy**: a recent `blockstore.db` and `state.db` of a mainnet node. Every node stores per-height tx results in `state.db`: these are what replays are compared against. `scripts/fetch-golden.sh` (timer, every 12h) downloads them from the newest snapshot on snapshots.gno.land, checks its sha256 and atomically repoints `golden`.
 - **Or a reference node** of the box's own: a non-validator `gnoland` node on the mainnet binary, syncing continuously (see `misc/deployments/mainnet.gno.land/VALIDATOR.md`; its governance halts stop it during the initial sync — restart it each time). `scripts/refresh-golden.sh` then makes the golden copy: it stops the node, reflinks its two DBs into a new snapshot, restarts it and repoints `golden`. Use XFS or btrfs so copies are instant and free.
-- **The server**: `go build` in this directory. It runs on the host (not in a container), with git. In local mode it also needs [microsandbox](https://microsandbox.dev) (`msb`, which needs KVM) for the job sandboxes in the example config, and 9 GB of RAM per concurrent replay.
+- **The server**: `go build` in this directory. It runs on the host (not in a container), with git. In local mode it also needs [microsandbox](https://microsandbox.dev) (`msb`, which needs KVM) for the job sandboxes in the example config, and 9 GB of RAM per concurrent replay; create the shared caches its mounts expect: `mkdir -p <data_dir>/gomod <data_dir>/gocache`.
 - **A read-only GitHub token** in `github.token_file`, for the GitHub API's rate limit and for private repos:
   - fine-grained (preferred): repositories `gnolang/gno` and `gnolang/gno-fixes`, permissions *Contents: read-only* and *Pull requests: read-only* (the org may need to approve it);
   - or classic with **no scopes**, if only public repos are tracked: it can read them, and nothing else. (A classic token that can read a private repo needs the `repo` scope, which can also write: don't.)
@@ -80,7 +80,7 @@ What the box needs in both cases (except where noted):
 PR code is untrusted.
 
 - **Worker machines** hold nothing but their own job: the coordinator checks out the commit and serves it, with the chain data, on its private address to a token valid for that job only, and takes the report back the same way. They get no GitHub or cloud credentials, and no inbound connections from the internet (cloud firewall). They live in a private network of their own, so they can't reach anything but the coordinator's worker endpoint (and each other's SSH, which takes keys only); they keep outbound internet access for Go and its modules. A worker is reinstalled from scratch, its disk wiped, before each job: a job's PR code runs as root, and must not reach the next job, e.g. a `gno-fixes` one's source.
-- **Local mode**: builds and replays run in microsandbox VMs that mount only the data dir, with a minimal environment; the replay VM has no network.
+- **Local mode**: builds and replays run in microsandbox VMs that mount only the job's own directory (and the shared Go caches while building), with a minimal environment; the replay VM has no network.
 
 The GitHub token stays on the coordinator: it goes to `git fetch` there through that command's environment only. Keep the token, OAuth secret and viewers files outside `data_dir` (which holds `session.key`, the key signing session cookies, created on first start).
 

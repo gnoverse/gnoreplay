@@ -19,6 +19,8 @@ func newTestQueue(t *testing.T) *Queue {
 }
 
 // A database from before the added columns gets them, and keeps its jobs.
+// Its jobs table is the one 8c3386e (Oct 6) shipped: no outcome, summary,
+// started_at, base_id, title, author, replay_sha, replay_note or progress.
 func TestMigrate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "jobs.db")
 	db, err := sql.Open("sqlite", path)
@@ -27,8 +29,7 @@ func TestMigrate(t *testing.T) {
 		id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, repo TEXT NOT NULL, event TEXT NOT NULL,
 		branch TEXT NOT NULL, pr INTEGER NOT NULL DEFAULT 0, sha TEXT NOT NULL, priority INTEGER NOT NULL,
 		state TEXT NOT NULL, enqueued_at INTEGER NOT NULL, finished_at INTEGER NOT NULL DEFAULT 0,
-		report_path TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
-		error TEXT NOT NULL DEFAULT '');
+		secret TEXT NOT NULL DEFAULT '', report_path TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '');
 		INSERT INTO jobs (key, repo, event, branch, sha, priority, state, enqueued_at)
 		VALUES ('gnolang/gno#branch/master', 'gnolang/gno', 'push', 'master', 'abc', 3, 'done', 1);`)
 	require.NoError(t, err)
@@ -254,7 +255,7 @@ func TestCancelKey(t *testing.T) {
 	require.Len(t, jobs, 1)
 	assert.Equal(t, stateSuperseded, jobs[0].State)
 	// Recent lists jobs that ran to an end.
-	recent, err := q.Recent(10)
+	recent, err := q.Recent(nil, 10)
 	require.NoError(t, err)
 	assert.Empty(t, recent)
 }

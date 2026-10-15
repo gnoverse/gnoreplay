@@ -64,6 +64,12 @@ func TestHetznerExampleConfig(t *testing.T) {
 	assert.ErrorContains(t, cfg.validate(), "must be below hetzner.max_age")
 	cfg.Job.RunTimeout.Duration = time.Hour
 
+	// The watchdog scripts delete a worker on one job after 4h, whatever the
+	// server's own limits allow.
+	cfg.Hetzner.MaxAge.Duration = 5 * time.Hour
+	assert.ErrorContains(t, cfg.validate(), "must not exceed")
+	cfg.Hetzner.MaxAge.Duration = 4 * time.Hour
+
 	// Workers must get a network of their own and an SSH key.
 	cfg.Hetzner.Network = 0
 	assert.ErrorContains(t, cfg.validate(), "hetzner.network")

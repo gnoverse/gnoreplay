@@ -89,8 +89,9 @@ type HetznerConfig struct {
 	GoMemLimit string `toml:"go_mem_limit"`
 	// MaxAge is how long a worker may run one job, from when it was given
 	// it, whatever the job's state: the worker is then deleted (and its job
-	// cancelled). job.run_timeout must leave room for the worker's boot and
-	// build.
+	// cancelled). It may not exceed maxWorkerAge, the cap the watchdog
+	// scripts enforce. job.run_timeout must leave room for the worker's
+	// boot and build.
 	MaxAge Duration `toml:"max_age"`
 }
 
@@ -154,6 +155,12 @@ func (d *Duration) UnmarshalText(b []byte) error {
 }
 
 func (d Duration) MarshalText() ([]byte, error) { return []byte(d.String()), nil }
+
+// maxWorkerAge is the cap the watchers enforce independently of the server:
+// deploy/watchdog.sh and .github/workflows/worker-watchdog.yml delete a
+// worker that has run one job for over 4h, whatever the server's own limits
+// say.
+const maxWorkerAge = 4 * time.Hour
 
 // defaultRules is the agreed priority order.
 var defaultRules = []Rule{
@@ -268,6 +275,8 @@ func (c *Config) validate() error {
 			return fmt.Errorf("hetzner.ssh_keys is required (otherwise every server's root password is emailed)")
 		case h.Listen == "" || h.URL == "":
 			return fmt.Errorf("hetzner.listen and hetzner.url are required")
+		case h.MaxAge.Duration > maxWorkerAge:
+			return fmt.Errorf("hetzner.max_age (%s) must not exceed %s: the watchdog scripts delete a worker after that, whatever the server allows", h.MaxAge, maxWorkerAge)
 		case c.Job.RunTimeout.Duration >= h.MaxAge.Duration:
 			return fmt.Errorf("job.run_timeout (%s) must be below hetzner.max_age (%s)", c.Job.RunTimeout, h.MaxAge)
 		}

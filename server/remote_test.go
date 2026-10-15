@@ -633,3 +633,33 @@ func TestWorkerScriptPowerOff(t *testing.T) {
 	// ...unless disabled (tests).
 	assert.Contains(t, render("0"), "if [ 0 -gt 0 ]")
 }
+
+// A restart without a provisioner, e.g. after removing [hetzner] from the
+// config, must not leave the jobs a previous process ran on worker machines
+// running forever: their machines are beyond reach, so the sessions go and
+// the jobs run again.
+func TestStartWithoutProvisionerRequeuesSessions(t *testing.T) {
+	cfg := &Config{DataDir: t.TempDir()}
+	cfg.setDefaults()
+	q := newTestQueue(t)
+	srv := newServer(cfg, q, newFakeGitHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPush, "master", 0, "abc"))
+	j, err := q.Claim()
+	require.NoError(t, err)
+	require.NoError(t, q.SaveSession(StoredSession{JobID: j.ID, TokenHash: []byte("hash"), Created: time.Now()}))
+
+	resume, err := srv.start(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, resume)
+
+	got, err := q.Get(j.ID)
+	require.NoError(t, err)
+	assert.Equal(t, stateQueued, got.State, "the job runs again, locally")
+	sessions, err := q.Sessions()
+	require.NoError(t, err)
+	assert.Empty(t, sessions)
+	next, err := q.Claim()
+	require.NoError(t, err)
+	require.NotNil(t, next)
+}

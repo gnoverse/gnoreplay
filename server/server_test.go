@@ -109,8 +109,16 @@ func main() {
 		panic("GNOROOT not set")
 	}
 	// Run through a local sandbox prefix (env SANDBOX_JOB={job} ...).
-	if job, ok := os.LookupEnv("SANDBOX_JOB"); ok && (job == "{job}" || os.Getenv("SANDBOX_SRC") != root) {
-		panic("{job} or {src} not substituted in the sandbox prefix")
+	if job, ok := os.LookupEnv("SANDBOX_JOB"); ok {
+		if job == "{job}" || os.Getenv("SANDBOX_SRC") != root {
+			panic("{job} or {src} not substituted in the sandbox prefix")
+		}
+		if dir := os.Getenv("SANDBOX_JOBDIR"); !strings.HasSuffix(dir, "/jobs/"+job) {
+			panic("{jobdir} not substituted in the sandbox prefix")
+		}
+		if os.Getenv("SANDBOX_DATA") == "{data}" || os.Getenv("SANDBOX_DATA") == "" {
+			panic("{data} not substituted in the sandbox prefix")
+		}
 	}
 	if bz, err := os.ReadFile(filepath.Join(root, "fake-sleep")); err == nil {
 		d, _ := time.ParseDuration(strings.TrimSpace(string(bz)))
@@ -225,7 +233,7 @@ func TestServerEndToEnd(t *testing.T) {
 		Job: JobConfig{
 			GnoreplayOverlay: overlay,
 			// A stand-in for a VM sandbox: it must get the job and checkout.
-			RunSandbox:     []string{"env", "SANDBOX_JOB={job}", "SANDBOX_SRC={src}"},
+			RunSandbox:     []string{"env", "SANDBOX_JOB={job}", "SANDBOX_SRC={src}", "SANDBOX_JOBDIR={jobdir}", "SANDBOX_DATA={data}"},
 			CleanupCommand: []string{"touch", filepath.Join(root, "cleaned-{job}")},
 		},
 	}

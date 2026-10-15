@@ -158,8 +158,13 @@ func TestSignIn(t *testing.T) {
 	res.Body.Close()
 	assert.Equal(t, http.StatusNotFound, status(alice, "/jobs/1"))
 
-	// Sign-in only sends back to this server.
-	for _, next := range []string{"//evil.example/x", "https://evil.example", "/\\evil.example"} {
+	// Sign-in only sends back to this server, and never carries a control
+	// character: browsers drop tab and newline before parsing URLs, which
+	// would turn them into cross-site ones.
+	for _, next := range []string{
+		"//evil.example/x", "https://evil.example", "/\\evil.example",
+		"/\t/evil.example", "/\n/evil.example", "/\x7f/evil.example",
+	} {
 		c := newJar(t)
 		code, loc := signIn(t, c, httpSrv.URL, "alice-code", next)
 		require.Equal(t, http.StatusFound, code)

@@ -304,11 +304,22 @@ type resumable struct {
 // again, and the other machines are idle.
 func (s *Server) start(ctx context.Context) ([]resumable, error) {
 	var resume []resumable
-	if s.prov != nil {
-		stored, err := s.queue.Sessions()
-		if err != nil {
-			return nil, err
+	stored, err := s.queue.Sessions()
+	if err != nil {
+		return nil, err
+	}
+	if s.prov == nil {
+		// No provisioner: their machines are beyond reach, so the jobs run
+		// again (Requeue below) instead of staying running forever.
+		if len(stored) > 0 {
+			s.logger.Info("no provisioner: jobs left on worker machines run again", "count", len(stored))
 		}
+		for _, st := range stored {
+			if err := s.queue.DeleteSession(st.JobID); err != nil {
+				return nil, err
+			}
+		}
+	} else {
 		machines, err := s.prov.List(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("list worker machines: %w", err)
