@@ -131,17 +131,48 @@ func (a versionApp) Info(req abci.RequestInfo) abci.ResponseInfo {
 	return res
 }
 
+// deferringApp simulates a binary that holds its commits in memory between
+// flush points (gnolang/gno#6334): it asks for one after the block at
+// flushAt, and its block at panicAt panics while it holds, as an iterator over
+// the held writes does.
+type deferringApp struct {
+	abci.Application
+	flushAt, panicAt int64
+	holding          bool
+	height           int64
+	flushes          []int64 // the height of each flush point
+}
+
+func (a *deferringApp) DeferCommits(on bool) bool { a.holding = on; return true }
+func (a *deferringApp) WriteCommits() error       { a.flushes = append(a.flushes, a.height); return nil }
+func (a *deferringApp) HeldBytes() int64          { return 0 }
+func (a *deferringApp) NeedsFlushPoint() bool     { return a.height == a.flushAt }
+
+func (a *deferringApp) BeginBlock(req abci.RequestBeginBlock) abci.ResponseBeginBlock {
+	a.height = req.Header.GetHeight()
+	if a.holding && a.height == a.panicAt {
+		panic("iterator over held writes")
+	}
+	return a.Application.BeginBlock(req)
+}
+
 func TestReplay(t *testing.T) {
 	if testing.Short() {
-		// Boots a node and replays its chain six times.
+		// Boots a node and replays its chain eight times.
 		t.Skip("skipping in -short mode")
 	}
 	src, genDoc := recordChain(t)
 	tip := src.Blocks.Height()
 
 	t.Run("same binary", func(t *testing.T) {
-		r, err := replay(src, newTestApp(t), memdb.NewMemDB(), replayOptions{Genesis: genDoc})
+		app := newTestApp(t)
+		r, err := replay(src, app, memdb.NewMemDB(), replayOptions{Genesis: genDoc})
 		require.NoError(t, err)
+		if _, ok := app.(deferredCommitter); ok {
+			assert.Positive(t, r.FlushPoints, "the app's commits are held, as in block sync")
+		} else {
+			assert.Zero(t, r.FlushPoints)
+		}
 		assert.Equal(t, tip, r.ToHeight)
 		assert.EqualValues(t, tip, r.Blocks)
 		assert.EqualValues(t, 3, r.Txs)
@@ -212,6 +243,28 @@ func TestReplay(t *testing.T) {
 		require.Equal(t, 1, r.Counts.Block)
 		assert.EqualValues(t, 1, r.Diffs[0].Height)
 		assert.Equal(t, "validator updates differ", r.Diffs[0].Detail)
+	})
+
+	t.Run("held commits", func(t *testing.T) {
+		require.GreaterOrEqual(t, tip, int64(2))
+		app := &deferringApp{Application: newTestApp(t), flushAt: 1}
+		r, err := replay(src, app, memdb.NewMemDB(), replayOptions{Genesis: genDoc})
+		require.NoError(t, err)
+		assert.EqualValues(t, tip, r.Blocks)
+		assert.Empty(t, r.Diffs)
+		// The one asked for, and the last; a slow block can add more.
+		assert.Contains(t, app.flushes, int64(1))
+		assert.Equal(t, tip, app.flushes[len(app.flushes)-1])
+		assert.EqualValues(t, len(app.flushes), r.FlushPoints)
+
+		app = &deferringApp{Application: newTestApp(t), panicAt: 2}
+		r, err = replay(src, app, memdb.NewMemDB(), replayOptions{Genesis: genDoc})
+		require.NoError(t, err)
+		assert.EqualValues(t, 1, r.Blocks)
+		assert.EqualValues(t, 2, r.ToHeight)
+		require.Equal(t, 1, r.Counts.Block)
+		assert.Equal(t, "block not applied: panic: iterator over held writes", r.Diffs[0].Detail)
+		assert.NotContains(t, app.flushes, int64(2), "a node that stops at a block loses what the app holds")
 	})
 
 	t.Run("rejected block", func(t *testing.T) {

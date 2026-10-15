@@ -36,6 +36,9 @@ type Report struct {
 	FirstAppHashMismatch int64 `json:"first_app_hash_mismatch,omitempty"`
 	// MissingResponses counts heights with no recorded responses to compare.
 	MissingResponses int64 `json:"missing_responses,omitempty"`
+	// FlushPoints counts the writes of the app's commits, held in memory
+	// between them as block sync holds them; 0 if the app writes each one.
+	FlushPoints int64 `json:"flush_points,omitempty"`
 
 	Counts struct {
 		Result int `json:"result"`
@@ -207,6 +210,9 @@ func (r *Report) Summary() string {
 	}
 	if r.MissingResponses > 0 {
 		fmt.Fprintf(&b, "%d heights had no recorded responses to compare\n", r.MissingResponses)
+	}
+	if r.FlushPoints > 0 {
+		fmt.Fprintf(&b, "app commits held in memory between flush points: %d\n", r.FlushPoints)
 	}
 	return b.String()
 }

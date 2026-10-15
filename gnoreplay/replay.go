@@ -29,6 +29,22 @@ type Source struct {
 	StateDB dbm.DB
 }
 
+// Block sync's flush points (tm2/pkg/bft/blockchain): at least every second,
+// and when the app holds more than 64 MiB or asks for one.
+const (
+	flushPointInterval = time.Second
+	flushPointBytes    = 64 << 20
+)
+
+// deferredCommitter is tm2's abci.DeferredCommitter (gnolang/gno#6334),
+// declared here so that the tool still builds on trees without it.
+type deferredCommitter interface {
+	DeferCommits(on bool) bool
+	WriteCommits() error
+	HeldBytes() int64
+	NeedsFlushPoint() bool
+}
+
 type replayOptions struct {
 	Genesis     *bft.GenesisDoc
 	ToHeight    int64 // last height to replay; 0 means the source tip
@@ -105,6 +121,24 @@ func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions
 	blocksStart := time.Now()
 	lastLog := time.Now()
 
+	// Where the app can, block sync holds its commits in memory and writes
+	// them at flush points: so does the replay, as how the app holds them
+	// changes what its blocks read. tm2's state is written as before: holding
+	// it only matters to a node's crash recovery.
+	deferred, _ := app.(deferredCommitter)
+	if deferred != nil && !deferred.DeferCommits(true) {
+		deferred = nil
+	}
+	lastFlush := time.Now()
+	flushPoint := func(height int64) error {
+		if err := deferred.WriteCommits(); err != nil {
+			return fmt.Errorf("write the app's commits up to height %d: %w", height, err)
+		}
+		r.FlushPoints++
+		lastFlush = time.Now()
+		return nil
+	}
+
 	for height := firstHeight; height <= tip; height++ {
 		block := src.Blocks.LoadBlock(height)
 		meta := src.Blocks.LoadBlockMeta(height)
@@ -121,11 +155,13 @@ func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions
 			baseApp.SetHaltHeight(0)
 		}
 
-		next, err := blockExec.ApplyBlock(state, meta.BlockID, block)
+		next, err := applyBlock(blockExec, state, meta.BlockID, block)
 		if err != nil {
-			// A node built from this code would stop here too.
+			// A node built from this code would stop here too, and lose
+			// what the app holds.
 			r.addBlockDiff(height, fmt.Sprintf("block not applied: %v", err))
 			r.ToHeight = height
+			deferred = nil
 			break
 		}
 		got, err := sm.LoadABCIResponses(stateDB, height)
@@ -190,6 +226,13 @@ func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions
 		}
 		state = next
 
+		if deferred != nil && (time.Since(lastFlush) >= flushPointInterval ||
+			deferred.HeldBytes() > flushPointBytes || deferred.NeedsFlushPoint()) {
+			if err := flushPoint(height); err != nil {
+				return nil, err
+			}
+		}
+
 		if time.Since(lastLog) > 30*time.Second {
 			lastLog = time.Now()
 			logger.Info("replaying", "height", height, "tip", tip,
@@ -198,9 +241,27 @@ func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions
 		}
 	}
 
+	// As block sync does before it switches to consensus.
+	if deferred != nil {
+		if err := flushPoint(state.LastBlockHeight); err != nil {
+			return nil, err
+		}
+	}
 	r.Timing.BlocksSeconds = time.Since(blocksStart).Seconds()
 	r.Timing.TotalSeconds = time.Since(start).Seconds()
 	return r, nil
+}
+
+// applyBlock is blockExec.ApplyBlock, with a panic returned as an error: the
+// node would stop at the block too. One is an iterator over the app's
+// database inside a block while its commits are held.
+func applyBlock(blockExec *sm.BlockExecutor, state sm.State, id bft.BlockID, block *bft.Block) (next sm.State, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("panic: %v", p)
+		}
+	}()
+	return blockExec.ApplyBlock(state, id, block)
 }
 
 // loadResponses returns the recorded responses for height, or nil if none
