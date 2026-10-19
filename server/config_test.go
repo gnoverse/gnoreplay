@@ -52,7 +52,7 @@ func TestExampleConfig(t *testing.T) {
 func TestHetznerExampleConfig(t *testing.T) {
 	cfg := loadExample(t, "config.hetzner.example.toml")
 	require.NotNil(t, cfg.Hetzner)
-	assert.Equal(t, "cpx42", cfg.Hetzner.ServerType)
+	assert.Equal(t, "ccx13", cfg.Hetzner.ServerType)
 	assert.Equal(t, "ubuntu-24.04", cfg.Hetzner.Image)
 	assert.Equal(t, []int64{12345678}, cfg.Hetzner.SSHKeys)
 	assert.Equal(t, defaultRules, cfg.Rules)

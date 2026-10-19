@@ -5,7 +5,7 @@ One always-on **coordinator** server runs the server and keeps a recent copy of 
 | | Type | Cost |
 |---|---|---|
 | Coordinator | 1 vCPU, 2 GB, 40 GB disk (`cpx12`) | €13.49/month |
-| Worker | 16 GB of RAM (`[hetzner] server_type`, e.g. `cpx42`) | €0.13/h for a `cpx42`, by the started hour; at most `workers` at once; a replay takes ~2 h |
+| Worker | 2 dedicated vCPUs, 8 GB (`[hetzner] server_type = "ccx13"`, `go_mem_limit = "6GiB"`) | $0.081/h, by the started hour; a replay takes about an hour; at most `workers` at once |
 
 ## 1. Project setup (once)
 
@@ -134,7 +134,7 @@ To stop everything at once: `systemctl stop gnoreplay-server && hcloud server li
 
 - Worker servers are named `gnoreplay-worker-<random>` and labelled `gnoreplay=worker`, `gnoreplay-job=<id>` while they run a job, and `gnoreplay-since=<Unix time>` (when they got their job, or became idle). A worker whose replay ends (done, failed, superseded or timed out) becomes idle: the next replay reinstalls it with its own startup script (Hetzner's rebuild, which wipes its disk), so that nothing of a replay, whose PR code ran as root, reaches the next one. Idle workers are deleted in the last 5 minutes of their billing hour.
 - Restarting the server (e.g. to deploy) keeps running replays: it leaves their workers running, and the next process resumes them, within the same time limits; it takes the other workers as idle ones. Deploy within a few minutes of stopping: that is how long workers retry posting a result to a stopped server.
-- If Hetzner refuses a new worker (out of capacity, or over the project's core limit: each `cpx42` counts 8 shared cores, and `workers` of them plus the coordinator's must fit), the job keeps its place and retries every minute, taking a worker that becomes idle meanwhile, until its `run_timeout`. Its log says why.
+- If Hetzner refuses a new worker (out of capacity, or over the project's core limit: each `ccx13` counts 2 dedicated cores, a `cpx42` 8 shared ones, and `workers` of them must fit, plus the coordinator's shared ones), the job keeps its place and retries every minute, taking a worker that becomes idle meanwhile, until its `run_timeout`. Its log says why.
 - After a change to how results are rendered, run `gnoreplay-server -config /etc/gnoreplay/config.toml rerender` (as the `gnoreplay` user) to update the pages of past replays.
 - A running replay's progress (its height, and the time left at its pace so far) is on its job's page and in `/queue`: the worker posts it every minute. The replay's own log, with a line every 30 seconds, is in `/root/gnoreplay/<job>/worker.log` on the worker while it runs (SSH in through the coordinator, over the private network: `ssh -A root@<coordinator>` then `ssh root@10.0.0.<n>`), and in its job's page when it fails.
 - The chain data refreshes are logged in `journalctl -u gnoreplay-golden`: a failed one leaves replays on the previous copy.

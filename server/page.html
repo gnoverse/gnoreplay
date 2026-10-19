@@ -129,7 +129,7 @@ gnoreplay replays gno.land mainnet's history with each change. Results are advis
 </ul>
 <p>A PR is replayed merged into its base branch (GitHub's test merge, what CI tests), so what its branch lacks from the base doesn't show as divergences. When it conflicts, its head is replayed as is, and its page says so.</p>
 <p>A divergence is not necessarily a bug: intended behavior changes are expected to be gated by height, or shipped through a coordinated upgrade.</p>
-<p>GitHub is polled every {{.PollInterval}}. Each new head is queued in the priority order below, superseding its PR's or branch's previous replay, and replayed on a worker machine reinstalled from scratch for it: up to {{.Workers}} at once, about 1h45m each (at most {{.RunTimeoutMinutes}} minutes). PRs that were already open when the server started are replayed from their next push. The server only reads from GitHub: it posts no statuses or comments, results are published here only.</p>
+<p>GitHub is polled every {{.PollInterval}}. Each new head is queued in the priority order below, superseding its PR's or branch's previous replay, and replayed on a worker machine reinstalled from scratch for it: up to {{.Workers}} at once, about an hour each (at most {{.RunTimeoutMinutes}} minutes). PRs that were already open when the server started are replayed from their next push. The server only reads from GitHub: it posts no statuses or comments, results are published here only.</p>
 {{with .Rules}}<p>What is checked, in priority order:</p>
 <ol>{{range .}}<li>{{.}}</li>{{end}}</ol>{{end}}
 </details>

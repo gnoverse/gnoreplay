@@ -7,7 +7,8 @@ data_dir = "/var/lib/gnoreplay"
 # Worker servers running replays at once (~2 h each). Each is billed by the
 # started hour while it exists: a worker that finished a replay runs the next
 # one, and an idle one is deleted at the end of its billing hour. Their cores
-# and the coordinator's must fit the project's core limit (a cpx42 has 8).
+# must fit the project's limit (a ccx13 has 2 dedicated cores, counted apart
+# from shared ones).
 workers = 2
 
 [github]
@@ -32,8 +33,10 @@ run_timeout = "3h30m"
 # An API token (read & write) of the project the workers are created in.
 token_file = "/etc/gnoreplay/hetzner-token"
 location = "hel1"
-# At least 16 GB of RAM (the replay's genesis commit peaks above 8 GB).
-server_type = "cpx42"
+# 2 dedicated vCPUs and 8 GB: a full replay takes about an hour (~$0.08), as
+# on 8 shared vCPUs (cpx42) at 62% of the price. With 8 GB, go_mem_limit must
+# be 6GiB (the genesis commit peaks above 8 GB without a limit).
+server_type = "ccx13"
 image = "ubuntu-24.04"
 # The ID of the private network the coordinator and workers share, used by
 # nothing else (`hcloud network list`).
@@ -45,7 +48,7 @@ ssh_keys = [12345678]
 listen = "10.0.0.2:8081"
 url = "http://10.0.0.2:8081"
 go_version = "1.26.1"
-go_mem_limit = "12GiB"
+go_mem_limit = "6GiB"
 # Hard cap on how long a worker runs one replay, from when it was given it:
 # the worker is then deleted, whatever the replay's state (by the server
 # every minute, and by deploy/watchdog.sh independently of it). Workers also
