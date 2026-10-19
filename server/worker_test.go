@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -200,4 +201,25 @@ func main() {
 	require.NoError(t, err)
 	assert.Contains(t, string(bz), "swapped", "the copy command simulated a refresh between the copies")
 	assert.Contains(t, report.Diffs[0].Detail, "blockstore=golden-A state=golden-A", "both DBs come from one snapshot")
+}
+
+// The replay flags come from one list, shared by the local runner and the
+// worker script's ReplayArgs, so a flag cannot be added to one runner and not
+// the other (see worker.sh).
+func TestReplayToolArgs(t *testing.T) {
+	assert.Equal(t,
+		[]string{"--data-dir", "/d", "--genesis", "/g.json", "--work-dir", "/w", "--max-diffs", "0", "--out", "/r.json", "--log-level", "warn"},
+		replayToolArgs("/d", "/g.json", "/w", "/r.json", "", "warn"))
+	worker := replayToolArgs("data", "genesis.json", "work", "report.json", "progress.json", "")
+	assert.Equal(t,
+		[]string{"--data-dir", "data", "--genesis", "genesis.json", "--work-dir", "work", "--max-diffs", "0", "--out", "report.json", "--progress", "progress.json"},
+		worker)
+
+	var b strings.Builder
+	require.NoError(t, workerTmpl.Execute(&b, map[string]string{
+		"URL": "u", "JobID": "1", "Token": "t", "WorkDir": "/w",
+		"GoVersion": "1", "GoMemLimit": "1GiB", "PowerOffMinutes": "0", "ProgressSeconds": "60",
+		"ReplayArgs": shellJoin(worker),
+	}))
+	assert.Contains(t, b.String(), `./gnoreplay '--data-dir' 'data'`)
 }

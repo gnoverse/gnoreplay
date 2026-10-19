@@ -121,6 +121,9 @@ func (s *Server) work(ctx context.Context, resume <-chan resumable) {
 	}
 }
 
+// errRetry cancels a job whose worker machine is gone: the job runs again.
+var errRetry = errors.New("the job's worker machine is gone: it runs again")
+
 func (s *Server) runJob(ctx context.Context, j *Job) {
 	s.track(ctx, j, func(ctx context.Context, logger *slog.Logger) (*Report, string, error) {
 		return s.replay(ctx, j, logger)
@@ -143,18 +146,18 @@ func (s *Server) track(ctx context.Context, j *Job, replay func(context.Context,
 
 	logger := s.logger.With("job", j.ID, "key", j.Key, "sha", j.SHA)
 
-	// The baseline is read before this job finishes, so a push job compares
-	// against the previous commit on its branch.
-	base, err := s.queue.Baseline(j.Repo, j.Branch, time.Now())
-	if err != nil {
-		logger.Error("load baseline", "err", err)
-	}
-
 	report, reportPath, err := replay(jobCtx, logger)
 	switch {
 	case err == nil:
 	case shuttingDown(jobCtx):
 		logger.Info("server stopping: replay left for the next start")
+		return
+	case errors.Is(context.Cause(jobCtx), errRetry):
+		if requeued, err := s.queue.RequeueJob(j.ID); err != nil {
+			logger.Error("requeue job", "err", err)
+		} else if requeued {
+			logger.Info("worker machine gone: the job runs again")
+		}
 		return
 	case jobCtx.Err() != nil:
 		// Recorded as failed, unless superseded or closed: the queue already
@@ -174,6 +177,14 @@ func (s *Server) track(ctx context.Context, j *Job, replay func(context.Context,
 		return
 	}
 
+	// The baseline is read now, just before this job is recorded: by then the
+	// replay of the commit a PR was merged into (j.BaseSHA) has finished if it
+	// is ever going to, and this job's own row is still running, so neither it
+	// nor a newer push job (which supersedes it) can be picked.
+	base, err := s.baselineFor(j, time.Now())
+	if err != nil {
+		logger.Error("load baseline", "err", err)
+	}
 	out, c, err := s.renderJob(j, report, reportPath, base)
 	if err != nil {
 		logger.Error("write job page", "err", err)
@@ -186,6 +197,64 @@ func (s *Server) track(ctx context.Context, j *Job, replay func(context.Context,
 		return
 	}
 	logger.Info("replay done", "outcome", out.Outcome, "new", len(c.New), "inherited", len(c.Inherited), "fixed", len(c.Fixed))
+	if j.Event == eventPush {
+		s.reclassifyAgainst(j.ID)
+	}
+}
+
+// baselineFor returns the job to classify j against: the replay of the commit
+// j was based on (j.BaseSHA, the test merge's base) when it has one, else the
+// latest completed replay of j's branch before at.
+func (s *Server) baselineFor(j *Job, at time.Time) (*Job, error) {
+	if j.BaseSHA != "" {
+		if base, err := s.queue.BaselineSHA(j.Repo, j.Branch, j.BaseSHA); err != nil {
+			return nil, err
+		} else if base != nil {
+			return base, nil
+		}
+	}
+	return s.queue.Baseline(j.Repo, j.Branch, at)
+}
+
+// reclassifyAgainst compares the done PR replays merged into the base commit
+// that just finished replaying (baseID) with it: they were classified against
+// an older baseline while it ran.
+func (s *Server) reclassifyAgainst(baseID int64) {
+	base, err := s.queue.Get(baseID)
+	if err != nil {
+		s.logger.Error("load base of replays to reclassify", "base", baseID, "err", err)
+		return
+	}
+	jobs, err := s.queue.DependentsOnBase(base.Repo, base.Branch, base.SHA)
+	if err != nil {
+		s.logger.Error("list replays to reclassify", "base", base.ID, "err", err)
+		return
+	}
+	for _, j := range jobs {
+		if j.BaseID == base.ID {
+			continue
+		}
+		out, _, err := s.renderStored(j, base)
+		if err != nil {
+			s.logger.Error("reclassify", "job", j.ID, "base", base.ID, "err", err)
+			continue
+		}
+		if err := s.queue.SetResult(j.ID, out.Outcome, out.Summary, base.ID); err != nil {
+			s.logger.Error("record reclassification", "job", j.ID, "err", err)
+			continue
+		}
+		s.logger.Info("reclassified against its base", "job", j.ID, "base", base.ID, "outcome", out.Outcome)
+	}
+}
+
+// renderStored renders a finished job's page again against base: the report
+// is on disk, the body next to it.
+func (s *Server) renderStored(j *Job, base *Job) (Outcome, Classification, error) {
+	report, err := readReport(j.ReportPath)
+	if err != nil {
+		return Outcome{}, Classification{}, err
+	}
+	return s.renderJob(j, report, j.ReportPath, base)
 }
 
 // renderJob classifies a job's report against its base job's, and writes the
@@ -340,14 +409,9 @@ func (s *Server) replayLocal(ctx context.Context, j *Job, jobDir, src, reportFil
 	step("replay")
 	runCtx, cancelRun := context.WithTimeout(ctx, s.cfg.Job.RunTimeout.Duration)
 	defer cancelRun()
-	err = s.run(runCtx, s.sandbox(s.cfg.Job.RunSandbox, j, src), jobDir, []string{"GNOROOT=" + src}, logFile, bin,
-		"--data-dir", dataDir,
-		"--genesis", s.cfg.Chain.Genesis,
-		"--work-dir", filepath.Join(jobDir, "work"),
-		"--max-diffs", "0",
-		"--out", reportFile,
-		"--log-level", "warn",
-	)
+	workDir := filepath.Join(jobDir, "work")
+	args := append([]string{bin}, replayToolArgs(dataDir, s.cfg.Chain.Genesis, workDir, reportFile, "", "warn")...)
+	err = s.run(runCtx, s.sandbox(s.cfg.Job.RunSandbox, j, src), jobDir, []string{"GNOROOT=" + src}, logFile, args[0], args[1:]...)
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 {
 		err = nil // diffs found: that's a result, not a failure
@@ -371,14 +435,15 @@ var (
 // base don't show as divergences; failing that (e.g. a conflict), the PR's
 // head, with a note saying why.
 func (s *Server) checkoutJob(ctx context.Context, j *Job, dst string, log io.Writer) error {
-	sha, note := j.SHA, ""
+	sha, note, baseSHA := j.SHA, "", ""
 	if j.Event == eventPullRequest {
 		merge, why := s.testMerge(ctx, j)
 		if merge != "" {
 			parents, err := s.checkout(ctx, j.Repo, merge, dst, log)
 			if err == nil && len(parents) == 2 && parents[1] == j.SHA {
 				sha = merge
-				note = fmt.Sprintf("this PR merged into %s at %s (GitHub's test merge)", j.Branch, shortSHA(parents[0]))
+				baseSHA = parents[0]
+				note = fmt.Sprintf("this PR merged into %s at %s (GitHub's test merge)", j.Branch, shortSHA(baseSHA))
 			} else {
 				fmt.Fprintf(log, "test merge %s unusable (parents %v, err %v)\n", merge, parents, err)
 				why = "its test merge could not be used"
@@ -397,8 +462,8 @@ func (s *Server) checkoutJob(ctx context.Context, j *Job, dst string, log io.Wri
 			return err
 		}
 	}
-	j.ReplaySHA, j.ReplayNote = sha, note
-	return s.queue.SetReplay(j.ID, sha, note)
+	j.ReplaySHA, j.ReplayNote, j.BaseSHA = sha, note, baseSHA
+	return s.queue.SetReplay(j.ID, sha, note, baseSHA)
 }
 
 // testMerge returns GitHub's test merge of PR job j, or "" and why there is
@@ -541,6 +606,24 @@ func (s *Server) sandbox(prefix []string, j *Job, src string) []string {
 		"{src}", src,
 		"{jobdir}", s.jobDir(j.ID),
 		"{data}", s.cfg.DataDir)
+}
+
+// replayToolArgs is the tool's argument list, shared by replayLocal and the
+// worker script (rendered into it as ReplayArgs), so a flag cannot be added
+// to one runner and not the other. progress is where the tool writes its
+// progress JSON (empty: none), logLevel its log level (empty: its default).
+func replayToolArgs(dataDir, genesis, workDir, out, progress, logLevel string) []string {
+	args := []string{
+		"--data-dir", dataDir, "--genesis", genesis, "--work-dir", workDir,
+		"--max-diffs", "0", "--out", out,
+	}
+	if progress != "" {
+		args = append(args, "--progress", progress)
+	}
+	if logLevel != "" {
+		args = append(args, "--log-level", logLevel)
+	}
+	return args
 }
 
 func copyDir(src, dst string) error {

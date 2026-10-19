@@ -30,9 +30,8 @@ rm "$snap/snapshot.tar.zst"
 trap - EXIT
 echo "$snap: $file"
 
+prev=$(readlink "$GOLDEN_ROOT/golden" 2>/dev/null || true)
 ln -sfn "$snap" "$GOLDEN_ROOT/golden.tmp"
 mv -T "$GOLDEN_ROOT/golden.tmp" "$GOLDEN_ROOT/golden"
 
-# Keep the two most recent snapshots (a running job may still be copying
-# from the previous one).
-ls -1d "$GOLDEN_ROOT"/golden-* | sort | head -n -2 | xargs -r rm -rf
+GOLDEN_ROOT="$GOLDEN_ROOT" "$(dirname "$0")/golden-prune.sh" ${prev:+"$prev"}

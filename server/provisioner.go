@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -26,6 +27,9 @@ type Provisioner interface {
 	Rebuild(ctx context.Context, id, userData string) error
 	// SetLabels replaces a machine's labels.
 	SetLabels(ctx context.Context, id string, labels map[string]string) error
+	// Find returns the machine named name, or nil if there is none: a Create
+	// that booted a machine but failed to say so is found this way.
+	Find(ctx context.Context, name string) (*Machine, error)
 	// Delete deletes a machine; deleting one that is already gone succeeds.
 	Delete(ctx context.Context, id string) error
 	// List returns the worker machines that exist.
@@ -80,9 +84,39 @@ func (p *hetznerProvisioner) Create(ctx context.Context, name, userData string, 
 		Networks:   []*hcloud.Network{{ID: p.cfg.Network}},
 	})
 	if err != nil {
+		// A rate limit or an outage is worth retrying; a rejected request or
+		// a bad token is not, and retrying it would hold a job for hours.
+		switch {
+		case hcloud.IsError(err, hcloud.ErrorCodeUnauthorized),
+			hcloud.IsError(err, hcloud.ErrorCodeForbidden),
+			hcloud.IsError(err, hcloud.ErrorCodeInvalidInput),
+			hcloud.IsError(err, hcloud.ErrorCodeNotFound):
+			return Machine{}, permanentCreateError{err}
+		}
 		return Machine{}, err
 	}
 	return toMachine(res.Server), nil
+}
+
+// permanentCreateError is a provisioning failure that retrying cannot fix.
+type permanentCreateError struct{ error }
+
+func (p permanentCreateError) Unwrap() error { return p.error }
+
+// isPermanentCreateError reports whether err came from a Create that must not
+// be retried.
+func isPermanentCreateError(err error) bool {
+	var perm permanentCreateError
+	return errors.As(err, &perm)
+}
+
+func (p *hetznerProvisioner) Find(ctx context.Context, name string) (*Machine, error) {
+	s, _, err := p.c.Server.GetByName(ctx, name)
+	if err != nil || s == nil {
+		return nil, err
+	}
+	m := toMachine(s)
+	return &m, nil
 }
 
 func toMachine(s *hcloud.Server) Machine {

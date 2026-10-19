@@ -22,6 +22,11 @@ func (s *Server) pollLoop(ctx context.Context) {
 	}
 }
 
+// prHead is a PR's cursor value: the base is part of it, so a PR retargeted
+// to another base is seen as a new head and enqueued again, and the job that
+// runs carries the new base.
+func prHead(base, sha string) string { return base + "@" + sha }
+
 // pollRepo compares repo's tracked branch heads and open PRs with the heads
 // seen last time, and enqueues a replay for each new head: a push, a new PR,
 // or a push to a PR. Jobs of PRs that were closed are cancelled.
@@ -74,7 +79,20 @@ func (s *Server) pollRepo(ctx context.Context, repo string) error {
 	for _, h := range current {
 		key := jobKey(repo, h.event, h.branch, h.pr)
 		seen[key] = true
-		if heads[key] == h.sha {
+		cursor := h.sha
+		if h.event == eventPullRequest {
+			cursor = prHead(h.branch, h.sha)
+			// A cursor from before the base was part of it: the PR is not
+			// replayed again (every open PR would be, on the first pass
+			// after an upgrade), only its cursor is brought up to date.
+			if heads[key] == h.sha && h.sha != "" {
+				if err := s.queue.SetHead(key, repo, cursor); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+		if heads[key] == cursor {
 			continue
 		}
 		// On the first pass, PRs that are already open are only recorded:
@@ -91,7 +109,7 @@ func (s *Server) pollRepo(ctx context.Context, repo string) error {
 				return err
 			}
 		}
-		if err := s.queue.SetHead(key, repo, h.sha); err != nil {
+		if err := s.queue.SetHead(key, repo, cursor); err != nil {
 			return err
 		}
 	}

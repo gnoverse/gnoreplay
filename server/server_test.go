@@ -108,6 +108,11 @@ func main() {
 	if root == "" {
 		panic("GNOROOT not set")
 	}
+	// Write a worker log over the fail route's cap, then fail.
+	if _, err := os.Stat(filepath.Join(root, "fake-loud")); err == nil {
+		os.Stderr.WriteString(strings.Repeat("loud\n", 1<<20))
+		os.Exit(1)
+	}
 	// Run through a local sandbox prefix (env SANDBOX_JOB={job} ...).
 	if job, ok := os.LookupEnv("SANDBOX_JOB"); ok {
 		if job == "{job}" || os.Getenv("SANDBOX_SRC") != root {
@@ -198,7 +203,6 @@ func TestServerEndToEnd(t *testing.T) {
 
 	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
 	broken := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, FirstAppHashMismatch: 12}
-	broken.Counts.Result = 1
 	broken.Diffs = []Diff{{
 		Kind: "result", Height: 12, Index: 0, TxHash: "AB12", Msgs: []string{"vm/exec gno.land/r/demo/foo.Bar"},
 		Recorded: &Result{GasUsed: 100}, Replayed: &Result{Error: "vm.VMError: <script>unexpected</script>", GasUsed: 90},
@@ -472,6 +476,71 @@ func TestServerEndToEnd(t *testing.T) {
 	}
 }
 
+// A PR retargeted to another base branch, same head, is enqueued again with
+// the new base: its job would otherwise be replayed merged into one branch
+// and compared against another.
+func TestPollRetargetedPR(t *testing.T) {
+	cfg := &Config{DataDir: t.TempDir()}
+	cfg.setDefaults()
+	q := newTestQueue(t)
+	gh := newFakeGitHub()
+	gh.branches["gnolang/gno@master"] = "mmm"
+	gh.branches["gnolang/gno@chain/mainnet"] = "ccc"
+	gh.branches["gnolang/gno-fixes@develop"] = "fff"
+	srv := newServer(cfg, q, gh, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+
+	gh.setPulls("gnolang/gno", PullRequest{Number: 1, Base: "master", HeadSHA: "bbb"})
+	require.NoError(t, srv.pollRepo(ctx, "gnolang/gno")) // first pass: records only
+
+	gh.setPulls("gnolang/gno", PullRequest{Number: 1, Base: "master", HeadSHA: "hhh"})
+	require.NoError(t, srv.pollRepo(ctx, "gnolang/gno")) // the push queues a replay
+
+	gh.setPulls("gnolang/gno", PullRequest{Number: 1, Base: "chain/mainnet", HeadSHA: "hhh"})
+	require.NoError(t, srv.pollRepo(ctx, "gnolang/gno"))
+	jobs, err := q.ByKey("gnolang/gno#pr/1", 10)
+	require.NoError(t, err)
+	require.Len(t, jobs, 2)
+	assert.Equal(t, "chain/mainnet", jobs[0].Branch, "the new job carries the new base")
+	assert.Equal(t, "master", jobs[1].Branch)
+	assert.Equal(t, stateSuperseded, jobs[1].State)
+}
+
+// enqueue records the head it queues, as the poller does: its next pass must
+// not treat the same commit as new and supersede the hand-queued replay, nor
+// record a docs-only PR as skipped over it.
+func TestEnqueueRecordsHead(t *testing.T) {
+	cfg := &Config{DataDir: t.TempDir()}
+	cfg.setDefaults()
+	q := newTestQueue(t)
+	gh := newFakeGitHub()
+	gh.branches["gnolang/gno@master"] = "mmm"
+	gh.branches["gnolang/gno@chain/mainnet"] = "ccc"
+	gh.branches["gnolang/gno-fixes@develop"] = "fff"
+	srv := newServer(cfg, q, gh, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+	require.NoError(t, srv.pollRepo(ctx, "gnolang/gno")) // sync: no PRs yet
+
+	// A PR the poller has not seen, enqueued by hand.
+	gh.setPulls("gnolang/gno", PullRequest{Number: 9, Base: "master", HeadSHA: "new"})
+	require.NoError(t, enqueueTarget(ctx, srv, "gnolang/gno", "9"))
+	require.NoError(t, srv.pollRepo(ctx, "gnolang/gno"))
+	jobs, err := q.ByKey("gnolang/gno#pr/9", 10)
+	require.NoError(t, err)
+	require.Len(t, jobs, 1)
+	assert.Equal(t, stateQueued, jobs[0].State, "the hand-queued replay is not superseded")
+
+	// A branch, likewise.
+	gh.branches["gnolang/gno@master"] = "mmm2"
+	require.NoError(t, enqueueTarget(ctx, srv, "gnolang/gno", "master"))
+	require.NoError(t, srv.pollRepo(ctx, "gnolang/gno"))
+	jobs, err = q.ByKey(jobKey("gnolang/gno", eventPush, "master", 0), 10)
+	require.NoError(t, err)
+	require.NotEmpty(t, jobs)
+	assert.Equal(t, "mmm2", jobs[0].SHA)
+	assert.Equal(t, stateQueued, jobs[0].State, "the hand-queued replay is not superseded")
+}
+
 // A PR is replayed merged into its base: what its branch lacks from the base
 // doesn't show. Without a usable test merge, its head is replayed, noted.
 func TestPullTestMerge(t *testing.T) {
@@ -553,6 +622,135 @@ func TestPullTestMerge(t *testing.T) {
 		assert.Equal(t, head, j.ReplaySHA, c.why)
 		assert.Equal(t, "the PR's head as is: "+c.why+", so what it lacks from master may show as divergences", j.ReplayNote)
 	}
+}
+
+// A PR is compared with the replay of the commit it is merged into, not with
+// whatever replay of the base branch happens to be done when it starts: while
+// that replay is missing, the page says so, and the job is compared again the
+// moment it finishes.
+func TestPullBaselineIsTheMergeBase(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	fastMergeRetry(t)
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote", "gnolang", "gno.git")
+	require.NoError(t, os.MkdirAll(remote, 0o755))
+	git(t, remote, "init", "-q")
+	git(t, remote, "config", "uploadpack.allowAnySHA1InWant", "true")
+
+	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
+	broken := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{{
+		Kind: "result", Height: 3, Index: 0, Recorded: &Result{}, Replayed: &Result{Error: "boom"},
+	}}}
+	m1 := commitReport(t, remote, clean, 0)
+	m2 := commitReport(t, remote, broken, 2)
+	head := commitReport(t, remote, broken, 2)
+	git(t, remote, "reset", "-q", "--hard", m2)
+	merge := git(t, remote, "commit-tree", m2+"^{tree}", "-p", m2, "-p", head, "-m", "test merge")
+
+	golden := filepath.Join(root, "golden")
+	require.NoError(t, os.MkdirAll(filepath.Join(golden, "db", "state.db"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(golden, "db", "state.db", "MARKER"), nil, 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(golden, "db", "blockstore.db"), 0o755))
+	overlay := filepath.Join(root, "overlay")
+	require.NoError(t, os.MkdirAll(overlay, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(overlay, "go.mod"), []byte("module fake\n\ngo 1.22\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(overlay, "main.go"), []byte(fakeTool), 0o644))
+	cfg := &Config{
+		DataDir: filepath.Join(root, "data"),
+		Chain:   ChainConfig{GoldenDir: golden, Genesis: filepath.Join(root, "genesis.json")},
+		GitHub:  GitHubConfig{GitURL: "file://" + filepath.Join(root, "remote") + "/"},
+		Job:     JobConfig{GnoreplayOverlay: overlay},
+	}
+	cfg.setDefaults()
+	q := newTestQueue(t)
+	gh := newFakeGitHub()
+	srv := newServer(cfg, q, gh, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+
+	run := func(j *Job) *Job {
+		t.Helper()
+		srv.runJob(ctx, j)
+		done, err := q.Get(j.ID)
+		require.NoError(t, err)
+		require.Equal(t, stateDone, done.State, done.Error)
+		return done
+	}
+
+	// m1's replay is done; m2's is claimed but still running.
+	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPush, "master", 0, m1))
+	m1job, err := q.Claim()
+	require.NoError(t, err)
+	m1done := run(m1job)
+	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPush, "master", 0, m2))
+	m2job, err := q.Claim()
+	require.NoError(t, err)
+	require.NotNil(t, m2job)
+
+	// The PR, merged into m2, is classified against m1, and says why.
+	yes := true
+	gh.setPulls("gnolang/gno", PullRequest{Number: 9, Base: "master", HeadSHA: head, Mergeable: &yes, MergeSHA: merge})
+	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPullRequest, "master", 9, head))
+	pr, err := q.Claim()
+	require.NoError(t, err)
+	prdone := run(pr)
+	assert.Equal(t, m1done.ID, prdone.BaseID)
+	assert.Contains(t, prdone.Summary, "1 new divergence(s)")
+	bz, err := os.ReadFile(bodyPath(prdone.ReportPath))
+	require.NoError(t, err)
+	assert.Contains(t, string(bz), "The merge base `"+shortSHA(m2)+"` had no finished replay")
+
+	// m2's replay finishes: the PR is compared against it, and the result
+	// stands corrected (the divergence was m2's, not the PR's).
+	run(m2job)
+	prdone, err = q.Get(prdone.ID)
+	require.NoError(t, err)
+	assert.Equal(t, m2job.ID, prdone.BaseID)
+	assert.Equal(t, outcomePass, prdone.Outcome)
+	assert.Contains(t, prdone.Summary, "No new divergences (1 inherited from master)")
+	bz, err = os.ReadFile(bodyPath(prdone.ReportPath))
+	require.NoError(t, err)
+	assert.Contains(t, string(bz), "Compared with `master` at commit `"+shortSHA(m2)+"`")
+
+	// A PR run after the merge base's replay is done is compared with it
+	// from the start.
+	gh.setPulls("gnolang/gno", PullRequest{Number: 10, Base: "master", HeadSHA: head, Mergeable: &yes, MergeSHA: merge})
+	require.NoError(t, srv.enqueueFor("gnolang/gno", eventPullRequest, "master", 10, head))
+	pr2, err := q.Claim()
+	require.NoError(t, err)
+	pr2done := run(pr2)
+	assert.Equal(t, m2job.ID, pr2done.BaseID)
+	assert.Contains(t, pr2done.Summary, "No new divergences")
+}
+
+// A cursor written before the base was part of a PR's (see prHead) must not
+// make the first poll after an upgrade replay every open PR: it is only
+// brought up to date.
+func TestPollUpgradesOldPRCursor(t *testing.T) {
+	cfg := &Config{DataDir: t.TempDir()}
+	cfg.setDefaults()
+	q := newTestQueue(t)
+	gh := newFakeGitHub()
+	gh.branches["gnolang/gno@master"] = "mmm"
+	gh.branches["gnolang/gno@chain/mainnet"] = "ccc"
+	gh.branches["gnolang/gno-fixes@develop"] = "fff"
+	srv := newServer(cfg, q, gh, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+	gh.setPulls("gnolang/gno", PullRequest{Number: 1, Base: "master", HeadSHA: "bbb"})
+	require.NoError(t, srv.pollRepo(ctx, "gnolang/gno")) // first pass: records only
+	require.NoError(t, srv.pollRepo(ctx, "gnolang/gno"))
+
+	// As a pre-upgrade process left it: the head alone.
+	key := jobKey("gnolang/gno", eventPullRequest, "master", 1)
+	require.NoError(t, q.SetHead(key, "gnolang/gno", "bbb"))
+	require.NoError(t, srv.pollRepo(ctx, "gnolang/gno"))
+	jobs, err := q.ByKey(key, 10)
+	require.NoError(t, err)
+	assert.Empty(t, jobs, "no replay is enqueued for a PR that did not change")
+	heads, err := q.Heads("gnolang/gno")
+	require.NoError(t, err)
+	assert.Equal(t, prHead("master", "bbb"), heads[key], "its cursor is upgraded")
 }
 
 func TestPollErrorKeepsHeads(t *testing.T) {

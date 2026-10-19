@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"slices"
@@ -180,13 +181,16 @@ const (
 	anyBranch = "*"
 )
 
+// loadConfig reads a config file. Unknown keys are refused: a typo must not
+// silently change the mode the server runs in (e.g. [hetzners] leaving it
+// local, or a misplaced max_age).
 func loadConfig(path string) (*Config, error) {
 	bz, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 	cfg := &Config{}
-	if err := toml.Unmarshal(bz, cfg); err != nil {
+	if err := toml.NewDecoder(bytes.NewReader(bz)).DisallowUnknownFields().Decode(cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	cfg.setDefaults()

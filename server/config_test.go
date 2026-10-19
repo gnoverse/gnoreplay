@@ -1,27 +1,41 @@
 package main
 
 import (
-	"bytes"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/pelletier/go-toml/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// loadExample loads an example config, failing on keys the config does not
-// know: they would be a stale example.
+// loadExample loads an example config: loadConfig refuses unknown keys, so a
+// stale example fails here.
 func loadExample(t *testing.T, path string) *Config {
 	t.Helper()
-	bz, err := os.ReadFile(path)
-	require.NoError(t, err)
-	var strict Config
-	require.NoError(t, toml.NewDecoder(bytes.NewReader(bz)).DisallowUnknownFields().Decode(&strict))
 	cfg, err := loadConfig(path)
 	require.NoError(t, err)
 	return cfg
+}
+
+// A typo must not silently change the mode the server runs in.
+func TestUnknownConfigKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+data_dir = "/d"
+[github]
+token_file = "/t"
+[chain]
+golden_dir = "/g"
+genesis = "/g.json"
+[job]
+gnoreplay_overlay = "/o"
+[hetzners]
+token_file = "/h"
+`), 0o644))
+	_, err := loadConfig(path)
+	assert.ErrorContains(t, err, "strict mode")
 }
 
 func TestExampleConfig(t *testing.T) {

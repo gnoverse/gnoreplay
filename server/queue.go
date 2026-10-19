@@ -45,6 +45,10 @@ type Job struct {
 	// push, GitHub's test merge of the PR into its base for a PR when there
 	// is one. ReplayNote says which, for PRs.
 	ReplaySHA, ReplayNote string
+	// BaseSHA is the commit a replay was based on: the test merge's first
+	// parent for a PR. The comparison baseline is its replay when it has
+	// one, not whatever the base branch's latest replay happens to be.
+	BaseSHA string
 	// Outcome is set when the job is done: outcomePass or outcomeDiverges,
 	// with a one-line Summary.
 	Outcome string
@@ -102,6 +106,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 	author      TEXT    NOT NULL DEFAULT '',
 	replay_sha  TEXT    NOT NULL DEFAULT '',
 	replay_note TEXT    NOT NULL DEFAULT '',
+	base_sha    TEXT    NOT NULL DEFAULT '',
 	progress    TEXT    NOT NULL DEFAULT '' -- JSON Progress
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state, priority, enqueued_at);
@@ -136,6 +141,7 @@ var addedColumns = []struct{ table, column, decl string }{
 	{"jobs", "author", "TEXT NOT NULL DEFAULT ''"},
 	{"jobs", "replay_sha", "TEXT NOT NULL DEFAULT ''"},
 	{"jobs", "replay_note", "TEXT NOT NULL DEFAULT ''"},
+	{"jobs", "base_sha", "TEXT NOT NULL DEFAULT ''"},
 	{"jobs", "progress", "TEXT NOT NULL DEFAULT ''"},
 }
 
@@ -301,6 +307,39 @@ func (q *Queue) Baseline(repo, branch string, t time.Time) (*Job, error) {
 	return jobs[0], nil
 }
 
+// BaselineSHA returns the completed replay of the push commit sha on
+// repo/branch, or nil: the comparison a PR merged into sha should use.
+func (q *Queue) BaselineSHA(repo, branch, sha string) (*Job, error) {
+	jobs, err := scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs
+		WHERE repo = ? AND event = ? AND branch = ? AND sha = ? AND state = ?
+		ORDER BY finished_at DESC LIMIT 1`, repo, eventPush, branch, sha, stateDone))
+	if err != nil || len(jobs) == 0 {
+		return nil, err
+	}
+	return jobs[0], nil
+}
+
+// DependentsOnBase lists the done PR replays merged into the push commit sha
+// of repo/branch: they are compared again once its replay finishes. (See
+// Job.BaseSHA.)
+func (q *Queue) DependentsOnBase(repo, branch, sha string) ([]*Job, error) {
+	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs
+		WHERE repo = ? AND event = ? AND branch = ? AND base_sha = ? AND state = ?`,
+		repo, eventPullRequest, branch, sha, stateDone))
+}
+
+// RequeueJob puts one running job back in the queue: its worker machine is
+// gone, and it runs again from the start. It reports whether it did.
+func (q *Queue) RequeueJob(id int64) (bool, error) {
+	res, err := q.db.Exec(`UPDATE jobs SET state = ?, started_at = 0, progress = '' WHERE id = ? AND state = ?`,
+		stateQueued, id, stateRunning)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 func (q *Queue) Get(id int64) (*Job, error) {
 	jobs, err := scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE id = ?`, id))
 	if err != nil {
@@ -399,9 +438,10 @@ func (q *Queue) SetResult(id int64, outcome, summary string, baseID int64) error
 	return err
 }
 
-// SetReplay records what a job replays (see Job.ReplaySHA).
-func (q *Queue) SetReplay(id int64, sha, note string) error {
-	_, err := q.db.Exec(`UPDATE jobs SET replay_sha = ?, replay_note = ? WHERE id = ?`, sha, note, id)
+// SetReplay records what a job replays (see Job.ReplaySHA): sha, note, and
+// the commit it was based on (baseSHA, see Job.BaseSHA; empty for pushes).
+func (q *Queue) SetReplay(id int64, sha, note, baseSHA string) error {
+	_, err := q.db.Exec(`UPDATE jobs SET replay_sha = ?, replay_note = ?, base_sha = ? WHERE id = ?`, sha, note, baseSHA, id)
 	return err
 }
 
@@ -517,7 +557,7 @@ func (q *Queue) MarkSynced(repo string) error {
 }
 
 const jobColumns = `id, key, repo, event, branch, pr, sha, priority, state, enqueued_at, started_at, finished_at,
-	report_path, outcome, summary, base_id, error, title, author, replay_sha, replay_note, progress`
+	report_path, outcome, summary, base_id, error, title, author, replay_sha, replay_note, base_sha, progress`
 
 func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 	if err != nil {
@@ -531,7 +571,7 @@ func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 		var progress string
 		if err := rows.Scan(&j.ID, &j.Key, &j.Repo, &j.Event, &j.Branch, &j.PR, &j.SHA, &j.Priority, &j.State,
 			&enq, &start, &fin, &j.ReportPath, &j.Outcome, &j.Summary, &j.BaseID, &j.Error, &j.Title, &j.Author,
-			&j.ReplaySHA, &j.ReplayNote, &progress); err != nil {
+			&j.ReplaySHA, &j.ReplayNote, &j.BaseSHA, &progress); err != nil {
 			return nil, err
 		}
 		if progress != "" {

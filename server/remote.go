@@ -51,6 +51,15 @@ var workerProgressInterval = time.Minute
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
+// shellJoin quotes each argument for the worker script's shell.
+func shellJoin(args []string) string {
+	quoted := make([]string, len(args))
+	for i, a := range args {
+		quoted[i] = shellQuote(a)
+	}
+	return strings.Join(quoted, " ")
+}
+
 // session is a job running on a worker machine. What it needs survives a
 // restart: its token hash and creation time are in the sessions table, the
 // rest in the job dir, so a restarted server resumes the job (see start).
@@ -130,6 +139,7 @@ func (s *Server) replayRemote(ctx context.Context, j *Job, dir string, log io.Wr
 		"GoVersion": h.GoVersion, "GoMemLimit": h.GoMemLimit,
 		"PowerOffMinutes": strconv.Itoa(powerOff),
 		"ProgressSeconds": strconv.FormatFloat(workerProgressInterval.Seconds(), 'f', -1, 64),
+		"ReplayArgs":      shellJoin(replayToolArgs("data", "genesis.json", "work", "report.json", "progress.json", "")),
 	}); err != nil {
 		return err
 	}
@@ -153,13 +163,23 @@ func (s *Server) assignMachine(ctx context.Context, jobID int64, userData string
 		if m, ok, err := s.reuseMachine(ctx, jobID, userData, log); ok || err != nil {
 			return m, err
 		}
-		m, err := s.prov.Create(ctx, newMachineName(), userData, workerLabels(jobID, time.Now()))
+		name := newMachineName()
+		m, err := s.prov.Create(ctx, name, userData, workerLabels(jobID, time.Now()))
 		if err == nil {
-			s.mu.Lock()
-			s.machines[m.ID] = &workerMachine{Machine: m, job: jobID, since: time.Now()}
-			s.mu.Unlock()
+			s.recordMachine(m, jobID)
 			fmt.Fprintf(log, "worker machine %s (%s) created\n", m.Name, m.ID)
 			return m, nil
+		}
+		// A create can boot its machine and still fail to say so. If it
+		// exists, it is already running this job's user data: take it, so
+		// the retry does not leave two machines on one job.
+		if found, ferr := s.prov.Find(ctx, name); ferr == nil && found != nil {
+			s.recordMachine(*found, jobID)
+			fmt.Fprintf(log, "worker machine %s (%s) found after a failed create\n", found.Name, found.ID)
+			return *found, nil
+		}
+		if isPermanentCreateError(err) {
+			return Machine{}, fmt.Errorf("create worker: %w", err)
 		}
 		if ctx.Err() != nil {
 			return Machine{}, ctx.Err()
@@ -175,6 +195,13 @@ func (s *Server) assignMachine(ctx context.Context, jobID int64, userData string
 		case <-time.After(createRetry):
 		}
 	}
+}
+
+// recordMachine remembers a machine this process knows as the job's.
+func (s *Server) recordMachine(m Machine, jobID int64) {
+	s.mu.Lock()
+	s.machines[m.ID] = &workerMachine{Machine: m, job: jobID, since: time.Now()}
+	s.mu.Unlock()
 }
 
 // reuseMachine gives the job an idle machine, reinstalled, if there is one
@@ -435,7 +462,9 @@ func tail(s string, n int) string {
 //     its job cancelled;
 //   - an idle one is deleted in the last minutes of its billing hour;
 //   - one this process doesn't know (left by a previous one, or by a failed
-//     create) becomes an idle one.
+//     create) becomes an idle one, relabelled so the watchdog's idle clock
+//     starts there rather than hours ago;
+//   - one that ran a job and is gone is cancelled: the job runs again.
 //
 // (deploy/watchdog.sh deletes machines busy or idle for too long too,
 // without the server.)
@@ -448,6 +477,8 @@ func (s *Server) reap(ctx context.Context) error {
 	maxAge := s.cfg.Hetzner.MaxAge.Duration
 	var overAge []workerMachine
 	var expired []Machine
+	var adopted []Machine
+	var vanished []workerMachine
 	listed := map[string]bool{}
 	s.mu.Lock()
 	for _, m := range machines {
@@ -459,6 +490,7 @@ func (s *Server) reap(ctx context.Context) error {
 			}
 			w = &workerMachine{Machine: m, since: now}
 			s.machines[m.ID] = w
+			adopted = append(adopted, m)
 			s.logger.Info("idle worker machine found", "machine", m.Name, "created", m.Created)
 		}
 		switch {
@@ -471,12 +503,29 @@ func (s *Server) reap(ctx context.Context) error {
 		}
 	}
 	for id, w := range s.machines {
-		if !listed[id] && w.job == 0 {
+		switch {
+		case !listed[id] && w.job == 0:
 			delete(s.machines, id) // deleted by someone else
+		case !listed[id]:
+			// Its machine is gone mid-job (an outage, its deletion out of
+			// band): stop waiting for a result that cannot come, and let
+			// the job run again.
+			vanished = append(vanished, *w)
+			delete(s.machines, id)
 		}
 	}
 	s.mu.Unlock()
 
+	// Relabelled before it can be taken by a job (it is not in s.machines
+	// yet): its old idle-since label would let the watchdog delete it
+	// mid-rebuild after a long outage.
+	for _, m := range adopted {
+		labelCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		if err := s.prov.SetLabels(labelCtx, m.ID, workerLabels(0, now)); err != nil {
+			s.logger.Error("label idle worker machine", "machine", m.Name, "err", err)
+		}
+		cancel()
+	}
 	for _, w := range overAge {
 		s.logger.Error("worker machine ran its job past its max age: cancelling it",
 			"machine", w.Name, "job", w.job, "since", w.since, "max_age", maxAge)
@@ -485,6 +534,20 @@ func (s *Server) reap(ctx context.Context) error {
 		if err := s.prov.Delete(ctx, w.ID); err != nil {
 			s.logger.Error("delete worker machine", "machine", w.Name, "err", err)
 		}
+	}
+	for _, w := range vanished {
+		if now.Sub(w.since) > maxAge {
+			// It was already over its max age: fail it, do not start a fresh
+			// attempt (the watchdog deletes such machines too).
+			s.logger.Error("worker machine ran its job past its max age and is gone: failing it",
+				"machine", w.Name, "job", w.job)
+			s.cancelCause(w.job, fmt.Errorf("worker machine %s ran the job for longer than its max age (%s), and was deleted",
+				w.Name, maxAge))
+			continue
+		}
+		s.logger.Error("worker machine is gone while its job runs: the job runs again",
+			"machine", w.Name, "job", w.job)
+		s.cancelCause(w.job, errRetry)
 	}
 	for _, m := range expired {
 		if err := s.prov.Delete(ctx, m.ID); err != nil {

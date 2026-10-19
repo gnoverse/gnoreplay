@@ -35,7 +35,11 @@ api() {
 
 fail() {
 	echo "FAILED: $*"
-	api POST fail --data-binary @"$LOG" || true
+	# A bounded tail: the server shows the last 4k of it, and a whole log
+	# over the fail route's cap would be rejected, leaving the job to wait
+	# out its run timeout.
+	tail -c 262144 "$LOG" >"$WORK/fail.log"
+	api POST fail --data-binary @"$WORK/fail.log" || true
 	exit 1
 }
 
@@ -81,8 +85,7 @@ step "replay"
 	done
 ) &
 reporter=$!
-GNOROOT="$WORK/src" ./gnoreplay --data-dir data --genesis genesis.json --work-dir work \
-	--max-diffs 0 --out report.json --progress progress.json
+GNOROOT="$WORK/src" ./gnoreplay {{.ReplayArgs}}
 rc=$?
 kill $reporter
 # 2: diffs found, a result like any other.

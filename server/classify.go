@@ -17,15 +17,9 @@ type Report struct {
 	Txs                  int64  `json:"txs"`
 	FirstAppHashMismatch int64  `json:"first_app_hash_mismatch"`
 	MissingResponses     int64  `json:"missing_responses"`
-	Counts               struct {
-		Result int `json:"result"`
-		Gas    int `json:"gas"`
-		Block  int `json:"block"`
-		Log    int `json:"log"`
-	} `json:"counts"`
-	Diffs     []Diff `json:"diffs"`
-	Truncated bool   `json:"truncated"`
-	Timing    struct {
+	Diffs                []Diff `json:"diffs"`
+	Truncated            bool   `json:"truncated"`
+	Timing               struct {
 		TotalSeconds float64 `json:"total_seconds"`
 	} `json:"timing"`
 }
@@ -44,7 +38,6 @@ type Diff struct {
 
 type Result struct {
 	Error   string `json:"error"`
-	Log     string `json:"log"`
 	GasUsed int64  `json:"gas_used"`
 }
 
@@ -200,6 +193,10 @@ func render(job *Job, r *Report, c Classification, reportURL string, base *Job) 
 	}
 	if base != nil {
 		fmt.Fprintf(&s, "Compared with `%s` at commit `%s` ([its replay](/jobs/%d)).\n\n", base.Branch, shortSHA(base.SHA), base.ID)
+	}
+	if job.BaseSHA != "" && (base == nil || base.SHA != job.BaseSHA) {
+		fmt.Fprintf(&s, "The merge base `%s` had no finished replay when this was classified: divergences it already has may show as new here until it is compared again.\n\n",
+			shortSHA(job.BaseSHA))
 	}
 	if r.FirstAppHashMismatch > 0 {
 		fmt.Fprintf(&s, "First app hash mismatch at height **%d**; diffs after it are marked *(after divergence)* and may be consequences of earlier ones.\n\n", r.FirstAppHashMismatch)

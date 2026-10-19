@@ -24,7 +24,9 @@ fi
 : "${HCLOUD_TOKEN:?HCLOUD_TOKEN or HCLOUD_TOKEN_FILE is required}"
 
 api() {
-	curl -fsS --retry 3 -H "Authorization: Bearer $HCLOUD_TOKEN" "$@"
+	# The token goes through a curl config on a pipe, not the argv every local
+	# user can read from /proc (the convention the git fetches follow).
+	curl -fsS --retry 3 --config <(printf 'header = "Authorization: Bearer %s"\n' "$HCLOUD_TOKEN") "$@"
 }
 
 now=$(date -u +%s)

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -112,4 +113,105 @@ func TestWatchdogScript(t *testing.T) {
 	// So is an unreadable API.
 	_, err = run("wrong")
 	assert.Error(t, err)
+}
+
+// The watchdog reaches the Hetzner API without putting the token in curl's
+// argv, where every local user can read it from /proc.
+func TestWatchdogTokenNotInArgv(t *testing.T) {
+	for _, tool := range []string{"bash", "curl", "jq"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not available", tool)
+		}
+	}
+	var mu sync.Mutex
+	auth := ""
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auth = r.Header.Get("Authorization")
+		mu.Unlock()
+		<-release
+		w.Write([]byte(`{"servers":[],"meta":{"pagination":{"page":1,"next_page":null}}}`))
+	}))
+	defer srv.Close()
+
+	cmd := exec.Command("../deploy/watchdog.sh")
+	cmd.Env = append(os.Environ(), "HCLOUD_API="+srv.URL, "HCLOUD_TOKEN=super-secret-token")
+	require.NoError(t, cmd.Start())
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+
+	// Scan /proc while the request is being made: the token must not be in
+	// any process's argv.
+	found := ""
+	scans := 0
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline) && found == ""; scans++ {
+		entries, _ := os.ReadDir("/proc")
+		for _, e := range entries {
+			if _, err := strconv.Atoi(e.Name()); err != nil {
+				continue
+			}
+			bz, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
+			if err != nil {
+				continue
+			}
+			if strings.Contains(string(bz), "super-secret-token") {
+				found = strings.ReplaceAll(string(bz), "\x00", " ")
+				break
+			}
+		}
+		mu.Lock()
+		seen := auth != ""
+		mu.Unlock()
+		if seen && scans >= 5 {
+			break
+		}
+		if found == "" {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	mu.Lock()
+	gotAuth := auth
+	mu.Unlock()
+	close(release)
+	select {
+	case <-waitDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("watchdog.sh did not exit")
+	}
+	assert.Empty(t, found, "the token must not be in a process's argv")
+	assert.Equal(t, "Bearer super-secret-token", gotAuth, "and must still reach the API")
+}
+
+// The golden prune keeps the current target, the previous target it is given
+// (a running job may still be copying from it), and anything younger than an
+// hour (a snapshot still being written, or left by a killed refresh);
+// everything else goes.
+func TestGoldenPrune(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	root := t.TempDir()
+	mk := func(name string, age time.Duration) string {
+		dir := filepath.Join(root, name)
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "db"), 0o755))
+		mtime := time.Now().Add(-age)
+		require.NoError(t, os.Chtimes(dir, mtime, mtime))
+		return dir
+	}
+	old := mk("golden-20261013T000000", 3*time.Hour)
+	prev := mk("golden-20261014T000000", 2*time.Hour)
+	target := mk("golden-20261015T000000", 2*time.Hour)
+	recent := mk("golden-20261015T010000", time.Minute)
+	require.NoError(t, os.Symlink(target, filepath.Join(root, "golden")))
+
+	cmd := exec.Command("scripts/golden-prune.sh", prev)
+	cmd.Env = append(os.Environ(), "GOLDEN_ROOT="+root)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, out)
+
+	for _, dir := range []string{target, prev, recent} {
+		assert.DirExists(t, dir, dir)
+	}
+	assert.NoDirExists(t, old)
 }

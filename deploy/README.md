@@ -58,7 +58,7 @@ git clone https://github.com/gnoverse/gnoreplay /opt/gnoreplay/src && ln -s src/
 (cd /opt/gnoreplay/server && /usr/local/go/bin/go build -o /opt/gnoreplay/bin/gnoreplay-server .)
 ```
 
-**Chain data.** Replays run the blocks a mainnet node stores in its `blockstore.db`, and compare against the tx results in its `state.db`. `gnoreplay-golden` ([`fetch-golden.sh`](../server/scripts/fetch-golden.sh)) downloads them from the newest snapshot on snapshots.gno.land every 12 hours: each snapshot is ~2 GB, served by the gno.land team, so not more often. If the download fails, replays keep the last copy.
+**Chain data.** Replays run the blocks a mainnet node stores in its `blockstore.db`, and compare against the tx results in its `state.db`. `gnoreplay-golden` ([`fetch-golden.sh`](../server/scripts/fetch-golden.sh)) downloads them from the newest snapshot on snapshots.gno.land every 12 hours: each snapshot is ~2 GB, served by the gno.land team, so not more often. If the download fails, replays keep the last copy. Both refresh scripts then run [`golden-prune.sh`](../server/scripts/golden-prune.sh), which keeps the current snapshot, the one before it (a running job may still be copying from it) and anything younger than an hour (a refresh in flight, or one killed before it could clean up), and removes the rest.
 
 ```bash
 cd /var/lib/gnoreplay

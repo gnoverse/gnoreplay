@@ -206,29 +206,11 @@ func rerender(configPath string, logger *slog.Logger, ids []string) error {
 		if j.State != stateDone {
 			continue
 		}
-		var base *Job
-		if j.BaseID != 0 {
-			base, err = srv.queue.Get(j.BaseID)
-		} else {
-			// A job rendered without a baseline keeps none: re-derive the
-			// one it would have had when it started, not one that finished
-			// while it ran, which rerendering must not turn into a result
-			// the job never had. Jobs from before started_at was recorded
-			// fall back to their finish.
-			at := j.StartedAt
-			if at.IsZero() {
-				at = j.FinishedAt
-			}
-			base, err = srv.queue.Baseline(j.Repo, j.Branch, at)
-		}
+		base, err := srv.rerenderBase(j)
 		if err != nil {
 			return fmt.Errorf("job %d: baseline: %w", j.ID, err)
 		}
-		report, err := readReport(j.ReportPath)
-		if err != nil {
-			return fmt.Errorf("job %d: %w", j.ID, err)
-		}
-		out, _, err := srv.renderJob(j, report, j.ReportPath, base)
+		out, _, err := srv.renderStored(j, base)
 		if err != nil {
 			return fmt.Errorf("job %d: %w", j.ID, err)
 		}
@@ -240,6 +222,30 @@ func rerender(configPath string, logger *slog.Logger, ids []string) error {
 	return nil
 }
 
+// rerenderBase returns the baseline to render a stored job against.
+func (s *Server) rerenderBase(j *Job) (*Job, error) {
+	// A PR's merge base, when its replay has finished since: the job was
+	// classified against an older baseline only because it had not.
+	if j.BaseSHA != "" {
+		if b, err := s.queue.BaselineSHA(j.Repo, j.Branch, j.BaseSHA); err != nil {
+			return nil, err
+		} else if b != nil {
+			return b, nil
+		}
+	}
+	if j.BaseID != 0 {
+		return s.queue.Get(j.BaseID)
+	}
+	// It recorded no baseline: derive the one it was rendered with. A job
+	// with a merge base (a PR) was rendered at its end; pushes and jobs from
+	// before base_sha was recorded, at their start.
+	at := j.FinishedAt
+	if j.BaseSHA == "" && !j.StartedAt.IsZero() {
+		at = j.StartedAt
+	}
+	return s.queue.Baseline(j.Repo, j.Branch, at)
+}
+
 // enqueueOne queues a replay of a PR's or a branch's current head. A running
 // server picks it up from the shared queue.
 func enqueueOne(ctx context.Context, configPath string, logger *slog.Logger, repo, target string) error {
@@ -248,19 +254,34 @@ func enqueueOne(ctx context.Context, configPath string, logger *slog.Logger, rep
 		return err
 	}
 	defer closeFn()
+	return enqueueTarget(ctx, srv, repo, target)
+}
+
+// enqueueTarget queues repo's target (a PR number, or a branch) as the
+// poller would have, head recorded: otherwise its next pass treats the same
+// commit as new and supersedes the replay of a PR it records as skipping.
+func enqueueTarget(ctx context.Context, srv *Server, repo, target string) error {
 	if n, err := strconv.Atoi(target); err == nil {
 		pr, err := srv.gh.Pull(ctx, repo, n)
 		if err != nil {
 			return err
 		}
+		key := jobKey(repo, eventPullRequest, pr.Base, pr.Number)
 		if err := srv.enqueueFor(repo, eventPullRequest, pr.Base, pr.Number, pr.HeadSHA); err != nil {
 			return err
 		}
-		return srv.queue.SetPRInfo(jobKey(repo, eventPullRequest, pr.Base, pr.Number), pr.Title, pr.Author)
+		if err := srv.queue.SetPRInfo(key, pr.Title, pr.Author); err != nil {
+			return err
+		}
+		return srv.queue.SetHead(key, repo, prHead(pr.Base, pr.HeadSHA))
 	}
 	sha, err := srv.gh.BranchHead(ctx, repo, target)
 	if err != nil {
 		return err
 	}
-	return srv.enqueueFor(repo, eventPush, target, 0, sha)
+	key := jobKey(repo, eventPush, target, 0)
+	if err := srv.enqueueFor(repo, eventPush, target, 0, sha); err != nil {
+		return err
+	}
+	return srv.queue.SetHead(key, repo, sha)
 }

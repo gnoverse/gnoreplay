@@ -7,10 +7,10 @@ gnoreplay checks whether a change to [gnolang/gno](https://github.com/gnolang/gn
 | Path | What |
 |---|---|
 | `gnoreplay/` | The replay tool. Not buildable on its own: its `go.mod` has `replace github.com/gnolang/gno => ../..`, so it is copied into a gno checkout at `contribs/gnoreplay` and built there, against the tree under test. |
-| `server/` | The coordinator: polls GitHub, queues replays (SQLite), runs each on a worker (a Hetzner Cloud server, reinstalled for each job, or a local microsandbox VM), classifies the report against the base branch's, serves the results. |
+| `server/` | The coordinator: polls GitHub, queues replays (SQLite), runs each on a worker (a Hetzner Cloud server, reinstalled for each job, or a local microsandbox VM), classifies the report against the replay of the commit it was based on, serves the results. |
 | `server/worker.sh` | The worker's cloud-init script (a Go template): downloads its inputs from the coordinator, builds the tool, replays, posts the report back. |
 | `server/page.html` | All HTML templates (embedded). |
-| `server/scripts/` | `fetch-golden.sh` (chain data from snapshots.gno.land, systemd timer; `refresh-golden.sh` takes it from a reference node instead), `sync-viewers.sh` (who may see a private repo's results). |
+| `server/scripts/` | `fetch-golden.sh` (chain data from snapshots.gno.land, systemd timer; `refresh-golden.sh` takes it from a reference node instead; both prune old snapshots with `golden-prune.sh`), `sync-viewers.sh` (who may see a private repo's results). |
 | `deploy/` | Hetzner Cloud deployment, systemd units, `watchdog.sh` (deletes workers on a job for over 4h or idle for over 65 min, independently of the server). |
 
 ## Build & test
@@ -35,8 +35,8 @@ Server tests drive real code against fakes, not mocks of it: `fakeGitHub` (serve
 - **Workers are reused, reinstalled for each job.** Hetzner bills started hours from a server's creation: a worker whose job ended is kept for the next job, and deleted once idle in the last 5 minutes of its billing hour (`idleMargin`); a job takes the idle worker whose hour ends first. Before each job the worker is rebuilt (disk wiped) with that job's user data: a job's PR code runs as root, and a reused machine must never carry it into a later job (a public PR could read a later `gno-fixes` job's source, or forge its result). Never hand a worker a new job without a rebuild. A restart finds which machine runs which job by its `gnoreplay-job` label, set only once the rebuild succeeded.
 - **No job runs on a worker past 4h, and no worker idles past its billing hour**, enforced independently four times: the job's `run_timeout` (must stay below `max_age`), the server's reaper (every minute), `deploy/watchdog.sh` on a systemd timer (from the workers' `gnoreplay-job`/`gnoreplay-since` labels: over 4h on a job, or 65 min idle), and the `worker-watchdog` GitHub workflow; workers also power themselves off 4h into a job. Keep all of them when changing worker lifecycle code.
 - **Outcome**: a commit *diverges* when a tx result or a block (app hash, validator updates) differs where the base branch's latest replay matched; gas-only differences pass. A divergence with every tx result unchanged is reported as an app-hash-only change (typically a stdlib change, which alters the genesis state).
-- **Rendering is stored**: a job's page body is rendered to `<report>.md` when it finishes (classification needs the baseline at that time). After changing rendering, run `gnoreplay-server rerender` to update past pages.
-- **Database migrations** are additive: new `jobs` columns go in both the `CREATE TABLE` and `addedColumns` (`TestMigrate`).
+- **Rendering is stored**: a job's page body is rendered to `<report>.md` when it finishes. A PR is classified against the replay of the commit it was merged into (`base_sha`, the test merge's first parent), falling back to the base branch's latest completed replay while that one runs, with the page saying so; when that replay finishes, the PRs merged into it are rendered again. A push is compared with its branch's previous commit, as of its start. After changing rendering, run `gnoreplay-server rerender` to update past pages.
+- **Database migrations** are additive: new `jobs` columns go in both the `CREATE TABLE` and `addedColumns` (`TestMigrate`, whose old table is the schema before `addedColumns` existed).
 
 ## Things learned the hard way
 

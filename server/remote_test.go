@@ -119,6 +119,18 @@ func (f *fakeMachines) SetLabels(_ context.Context, id string, labels map[string
 	return nil
 }
 
+func (f *fakeMachines) Find(_ context.Context, name string) (*Machine, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, m := range f.running {
+		if m.name == name {
+			machine := m.machine(id)
+			return &machine, nil
+		}
+	}
+	return nil, nil
+}
+
 // orphan registers a machine this process doesn't know, as if left by a
 // previous one: running job, or idle (job 0).
 func (f *fakeMachines) orphan(name string, job int64) {
@@ -624,6 +636,7 @@ func TestWorkerScriptPowerOff(t *testing.T) {
 		require.NoError(t, workerTmpl.Execute(&b, map[string]string{
 			"URL": "http://10.0.0.1:8081", "JobID": "1", "Token": "t", "WorkDir": "/w",
 			"GoVersion": "1.26.1", "GoMemLimit": "12GiB", "PowerOffMinutes": minutes, "ProgressSeconds": "60",
+			"ReplayArgs": "--data-dir 'data'",
 		}))
 		return b.String()
 	}
@@ -632,6 +645,8 @@ func TestWorkerScriptPowerOff(t *testing.T) {
 	shutdown -P +240`)
 	// ...unless disabled (tests).
 	assert.Contains(t, render("0"), "if [ 0 -gt 0 ]")
+	// The replay command line comes from the server (ReplayArgs).
+	assert.Contains(t, render("0"), "./gnoreplay --data-dir 'data'")
 }
 
 // A restart without a provisioner, e.g. after removing [hetzner] from the
@@ -662,4 +677,163 @@ func TestStartWithoutProvisionerRequeuesSessions(t *testing.T) {
 	next, err := q.Claim()
 	require.NoError(t, err)
 	require.NotNil(t, next)
+}
+
+// A machine that disappears while its job runs must be noticed: the job runs
+// again, rather than waiting out its run timeout and failing.
+func TestRemoteVanishedMachineRequeues(t *testing.T) {
+	e := newRemoteEnv(t)
+	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
+	gate := filepath.Join(e.root, "gate")
+	require.NoError(t, os.WriteFile(filepath.Join(e.remote, "fake-wait"), []byte(gate), 0o644))
+	sha := commitReport(t, e.remote, clean, 0)
+
+	require.NoError(t, e.srv.enqueueFor("gnolang/gno", eventPush, "master", 0, sha))
+	j, err := e.q.Claim()
+	require.NoError(t, err)
+	finished := make(chan struct{})
+	go func() { e.srv.runJob(context.Background(), j); close(finished) }()
+
+	var id string
+	require.Eventually(t, func() bool {
+		ms, _ := e.machines.List(context.Background())
+		for _, m := range ms {
+			if m.Labels[labelJob] == strconv.FormatInt(j.ID, 10) {
+				id = m.ID
+				return true
+			}
+		}
+		return false
+	}, 30*time.Second, 10*time.Millisecond)
+	require.NoError(t, e.machines.Delete(context.Background(), id))
+	require.NoError(t, e.srv.reap(context.Background()))
+
+	select {
+	case <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the job did not stop")
+	}
+	got, err := e.q.Get(j.ID)
+	require.NoError(t, err)
+	assert.Equal(t, stateQueued, got.State, "the job runs again")
+	pending, err := e.q.Pending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, j.ID, pending[0].ID)
+}
+
+type bootThenFailCreate struct {
+	*fakeMachines
+	lost bool
+}
+
+// Create boots the machine, then fails: a create whose response was lost.
+func (f *bootThenFailCreate) Create(ctx context.Context, name, userData string, labels map[string]string) (Machine, error) {
+	m, err := f.fakeMachines.Create(ctx, name, userData, labels)
+	if err != nil || f.lost {
+		return m, err
+	}
+	f.lost = true
+	return Machine{}, errors.New("create response lost")
+}
+
+// A create that booted its machine but failed to say so is found by name and
+// taken: the retry must not leave two machines on one job.
+func TestRemoteLostCreateResponse(t *testing.T) {
+	cfg := &Config{DataDir: t.TempDir()}
+	cfg.setDefaults()
+	srv := newServer(cfg, newTestQueue(t), newFakeGitHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	machines := newFakeMachines(t.TempDir())
+	srv.prov = &bootThenFailCreate{fakeMachines: machines}
+
+	old := createRetry
+	createRetry = 5 * time.Millisecond
+	defer func() { createRetry = old }()
+
+	m, err := srv.assignMachine(context.Background(), 42, "user data", time.Now().Add(5*time.Second), io.Discard)
+	require.NoError(t, err)
+	created, _, running := machines.names()
+	assert.Len(t, created, 1, "the booted machine is taken, not left behind")
+	assert.Equal(t, 1, running)
+	assert.Equal(t, "42", machines.labels(m.Name)[labelJob])
+}
+
+// A machine adopted as idle after a long outage is relabelled then: its old
+// idle-since label would let the watchdog delete it mid-rebuild.
+func TestRemoteAdoptedIdleRelabelled(t *testing.T) {
+	cfg := &Config{DataDir: t.TempDir(), Hetzner: &HetznerConfig{}}
+	cfg.setDefaults()
+	srv := newServer(cfg, newTestQueue(t), newFakeGitHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	machines := newFakeMachines(t.TempDir())
+	srv.prov = machines
+
+	machines.orphan("gnoreplay-worker-stale", 0)
+	machines.mu.Lock()
+	for _, m := range machines.running {
+		m.labels = workerLabels(0, time.Now().Add(-2*time.Hour))
+	}
+	machines.mu.Unlock()
+
+	_, err := srv.start(context.Background())
+	require.NoError(t, err)
+	labels := machines.labels("gnoreplay-worker-stale")
+	since, err := strconv.ParseInt(labels[labelSince], 10, 64)
+	require.NoError(t, err)
+	assert.Greater(t, since, time.Now().Add(-time.Minute).Unix(), "relabelled when adopted")
+	assert.NotContains(t, labels, labelJob)
+}
+
+// A worker whose log is larger than the fail route's cap used to hang the job
+// until its run timeout: the worker posts a bounded tail now.
+func TestRemoteLoudWorkerLogFails(t *testing.T) {
+	e := newRemoteEnv(t)
+	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
+	require.NoError(t, os.WriteFile(filepath.Join(e.remote, "fake-loud"), nil, 0o644))
+	sha := commitReport(t, e.remote, clean, 1)
+
+	require.NoError(t, e.srv.enqueueFor("gnolang/gno", eventPush, "master", 0, sha))
+	j, err := e.q.Claim()
+	require.NoError(t, err)
+	done := make(chan struct{})
+	go func() { e.srv.runJob(context.Background(), j); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the job did not fail quickly: the worker's log was rejected, and it waits out its run timeout")
+	}
+	got, err := e.q.Get(j.ID)
+	require.NoError(t, err)
+	require.Equal(t, stateFailed, got.State)
+	assert.Contains(t, got.Error, "loud")
+	assert.Contains(t, got.Error, "gnoreplay exited with 1")
+}
+
+type permanentFailCreate struct {
+	*fakeMachines
+	attempts int
+}
+
+func (f *permanentFailCreate) Create(context.Context, string, string, map[string]string) (Machine, error) {
+	f.attempts++
+	return Machine{}, permanentCreateError{errors.New("unauthorized: invalid token")}
+}
+
+// A create that retrying cannot fix fails the job at once, instead of holding
+// its slot for the whole run timeout.
+func TestRemotePermanentCreateFailsFast(t *testing.T) {
+	cfg := &Config{DataDir: t.TempDir()}
+	cfg.setDefaults()
+	srv := newServer(cfg, newTestQueue(t), newFakeGitHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	fail := &permanentFailCreate{fakeMachines: newFakeMachines(t.TempDir())}
+	srv.prov = fail
+
+	old := createRetry
+	createRetry = time.Second
+	defer func() { createRetry = old }()
+
+	start := time.Now()
+	_, err := srv.assignMachine(context.Background(), 1, "ud", time.Now().Add(10*time.Second), io.Discard)
+	assert.ErrorContains(t, err, "unauthorized")
+	assert.Equal(t, 1, fail.attempts, "not retried")
+	assert.Less(t, time.Since(start), time.Second, "failed at once")
 }

@@ -22,7 +22,7 @@ A commit *diverges* when it would change a tx result or a block compared to its 
 2. A worker fetches the commit into a bare mirror (with the token, so private repos work), and extracts it. For a PR, that is GitHub's test merge of the PR into its base branch (what CI tests), so that what the PR's branch lacks from its base doesn't show as divergences; when there is none (a conflict, or GitHub hasn't computed it within a minute), the PR's head, and its page says so.
 3. It copies [`gnoreplay/`](../gnoreplay/) into the checkout at `contribs/gnoreplay` and builds it there, so the replay runs that commit's application code.
 4. It copies the golden chain data (blockstore + state DBs, via reflinks) into the job dir and runs the replay with `GNOROOT` set to the checkout (stdlibs are read from disk at runtime).
-5. The report's diffs are classified against the latest completed replay of the base branch (for a push: the branch's previous commit):
+5. The report's diffs are classified against the replay of the commit it was based on (for a PR: the test merge's first parent, the base branch's commit it was merged into), when that replay has finished; until then, against the latest completed replay of the base branch, and the page says so. When that commit's replay finishes, the PR's replays merged into it are compared again. A push is compared with the branch's previous commit:
    - **new** — diverges here, not on the base
    - **inherited** — diverges on the base too
    - **fixed** — diverges on the base, not here
