@@ -9,6 +9,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -29,18 +30,26 @@ import (
 )
 
 func main() {
+	// A bad flag is an error (exit 1), not "diffs found" (exit 2): the
+	// workers and the server read 2 as a result.
+	fs := flag.NewFlagSet("gnoreplay", flag.ContinueOnError)
 	var (
-		dataDir     = flag.String("data-dir", "gnoland-data", "source node data directory (its db/ is opened read-only)")
-		genesisFile = flag.String("genesis", "genesis.json", "genesis.json of the source chain")
-		workDir     = flag.String("work-dir", "", "directory for the replay's app and state DBs and genesis cache (default: a temporary directory, removed on exit)")
-		toHeight    = flag.Int64("to", 0, "last height to replay (default: source tip)")
-		stopOnFirst = flag.Bool("stop-on-first", false, "stop at the first block with a result or app hash divergence")
-		maxDiffs    = flag.Int("max-diffs", 1000, "maximum number of diffs listed in the report (counts stay exact); 0 for no limit")
-		out         = flag.String("out", "", "write the JSON report to this file")
-		logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
-		progress    = flag.String("progress", "", "keep this file updated with the replay's progress (JSON: height, tip, blocks_per_second)")
+		dataDir     = fs.String("data-dir", "gnoland-data", "source node data directory (its db/ is opened read-only)")
+		genesisFile = fs.String("genesis", "genesis.json", "genesis.json of the source chain")
+		workDir     = fs.String("work-dir", "", "directory for the replay's app and state DBs and genesis cache (default: a temporary directory, removed on exit)")
+		toHeight    = fs.Int64("to", 0, "last height to replay (default: source tip)")
+		stopOnFirst = fs.Bool("stop-on-first", false, "stop at the first block with a result or app hash divergence")
+		maxDiffs    = fs.Int("max-diffs", 1000, "maximum number of diffs listed in the report (counts stay exact); 0 for no limit")
+		out         = fs.String("out", "", "write the JSON report to this file")
+		logLevel    = fs.String("log-level", "info", "log level: debug, info, warn, error")
+		progress    = fs.String("progress", "", "keep this file updated with the replay's progress (JSON: height, tip, blocks_per_second)")
 	)
-	flag.Parse()
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		os.Exit(1) // fs.Parse printed the error and the usage
+	}
 
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {

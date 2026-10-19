@@ -36,7 +36,7 @@ gnoreplay --data-dir <node data dir> --genesis genesis.json --out report.json
 | `--out` | Write the JSON report here. |
 | `--progress` | Keep this file updated with the replay's progress (`height`, `tip`, `blocks_per_second`), whenever it is logged: once genesis is replayed, then every 30 seconds. |
 
-Exit status: `0` no consensus-relevant diffs, `1` error, `2` result or block diffs found.
+Exit status: `0` no consensus-relevant diffs, `1` error (a bad flag included), `2` result or block diffs found.
 
 The stdlibs are read from `GNOROOT` at runtime (not embedded in the binary), so run it from — or with `GNOROOT` pointing at — the checkout it was built from.
 

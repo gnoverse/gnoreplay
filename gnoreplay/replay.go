@@ -81,7 +81,12 @@ func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions
 
 	r := newReport(genDoc.ChainID, firstHeight, tip, opts.MaxDiffs)
 
-	baseApp, _ := app.(*sdk.BaseApp)
+	baseApp, ok := app.(*sdk.BaseApp)
+	if !ok {
+		// Governance halts recorded in history must not stop the replay:
+		// without BaseApp, SetHaltHeight below cannot clear them.
+		logger.Warn("the app is not a *sdk.BaseApp: a governance halt in the replayed history would stop the replay")
+	}
 	genesis := &genesisCheck{Application: app}
 	// tm2 logs every block, and returns its errors: those are what we report.
 	tmLogger := log.NewNoopLogger()
@@ -256,7 +261,6 @@ func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions
 			return nil, err
 		}
 	}
-	r.Timing.BlocksSeconds = time.Since(blocksStart).Seconds()
 	r.Timing.TotalSeconds = time.Since(start).Seconds()
 	return r, nil
 }

@@ -54,7 +54,6 @@ type Report struct {
 
 	Timing struct {
 		GenesisSeconds float64 `json:"genesis_seconds"`
-		BlocksSeconds  float64 `json:"blocks_seconds"`
 		TotalSeconds   float64 `json:"total_seconds"`
 	} `json:"timing"`
 
