@@ -10,7 +10,7 @@ Replays gno.land mainnet's full history with the binary of each pushed commit an
 | `/<owner>/<repo>/pull/<n>` | a PR's replays, and its latest result in full (the same path as on GitHub) |
 | `/<owner>/<repo>/tree/<branch>` | the same for a branch |
 | `/jobs/<id>` | one replay: what diverges, transaction by transaction |
-| `/reports/<id>` | its full JSON report |
+| `/reports/<id>` | its full JSON report, while kept (the newest 1 GiB, gzipped) |
 | `/search?q=` | finds replays by PR number, branch, commit, PR title or GitHub URL (the search box on every page) |
 | `/queue` | pending replays, as JSON |
 
@@ -62,7 +62,7 @@ Within a level, jobs run in arrival order. A new push to the same branch or PR s
 
 Replays run in one of two places:
 
-- **On worker machines** (`[hetzner]` in the config): each replay runs on a Hetzner Cloud server of its own, reinstalled from scratch for it; the server is the sandbox. A worker that finished its replay runs the next one, and one left idle is deleted at the end of its billing hour (Hetzner bills started hours). The coordinator only needs 2 GB of RAM, and disk for the reports (~0.2 GB a day). Step by step: [`deploy/README.md`](../deploy/README.md), config: [`config.hetzner.example.toml`](config.hetzner.example.toml).
+- **On worker machines** (`[hetzner]` in the config): each replay runs on a Hetzner Cloud server of its own, reinstalled from scratch for it; the server is the sandbox. A worker that finished its replay runs the next one, and one left idle is deleted at the end of its billing hour (Hetzner bills started hours). The coordinator only needs 2 GB of RAM, and disk for the reports (gzipped, the oldest past 1 GiB deleted). Step by step: [`deploy/README.md`](../deploy/README.md), config: [`config.hetzner.example.toml`](config.hetzner.example.toml).
 - **On the server's own box**, in local sandboxes (`config.example.toml`): one bigger machine with KVM, described below.
 
 What the box needs in both cases (except where noted):

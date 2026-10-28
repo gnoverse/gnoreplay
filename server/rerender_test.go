@@ -17,7 +17,8 @@ import (
 
 // Rerendering compares a job with the baseline it had, not one that finished
 // while it ran: a job that ran without a baseline keeps none, and a job from
-// before base_id was recorded gets the baseline of its start.
+// before base_id was recorded gets the baseline of its start. A job whose
+// report, or its baseline's, was pruned keeps its page.
 func TestRerenderKeepsTheBaselineItHad(t *testing.T) {
 	root := t.TempDir()
 	dataDir := filepath.Join(root, "data")
@@ -90,9 +91,16 @@ gnoreplay_overlay = "`+overlay+`"
 	legacy := insert(eventPullRequest, "master", 8, "c0", t0, t2, path10,
 		outcomeDiverges, "1 new divergence(s) from gnoland-1 history", 0)
 
+	pruned := insert(eventPullRequest, "master", 9, "d0", t0, t2, filepath.Join(reports, "pruned.json.gz"),
+		outcomeDiverges, "as rendered", base0)
+	prunedBase := insert(eventPush, "stable", 0, "s0", t0, t0, filepath.Join(reports, "pruned-base.json.gz"), outcomePass, "same", 0)
+	onPrunedBase := insert(eventPullRequest, "stable", 10, "e0", t0, t2, path10, outcomePass, "as rendered", prunedBase)
+
 	require.NoError(t, q.Close())
-	require.NoError(t, rerender(cfgPath, slog.New(slog.NewTextHandler(io.Discard, nil)),
-		[]string{strconv.FormatInt(ranAlone, 10), strconv.FormatInt(legacy, 10)}))
+	require.NoError(t, rerender(cfgPath, slog.New(slog.NewTextHandler(io.Discard, nil)), []string{
+		strconv.FormatInt(ranAlone, 10), strconv.FormatInt(legacy, 10),
+		strconv.FormatInt(pruned, 10), strconv.FormatInt(onPrunedBase, 10),
+	}))
 
 	q, err = openQueue(filepath.Join(dataDir, "jobs.db"))
 	require.NoError(t, err)
@@ -107,4 +115,12 @@ gnoreplay_overlay = "`+overlay+`"
 	require.NoError(t, err)
 	assert.Equal(t, base0, got.BaseID, "the baseline of its start, not one from mid-run")
 	assert.Equal(t, outcomePass, got.Outcome, "inherited from that baseline")
+
+	for _, id := range []int64{pruned, onPrunedBase} {
+		got, err = q.Get(id)
+		require.NoError(t, err)
+		assert.Equal(t, "as rendered", got.Summary, "job %d keeps its page", id)
+	}
+	assert.Equal(t, prunedBase, got.BaseID)
+	assert.Equal(t, outcomePass, got.Outcome, "not rendered again without its baseline, every diff new")
 }

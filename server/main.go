@@ -149,6 +149,9 @@ func serve(parent context.Context, configPath string, logger *slog.Logger) error
 	for range srv.cfg.Workers {
 		wg.Go(func() { srv.work(ctx, resume) })
 	}
+	// Each job prunes reports when it finishes; this catches up with what
+	// came before, e.g. reports saved before they were gzipped.
+	wg.Go(func() { srv.pruneReports(ctx) })
 	wg.Go(func() { srv.pollLoop(ctx) })
 
 	httpSrv := &http.Server{
@@ -209,6 +212,12 @@ func rerender(configPath string, logger *slog.Logger, ids []string) error {
 		base, err := srv.rerenderBase(j)
 		if err != nil {
 			return fmt.Errorf("job %d: baseline: %w", j.ID, err)
+		}
+		// Without its report, or its baseline's, the job keeps the page it
+		// has: rendering it without a baseline would make every diff new.
+		if !fileExists(j.ReportPath) || base != nil && !fileExists(base.ReportPath) {
+			logger.Info("report pruned: page kept", "job", j.ID, "base", baseID(base))
+			continue
 		}
 		out, _, err := srv.renderStored(j, base)
 		if err != nil {

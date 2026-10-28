@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
+	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"regexp"
@@ -522,13 +526,43 @@ func (s *Server) serveReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f, err := os.Open(j.ReportPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		http.Error(w, "This report was deleted to save space: only the newest reports are kept. The replay's page remains.", http.StatusGone)
+		return
+	}
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	defer f.Close()
 	w.Header().Set("Content-Type", "application/json")
-	http.ServeContent(w, r, "", time.Time{}, f)
+	if !strings.HasSuffix(j.ReportPath, ".gz") {
+		http.ServeContent(w, r, "", time.Time{}, f)
+		return
+	}
+	// Sent as stored to clients that take gzip (browsers, curl --compressed).
+	w.Header().Set("Vary", "Accept-Encoding")
+	if acceptsGzip(r) {
+		w.Header().Set("Content-Encoding", "gzip")
+		http.ServeContent(w, r, "", time.Time{}, f)
+		return
+	}
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		http.Error(w, "report unavailable", http.StatusInternalServerError)
+		return
+	}
+	io.Copy(w, zr)
+}
+
+// acceptsGzip reports whether r's client takes gzip-encoded responses.
+func acceptsGzip(r *http.Request) bool {
+	for _, e := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		if name, _, _ := strings.Cut(e, ";"); strings.TrimSpace(name) == "gzip" {
+			return true
+		}
+	}
+	return false
 }
 
 // serveQueue lists pending jobs; jobs the request may not see are anonymized.

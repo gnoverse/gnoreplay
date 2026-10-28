@@ -345,11 +345,16 @@ func TestServerEndToEnd(t *testing.T) {
 	assert.Contains(t, page, "Branch chain/mainnet")
 	code, _ = get(anon, "/gnolang/gno/pull/99")
 	assert.Equal(t, http.StatusNotFound, code)
-	code, report := get(anon, fmt.Sprintf("/reports/%d", prJob.ID))
-	require.Equal(t, http.StatusOK, code)
-	var served Report
-	require.NoError(t, json.Unmarshal([]byte(report), &served))
-	assert.Len(t, served.Diffs, 1)
+	// Reports are stored gzipped, and sent so to clients that take it (Go's
+	// does, and unzips); others get plain JSON.
+	assert.True(t, strings.HasSuffix(prJob.ReportPath, ".json.gz"), prJob.ReportPath)
+	for _, client := range []*http.Client{anon, {Transport: &http.Transport{DisableCompression: true}}} {
+		code, report := get(client, fmt.Sprintf("/reports/%d", prJob.ID))
+		require.Equal(t, http.StatusOK, code)
+		var served Report
+		require.NoError(t, json.Unmarshal([]byte(report), &served))
+		assert.Len(t, served.Diffs, 1)
+	}
 
 	code, index := get(anon, "/")
 	require.Equal(t, http.StatusOK, code)

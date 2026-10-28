@@ -36,7 +36,8 @@ type Server struct {
 	// wake is signaled when a job is enqueued.
 	wake chan struct{}
 
-	gitMu sync.Mutex // serializes git operations on the mirrors
+	gitMu   sync.Mutex // serializes git operations on the mirrors
+	pruneMu sync.Mutex // serializes pruneReports
 
 	mu       sync.Mutex
 	running  map[int64]context.CancelCauseFunc
@@ -200,6 +201,7 @@ func (s *Server) track(ctx context.Context, j *Job, replay func(context.Context,
 	if j.Event == eventPush {
 		s.reclassifyAgainst(j.ID)
 	}
+	s.pruneReports(ctx)
 }
 
 // baselineFor returns the job to classify j against: the replay of the commit
@@ -282,7 +284,7 @@ func baseID(base *Job) int64 {
 
 // bodyPath is where a job's rendered page body is stored, next to its report.
 func bodyPath(reportPath string) string {
-	return strings.TrimSuffix(reportPath, ".json") + ".md"
+	return strings.TrimSuffix(strings.TrimSuffix(reportPath, ".gz"), ".json") + ".md"
 }
 
 // replay fetches the commit, builds gnoreplay from it and runs it against a
@@ -358,14 +360,18 @@ func (s *Server) removeJobDir(ctx context.Context, dir string) {
 	}
 }
 
-// saveReport moves a job's report from its job dir to the reports dir.
+// saveReport stores a job's report from its job dir in the reports dir,
+// gzipped: they are ~100 MB of JSON, ~7 MB gzipped.
 func (s *Server) saveReport(j *Job, reportFile string) (*Report, string, error) {
-	reportPath := filepath.Join(s.reportsDir(), fmt.Sprintf("%d.json", j.ID))
-	if err := os.Rename(reportFile, reportPath); err != nil {
+	report, err := readReport(reportFile)
+	if err != nil {
 		return nil, "", err
 	}
-	report, err := readReport(reportPath)
-	return report, reportPath, err
+	reportPath := filepath.Join(s.reportsDir(), fmt.Sprintf("%d.json.gz", j.ID))
+	if err := compressFile(reportFile, reportPath); err != nil {
+		return nil, "", err
+	}
+	return report, reportPath, nil
 }
 
 // replayLocal builds the tool in src and replays in the local job sandboxes,

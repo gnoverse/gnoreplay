@@ -1,8 +1,10 @@
 package main
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -42,12 +44,21 @@ type Result struct {
 }
 
 func readReport(path string) (*Report, error) {
-	bz, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
+	var in io.Reader = f
+	// Reports are gzipped once saved; the job dir's copy, and reports saved
+	// before that, are not.
+	if strings.HasSuffix(path, ".gz") {
+		if in, err = gzip.NewReader(f); err != nil {
+			return nil, err
+		}
+	}
 	r := &Report{}
-	return r, json.Unmarshal(bz, r)
+	return r, json.NewDecoder(in).Decode(r)
 }
 
 // id identifies "the same divergence" across two reports. Block diffs carry

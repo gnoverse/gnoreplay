@@ -438,6 +438,19 @@ func (q *Queue) SetResult(id int64, outcome, summary string, baseID int64) error
 	return err
 }
 
+// Reports lists the done jobs with a report, newest first. Pruned reports
+// keep their path: the page body is found from it.
+func (q *Queue) Reports() ([]*Job, error) {
+	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs WHERE state = ? AND report_path != ''
+		ORDER BY finished_at DESC, id DESC`, stateDone))
+}
+
+// SetReportPath records where a job's report moved.
+func (q *Queue) SetReportPath(id int64, path string) error {
+	_, err := q.db.Exec(`UPDATE jobs SET report_path = ? WHERE id = ?`, path, id)
+	return err
+}
+
 // SetReplay records what a job replays (see Job.ReplaySHA): sha, note, and
 // the commit it was based on (baseSHA, see Job.BaseSHA; empty for pushes).
 func (q *Queue) SetReplay(id int64, sha, note, baseSHA string) error {
