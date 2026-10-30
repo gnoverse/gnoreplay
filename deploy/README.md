@@ -19,11 +19,9 @@ hcloud context create gnoreplay
 hcloud network create --name gnoreplay --ip-range 10.0.0.0/16
 hcloud network add-subnet gnoreplay --type cloud --network-zone eu-central --ip-range 10.0.0.0/24
 
-# Workers accept no inbound connections (a firewall with no inbound rules); they
-# need outbound access for Go and its modules, and the coordinator over the
-# private network (which firewalls don't filter).
-hcloud firewall create --name gnoreplay-worker
-hcloud firewall apply-to-resource gnoreplay-worker --type label_selector --label-selector gnoreplay=worker
+# Workers get no public IP (Hetzner limits them per account): they reach the
+# coordinator over this network, and Go and its modules through the
+# coordinator's worker endpoint, which tunnels HTTPS to their hosts only.
 
 # Your SSH key: its ID goes in the config (without one, Hetzner emails a root
 # password for every worker). So does the network's.
@@ -45,7 +43,7 @@ hcloud server create --name gnoreplay --type cpx12 --image ubuntu-24.04 --locati
   --network gnoreplay --ssh-key <you> --firewall gnoreplay-coordinator
 ```
 
-Inbound: 22 (SSH) and 80/443 (the result pages, through Caddy); port 8081 is only bound to the private address. Use the workers' `location` (or one in the same network zone).
+Inbound: 22 (SSH) and 80/443 (the result pages, through Caddy); port 8081 is only bound to the private address, where it serves workers their jobs and their HTTPS proxy (to Go's download hosts only). Use the workers' `location` (or one in the same network zone).
 
 On the server:
 
@@ -133,7 +131,7 @@ To stop everything at once: `systemctl stop gnoreplay-server && hcloud server li
 ## Operating
 
 - Worker servers are named `gnoreplay-worker-<random>` and labelled `gnoreplay=worker`, `gnoreplay-job=<id>` while they run a job, and `gnoreplay-since=<Unix time>` (when they got their job, or became idle). A worker whose replay ends (done, failed, superseded or timed out) becomes idle: the next replay reinstalls it with its own startup script (Hetzner's rebuild, which wipes its disk), so that nothing of a replay, whose PR code ran as root, reaches the next one. Idle workers are deleted in the last 5 minutes of their billing hour.
-- Restarting the server (e.g. to deploy) keeps running replays: it leaves their workers running, and the next process resumes them, within the same time limits; it takes the other workers as idle ones. Deploy within a few minutes of stopping: that is how long workers retry posting a result to a stopped server.
+- Restarting the server (e.g. to deploy) keeps running replays: it leaves their workers running, and the next process resumes them, within the same time limits; it takes the other workers as idle ones. Deploy within a few minutes of stopping: that is how long workers retry posting a result to a stopped server, or downloading Go and its modules through it.
 - If Hetzner refuses a new worker (out of capacity, or over the project's core limit: each `ccx13` counts 2 dedicated cores, a `cpx42` 8 shared ones, and `workers` of them must fit, plus the coordinator's shared ones), the job keeps its place and retries every minute, taking a worker that becomes idle meanwhile, until its `run_timeout`. Its log says why.
 - After a change to how results are rendered, run `gnoreplay-server -config /etc/gnoreplay/config.toml rerender` (as the `gnoreplay` user) to update the pages of past replays.
 - A running replay's progress (its height, and the time left at its pace so far) is on its job's page and in `/queue`: the worker posts it every minute. The replay's own log, with a line every 30 seconds, is in `/root/gnoreplay/<job>/worker.log` on the worker while it runs (SSH in through the coordinator, over the private network: `ssh -A root@<coordinator>` then `ssh root@10.0.0.<n>`), and in its job's page when it fails.

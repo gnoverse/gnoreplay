@@ -12,6 +12,9 @@ WORK={{q .WorkDir}}
 GO_VERSION={{q .GoVersion}}
 export GOMEMLIMIT={{q .GoMemLimit}}
 export HOME=${HOME:-/root}
+# No public IP: Go and its modules come through the coordinator, which
+# tunnels HTTPS to their hosts only.
+export https_proxy=$URL
 
 mkdir -p "$WORK"
 LOG="$WORK/worker.log"
@@ -45,9 +48,25 @@ fail() {
 
 step() { echo "==> $* ($(date -u +%H:%M:%S))"; }
 
+# retry <cmd...> runs cmd up to 5 times, for about 2 minutes: downloads
+# through the coordinator's proxy are cut by its restarts.
+retry() {
+	local attempt
+	for attempt in 1 2 3 4; do
+		"$@" && return 0
+		sleep 30
+	done
+	"$@"
+}
+
+install_go() {
+	rm -rf /usr/local/go &&
+		curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xz
+}
+
 if ! command -v go >/dev/null; then
 	step "install go $GO_VERSION"
-	curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xz || fail "install go"
+	retry install_go || fail "install go"
 	export PATH=/usr/local/go/bin:$PATH
 fi
 
@@ -72,7 +91,7 @@ step "download genesis"
 api GET genesis -o genesis.json || fail "download genesis"
 
 step "build"
-go -C src/contribs/gnoreplay mod tidy || fail "go mod tidy"
+retry go -C src/contribs/gnoreplay mod tidy || fail "go mod tidy"
 go -C src/contribs/gnoreplay build -o "$WORK/gnoreplay" . || fail "build"
 
 step "replay"

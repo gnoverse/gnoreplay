@@ -80,7 +80,8 @@ type HetznerConfig struct {
 	// without it, Hetzner emails a root password for every server.
 	SSHKeys []int64 `toml:"ssh_keys"`
 	// Listen is the coordinator's private address that workers download
-	// their inputs from, and URL how they reach it ("http://10.x.y.z:8081").
+	// their inputs from (and Go and its modules, through it: they have no
+	// public IP), and URL how they reach it ("http://10.x.y.z:8081").
 	Listen string `toml:"listen"`
 	URL    string `toml:"url"`
 	// GoVersion is the Go toolchain installed on workers (newer versions

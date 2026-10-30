@@ -44,7 +44,8 @@ network = 1234567
 # IDs of SSH keys set on workers (`hcloud ssh-key list`; none set means
 # Hetzner emails a root password for every worker).
 ssh_keys = [12345678]
-# The coordinator's private address, where workers fetch their inputs.
+# The coordinator's private address, where workers fetch their inputs, and Go
+# and its modules (it is their HTTPS proxy: workers have no public IP).
 listen = "10.0.0.2:8081"
 url = "http://10.0.0.2:8081"
 go_version = "1.26.1"

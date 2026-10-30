@@ -572,7 +572,8 @@ func (s *Server) reapLoop(ctx context.Context, every time.Duration) {
 	}
 }
 
-// workerRoutes serves workers, on the private network only.
+// workerRoutes serves workers, on the private network only: their jobs'
+// inputs and results, and their HTTPS proxy (proxyConnect).
 func (s *Server) workerRoutes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /worker/{id}/source", s.withSession(func(w http.ResponseWriter, _ *http.Request, sess *session, _ int64) {
@@ -625,7 +626,13 @@ func (s *Server) workerRoutes() http.Handler {
 		sess.signal()
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			s.proxyConnect(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // saveUpload writes body to path atomically: path exists only once complete.

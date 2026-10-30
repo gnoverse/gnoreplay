@@ -82,6 +82,9 @@ func (p *hetznerProvisioner) Create(ctx context.Context, name, userData string, 
 		UserData:   userData,
 		Labels:     labels,
 		Networks:   []*hcloud.Network{{ID: p.cfg.Network}},
+		// No public IP (the account's are few): workers reach the
+		// coordinator over the network, and Go's hosts through its proxy.
+		PublicNet: &hcloud.ServerCreatePublicNet{EnableIPv4: false, EnableIPv6: false},
 	})
 	if err != nil {
 		// A rate limit or an outage is worth retrying; a rejected request or
