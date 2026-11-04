@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -64,7 +65,26 @@ func (f *fakeMachines) boot(m *fakeMachine, userData string) error {
 	m.cancel, m.done = cancel, done
 	go func() {
 		defer close(done)
-		exec.CommandContext(ctx, "bash", script).Run()
+		// Killed as a whole, its own process group: what the script started
+		// (a tar, a curl) must not outlive its machine, and write into a
+		// test's temp dir while it is removed.
+		cmd := exec.CommandContext(ctx, "bash", script)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+		cmd.Run()
+		if cmd.Process == nil {
+			return
+		}
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// Until the group is gone: a killed process completes the system
+		// call it was in. (Bounded: orphans are reaped by init, which may
+		// not do so promptly in a container.)
+		for range 500 {
+			if syscall.Kill(-cmd.Process.Pid, 0) != nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}()
 	return nil
 }
