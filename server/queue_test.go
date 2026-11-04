@@ -20,7 +20,8 @@ func newTestQueue(t *testing.T) *Queue {
 
 // A database from before the added columns gets them, and keeps its jobs.
 // Its jobs table is the one 8c3386e (Oct 6) shipped: no outcome, summary,
-// started_at, base_id, title, author, replay_sha, replay_note or progress.
+// started_at, base_id, title, author, replay_sha, replay_note, progress,
+// machine or machine_info.
 func TestMigrate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "jobs.db")
 	db, err := sql.Open("sqlite", path)
@@ -47,7 +48,7 @@ func TestMigrate(t *testing.T) {
 	}
 }
 
-// A running job's progress is kept until it runs again.
+// A running job's progress, and its machine, are kept until it runs again.
 func TestProgress(t *testing.T) {
 	cfg := &Config{}
 	cfg.setDefaults()
@@ -57,6 +58,9 @@ func TestProgress(t *testing.T) {
 	j, err := q.Claim()
 	require.NoError(t, err)
 	require.NoError(t, q.SetProgress(j.ID, Progress{Height: 25, Tip: 50, BlocksPerSecond: 5, At: time.Unix(1, 0)}))
+	require.NoError(t, q.SetMachine(j.ID, "gnoreplay-worker-a (1)"))
+	machine := MachineInfo{CPU: "AMD EPYC-Milan Processor", CPUs: 2, ThreadsPerCore: 2, MemoryKB: 8 << 20, Busy: 80, Idle: 19, Steal: 1}
+	require.NoError(t, q.SetMachineInfo(j.ID, machine))
 	got, err := q.Get(j.ID)
 	require.NoError(t, err)
 	require.NotNil(t, got.Progress)
@@ -64,6 +68,11 @@ func TestProgress(t *testing.T) {
 	got.Progress.At = time.Time{}
 	assert.Equal(t, Progress{Height: 25, Tip: 50, BlocksPerSecond: 5}, *got.Progress)
 	assert.Equal(t, "replaying: block 25 of 50 (50%), about 5s left", result(got))
+	assert.Equal(t, "gnoreplay-worker-a (1)", got.Machine)
+	require.NotNil(t, got.MachineInfo)
+	assert.Equal(t, machine, *got.MachineInfo)
+	assert.Equal(t, "AMD EPYC-Milan Processor, 2 CPUs (2 threads per core), 8.0 GiB · since it booted for this job: 80% busy, 0.0% I/O wait, 1.0% steal",
+		got.MachineInfo.String())
 
 	// A restart requeues it: it starts over.
 	n, err := q.Requeue()
@@ -76,6 +85,8 @@ func TestProgress(t *testing.T) {
 	got, err = q.Get(j.ID)
 	require.NoError(t, err)
 	assert.Nil(t, got.Progress)
+	assert.Empty(t, got.Machine)
+	assert.Nil(t, got.MachineInfo)
 	assert.Equal(t, "replaying", result(got))
 	require.NoError(t, q.SetProgress(j.ID, Progress{Tip: 50}))
 	got, err = q.Get(j.ID)

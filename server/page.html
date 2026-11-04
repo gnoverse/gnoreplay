@@ -185,6 +185,7 @@ gnoreplay replays gno.land mainnet's history with each change. Results are advis
 <dt>Started</dt><dd>{{ts .StartedAt}}</dd>
 <dt>Finished</dt><dd>{{ts .FinishedAt}}</dd>
 <dt>Took</dt><dd>{{took .}}</dd>
+{{with .Machine}}<dt>Worker machine</dt><dd>{{.}}{{with $.Job.MachineInfo}}<div class="muted">{{.}}</div>{{end}}</dd>{{end}}
 {{if .ReportPath}}<dt>Report</dt><dd><a href="/reports/{{.ID}}">full report (JSON)</a></dd>{{end}}
 </dl>{{end}}
 {{with .Body}}<div class="report">{{.}}</div>{{end}}

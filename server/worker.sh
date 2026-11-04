@@ -48,6 +48,23 @@ fail() {
 
 step() { echo "==> $* ($(date -u +%H:%M:%S))"; }
 
+# post_machine posts what this machine is, and how its CPU time was spent
+# since it booted for this job (/proc/stat's first line: user nice system idle
+# iowait irq softirq steal), to tell a slow machine from a slow replay. One
+# try: it is posted again with each progress.
+post_machine() {
+	local cpu user nice system idle iowait irq softirq steal
+	cpu=$(awk -F': ' '/^model name/ { print $2; exit }' /proc/cpuinfo | tr -cd '[:alnum:] ._@()+-')
+	read -r _ user nice system idle iowait irq softirq steal _ </proc/stat
+	printf '{"cpu":"%s","cpus":%d,"threads_per_core":%d,"memory_kb":%d,"busy":%d,"idle":%d,"iowait":%d,"steal":%d}' \
+		"$cpu" "$(nproc)" "$(lscpu | awk -F: '/^Thread\(s\) per core/ { print $2 + 0 }')" \
+		"$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)" \
+		$((user + nice + system + irq + softirq)) "$idle" "$iowait" "$steal" |
+		curl -fsS -m 10 -o /dev/null -H "Authorization: Bearer $TOKEN" --data-binary @- "$URL/worker/$JOB/machine"
+}
+# Once now, before the build: a job that fails or runs out of time has it too.
+post_machine
+
 # retry <cmd...> runs cmd up to 5 times, for about 2 minutes: downloads
 # through the coordinator's proxy are cut by its restarts.
 retry() {
@@ -101,6 +118,7 @@ step "replay"
 	while sleep {{.ProgressSeconds}}; do
 		[ -s progress.json ] && curl -fsS -m 10 -o /dev/null -H "Authorization: Bearer $TOKEN" \
 			--data-binary @progress.json "$URL/worker/$JOB/progress"
+		post_machine
 	done
 ) &
 reporter=$!

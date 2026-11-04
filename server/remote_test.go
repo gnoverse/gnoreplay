@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -379,6 +380,21 @@ func TestRemoteReplay(t *testing.T) {
 	assert.NotContains(t, machines.labels(worker), labelJob, "idle")
 	// The session is gone: its token no longer works.
 	assert.Empty(t, srv.sessions)
+	// The job records its machine, and what the machine said of itself.
+	found, err := machines.Find(ctx, worker)
+	require.NoError(t, err)
+	require.NotNil(t, found)
+	assert.Equal(t, fmt.Sprintf("%s (%s)", worker, found.ID), ok.Machine)
+	require.NotNil(t, ok.MachineInfo, "posted before the build")
+	if runtime.GOOS == "linux" { // what the worker script reads is Linux's
+		assert.Positive(t, ok.MachineInfo.CPUs)
+		assert.Positive(t, ok.MachineInfo.ThreadsPerCore)
+		assert.Positive(t, ok.MachineInfo.MemoryKB)
+		assert.Positive(t, ok.MachineInfo.Busy+ok.MachineInfo.Idle)
+	}
+	page := httptest.NewRecorder()
+	srv.routes().ServeHTTP(page, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/jobs/%d", ok.ID), nil))
+	assert.Contains(t, page.Body.String(), "<dt>Worker machine</dt><dd>"+ok.Machine+`<div class="muted">`)
 
 	// The next job runs on it, reinstalled. The worker fails: the job fails
 	// with the worker's log, and the machine is idle again.

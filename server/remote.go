@@ -147,7 +147,17 @@ func (s *Server) replayRemote(ctx context.Context, j *Job, dir string, log io.Wr
 	if err != nil {
 		return err
 	}
+	s.noteMachine(j.ID, m)
 	return s.awaitWorker(ctx, sess, m, log)
+}
+
+// noteMachine records which machine runs the job, in the journal and on the
+// job: the job's log, which says so too, goes with its dir.
+func (s *Server) noteMachine(jobID int64, m Machine) {
+	s.logger.Info("replay on worker machine", "job", jobID, "machine", m.Name, "id", m.ID)
+	if err := s.queue.SetMachine(jobID, fmt.Sprintf("%s (%s)", m.Name, m.ID)); err != nil {
+		s.logger.Error("record worker machine", "job", jobID, "err", err)
+	}
 }
 
 // createRetry is how often a job retries creating its worker machine.
@@ -423,6 +433,7 @@ func (s *Server) resumeJob(ctx context.Context, r resumable) {
 		}
 		logger.Info("replay resumed", "machine", r.machine.Name)
 		fmt.Fprintf(logFile, "==> resumed by a new server process\n")
+		s.noteMachine(j.ID, r.machine) // for jobs started before machines were recorded
 		if err := s.awaitWorker(ctx, r.sess, r.machine, logFile); err != nil {
 			return nil, "", err
 		}
@@ -613,6 +624,18 @@ func (s *Server) workerRoutes() http.Handler {
 		}
 		p.At = time.Now()
 		if err := s.queue.SetProgress(id, p); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	mux.HandleFunc("POST /worker/{id}/machine", s.withSession(func(w http.ResponseWriter, r *http.Request, _ *session, id int64) {
+		var m MachineInfo
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&m); err != nil || !m.valid() {
+			http.Error(w, "invalid machine info", http.StatusBadRequest)
+			return
+		}
+		if err := s.queue.SetMachineInfo(id, m); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

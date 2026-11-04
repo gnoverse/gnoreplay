@@ -57,6 +57,10 @@ type Job struct {
 	// Progress is how far the replay got, as its worker last reported, or
 	// nil.
 	Progress *Progress
+	// Machine is the worker machine the job runs or ran on, "name (id)",
+	// and MachineInfo what that machine last reported of itself, or nil.
+	Machine     string
+	MachineInfo *MachineInfo
 }
 
 // Progress is how far a running replay got.
@@ -65,6 +69,38 @@ type Progress struct {
 	Tip             int64     `json:"tip"`
 	BlocksPerSecond float64   `json:"blocks_per_second"` // since the first block
 	At              time.Time `json:"at"`                // when the server got it
+}
+
+// MachineInfo is what a worker machine reports of itself: its CPU, and how
+// its CPU time was spent since it booted for the job (in /proc/stat's ticks).
+// It tells a slow machine (another CPU, or a busy host, whose time shows as
+// steal) from a slow replay.
+type MachineInfo struct {
+	CPU  string `json:"cpu"` // the model name
+	CPUs int    `json:"cpus"`
+	// ThreadsPerCore is the CPUs' topology as the machine sees it: a ccx13's
+	// 2 dedicated vCPUs are 1 core's 2 threads.
+	ThreadsPerCore int   `json:"threads_per_core"`
+	MemoryKB       int64 `json:"memory_kb"`
+	Busy           int64 `json:"busy"` // user, nice, system, irq and softirq
+	Idle           int64 `json:"idle"`
+	IOWait         int64 `json:"iowait"`
+	Steal          int64 `json:"steal"`
+}
+
+func (m *MachineInfo) valid() bool {
+	return len(m.CPU) <= 256 && m.CPUs >= 0 && m.ThreadsPerCore >= 0 && m.MemoryKB >= 0 &&
+		m.Busy >= 0 && m.Idle >= 0 && m.IOWait >= 0 && m.Steal >= 0
+}
+
+func (m *MachineInfo) String() string {
+	s := fmt.Sprintf("%s, %d CPUs (%d threads per core), %.1f GiB", m.CPU, m.CPUs, m.ThreadsPerCore, float64(m.MemoryKB)/(1<<20))
+	if total := m.Busy + m.Idle + m.IOWait + m.Steal; total > 0 {
+		pct := func(n int64) float64 { return 100 * float64(n) / float64(total) }
+		s += fmt.Sprintf(" · since it booted for this job: %.0f%% busy, %.1f%% I/O wait, %.1f%% steal",
+			pct(m.Busy), pct(m.IOWait), pct(m.Steal))
+	}
+	return s
 }
 
 const (
@@ -107,7 +143,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 	replay_sha  TEXT    NOT NULL DEFAULT '',
 	replay_note TEXT    NOT NULL DEFAULT '',
 	base_sha    TEXT    NOT NULL DEFAULT '',
-	progress    TEXT    NOT NULL DEFAULT '' -- JSON Progress
+	progress    TEXT    NOT NULL DEFAULT '', -- JSON Progress
+	machine     TEXT    NOT NULL DEFAULT '',
+	machine_info TEXT   NOT NULL DEFAULT '' -- JSON MachineInfo
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state, priority, enqueued_at);
 CREATE INDEX IF NOT EXISTS jobs_key ON jobs (key, state);
@@ -143,6 +181,8 @@ var addedColumns = []struct{ table, column, decl string }{
 	{"jobs", "replay_note", "TEXT NOT NULL DEFAULT ''"},
 	{"jobs", "base_sha", "TEXT NOT NULL DEFAULT ''"},
 	{"jobs", "progress", "TEXT NOT NULL DEFAULT ''"},
+	{"jobs", "machine", "TEXT NOT NULL DEFAULT ''"},
+	{"jobs", "machine_info", "TEXT NOT NULL DEFAULT ''"},
 }
 
 func migrate(db *sql.DB) error {
@@ -272,11 +312,13 @@ func (q *Queue) Claim() (*Job, error) {
 	}
 	j := jobs[0]
 	j.StartedAt = time.Now()
-	// A requeued job starts over: its last run's progress is gone.
-	if _, err := tx.Exec(`UPDATE jobs SET state = ?, started_at = ?, progress = '' WHERE id = ?`, stateRunning, j.StartedAt.UnixNano(), j.ID); err != nil {
+	// A requeued job starts over: its last run's progress and machine are
+	// gone.
+	if _, err := tx.Exec(`UPDATE jobs SET state = ?, started_at = ?, progress = '', machine = '', machine_info = '' WHERE id = ?`,
+		stateRunning, j.StartedAt.UnixNano(), j.ID); err != nil {
 		return nil, err
 	}
-	j.State, j.Progress = stateRunning, nil
+	j.State, j.Progress, j.Machine, j.MachineInfo = stateRunning, nil, "", nil
 	return j, tx.Commit()
 }
 
@@ -331,7 +373,7 @@ func (q *Queue) DependentsOnBase(repo, branch, sha string) ([]*Job, error) {
 // RequeueJob puts one running job back in the queue: its worker machine is
 // gone, and it runs again from the start. It reports whether it did.
 func (q *Queue) RequeueJob(id int64) (bool, error) {
-	res, err := q.db.Exec(`UPDATE jobs SET state = ?, started_at = 0, progress = '' WHERE id = ? AND state = ?`,
+	res, err := q.db.Exec(`UPDATE jobs SET state = ?, started_at = 0, progress = '', machine = '', machine_info = '' WHERE id = ? AND state = ?`,
 		stateQueued, id, stateRunning)
 	if err != nil {
 		return false, err
@@ -475,6 +517,23 @@ func (q *Queue) SetProgress(id int64, p Progress) error {
 	return err
 }
 
+// SetMachine records the worker machine a running job runs on (see
+// Job.Machine).
+func (q *Queue) SetMachine(id int64, machine string) error {
+	_, err := q.db.Exec(`UPDATE jobs SET machine = ? WHERE id = ? AND state = ?`, machine, id, stateRunning)
+	return err
+}
+
+// SetMachineInfo records what a running job's machine reported of itself.
+func (q *Queue) SetMachineInfo(id int64, m MachineInfo) error {
+	bz, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	_, err = q.db.Exec(`UPDATE jobs SET machine_info = ? WHERE id = ? AND state = ?`, string(bz), id, stateRunning)
+	return err
+}
+
 // Requeue puts jobs left running by a previous process back in the queue,
 // except those with a session: they run on worker machines, and are resumed.
 func (q *Queue) Requeue() (int64, error) {
@@ -570,7 +629,8 @@ func (q *Queue) MarkSynced(repo string) error {
 }
 
 const jobColumns = `id, key, repo, event, branch, pr, sha, priority, state, enqueued_at, started_at, finished_at,
-	report_path, outcome, summary, base_id, error, title, author, replay_sha, replay_note, base_sha, progress`
+	report_path, outcome, summary, base_id, error, title, author, replay_sha, replay_note, base_sha, progress,
+	machine, machine_info`
 
 func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 	if err != nil {
@@ -581,16 +641,22 @@ func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 	for rows.Next() {
 		j := &Job{}
 		var enq, start, fin int64
-		var progress string
+		var progress, machineInfo string
 		if err := rows.Scan(&j.ID, &j.Key, &j.Repo, &j.Event, &j.Branch, &j.PR, &j.SHA, &j.Priority, &j.State,
 			&enq, &start, &fin, &j.ReportPath, &j.Outcome, &j.Summary, &j.BaseID, &j.Error, &j.Title, &j.Author,
-			&j.ReplaySHA, &j.ReplayNote, &j.BaseSHA, &progress); err != nil {
+			&j.ReplaySHA, &j.ReplayNote, &j.BaseSHA, &progress, &j.Machine, &machineInfo); err != nil {
 			return nil, err
 		}
 		if progress != "" {
 			j.Progress = &Progress{}
 			if err := json.Unmarshal([]byte(progress), j.Progress); err != nil {
 				return nil, fmt.Errorf("job %d: progress: %w", j.ID, err)
+			}
+		}
+		if machineInfo != "" {
+			j.MachineInfo = &MachineInfo{}
+			if err := json.Unmarshal([]byte(machineInfo), j.MachineInfo); err != nil {
+				return nil, fmt.Errorf("job %d: machine info: %w", j.ID, err)
 			}
 		}
 		j.EnqueuedAt = time.Unix(0, enq)
