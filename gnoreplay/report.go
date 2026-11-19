@@ -30,6 +30,9 @@ type Report struct {
 	ToHeight   int64  `json:"to_height"`
 	Blocks     int64  `json:"blocks"`
 	Txs        int64  `json:"txs"`
+	// AppHash is the app's hash after the last block it replayed, in hex: what
+	// a checkpoint at ToHeight holds, if the replay stopped there.
+	AppHash string `json:"app_hash,omitempty"`
 
 	// FirstAppHashMismatch is the first height whose app hash differs from the
 	// recorded one; 0 if none. Diffs at later heights have AfterDivergence set.

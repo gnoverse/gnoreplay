@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -58,4 +59,75 @@ func TestRunReusesWorkDir(t *testing.T) {
 	assert.Empty(t, second.Diffs, "a reused work dir replays the same history")
 	assert.Equal(t, first.ToHeight, second.ToHeight)
 	assert.Equal(t, first.Blocks, second.Blocks)
+}
+
+// A replay stopped at a height and resumed from its work dir ends where an
+// uninterrupted one does: the same blocks and txs between them, and the same
+// app hash, wherever it was stopped.
+func TestRunResume(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots a node and replays its chain several times")
+	}
+	root := t.TempDir()
+	dataDir, genesisFile := recordChainOnDisk(t, root)
+
+	full, err := run(log.NewNoopLogger(), dataDir, genesisFile, filepath.Join(root, "full"), replayOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, full.AppHash)
+	require.Greater(t, full.ToHeight, int64(1))
+
+	for split := int64(1); split < full.ToHeight; split++ {
+		t.Run(fmt.Sprintf("at %d", split), func(t *testing.T) {
+			workDir := filepath.Join(root, fmt.Sprintf("work-%d", split))
+			first, err := run(log.NewNoopLogger(), dataDir, genesisFile, workDir, replayOptions{ToHeight: split})
+			require.NoError(t, err)
+			require.Equal(t, split, first.ToHeight)
+
+			// No genesis file: a checkpoint is resumed without it.
+			second, err := run(log.NewNoopLogger(), dataDir, "", workDir, replayOptions{Resume: true})
+			require.NoError(t, err)
+			assert.Empty(t, second.Diffs)
+			assert.Equal(t, full.ChainID, second.ChainID)
+			assert.Equal(t, split+1, second.FromHeight)
+			assert.Equal(t, full.ToHeight, second.ToHeight)
+			assert.Equal(t, full.Blocks, first.Blocks+second.Blocks)
+			assert.Equal(t, full.Txs, first.Txs+second.Txs)
+			assert.Equal(t, full.AppHash, second.AppHash)
+		})
+	}
+}
+
+// A checkpoint of another chain is refused up front, with the cause, and
+// stays usable for its own.
+func TestRunResumeOtherChain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots two nodes and replays a chain")
+	}
+	rootA, rootB := t.TempDir(), t.TempDir()
+	dataA, genesisA := recordChainOnDisk(t, rootA)
+	dataB, _ := recordChainOnDisk(t, rootB)
+	workDir := filepath.Join(rootA, "work")
+
+	_, err := run(log.NewNoopLogger(), dataA, genesisA, workDir, replayOptions{ToHeight: 1})
+	require.NoError(t, err)
+
+	_, err = run(log.NewNoopLogger(), dataB, "", workDir, replayOptions{Resume: true})
+	assert.ErrorContains(t, err, "not of this chain")
+
+	r, err := run(log.NewNoopLogger(), dataA, "", workDir, replayOptions{Resume: true})
+	require.NoError(t, err)
+	assert.Empty(t, r.Diffs)
+}
+
+// Resuming needs the checkpoint's DBs: opening a missing one would create an
+// empty one.
+func TestCheckCheckpointDir(t *testing.T) {
+	assert.ErrorContains(t, checkCheckpointDir(""), "--work-dir")
+
+	dir := t.TempDir()
+	assert.ErrorContains(t, checkCheckpointDir(dir), "no checkpoint to resume")
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "gnolang.db"), 0o755))
+	assert.ErrorContains(t, checkCheckpointDir(dir), "no checkpoint to resume", "the state DB is missing")
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "state.db"), 0o755))
+	assert.NoError(t, checkCheckpointDir(dir))
 }

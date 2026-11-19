@@ -144,7 +144,7 @@ func cpDir(src, dst string) error {
 
 func newTestApp(t *testing.T) abci.Application {
 	t.Helper()
-	app, err := newApp(memdb.NewMemDB(), log.NewNoopLogger())
+	app, err := newApp(memdb.NewMemDB(), log.NewNoopLogger(), 0)
 	require.NoError(t, err)
 	return app
 }

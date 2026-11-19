@@ -5,6 +5,7 @@
 // Usage:
 //
 //	gnoreplay --data-dir gnoland-data --genesis genesis.json [--out report.json]
+//	gnoreplay --data-dir gnoland-data --work-dir checkpoint --resume [--out report.json]
 package main
 
 import (
@@ -22,6 +23,7 @@ import (
 	"github.com/gnolang/gno/gno.land/pkg/gnoland"
 	"github.com/gnolang/gno/gnovm/pkg/gnoenv"
 	abci "github.com/gnolang/gno/tm2/pkg/bft/abci/types"
+	sm "github.com/gnolang/gno/tm2/pkg/bft/state"
 	"github.com/gnolang/gno/tm2/pkg/bft/store"
 	dbm "github.com/gnolang/gno/tm2/pkg/db"
 	"github.com/gnolang/gno/tm2/pkg/db/pebbledb"
@@ -35,8 +37,9 @@ func main() {
 	fs := flag.NewFlagSet("gnoreplay", flag.ContinueOnError)
 	var (
 		dataDir     = fs.String("data-dir", "gnoland-data", "source node data directory (its db/ is opened read-only)")
-		genesisFile = fs.String("genesis", "genesis.json", "genesis.json of the source chain")
+		genesisFile = fs.String("genesis", "genesis.json", "genesis.json of the source chain (not read with --resume)")
 		workDir     = fs.String("work-dir", "", "directory for the replay's app and state DBs and genesis cache (default: a temporary directory, removed on exit)")
+		resume      = fs.Bool("resume", false, "continue from the checkpoint in --work-dir: the app and state DBs an earlier replay left when it stopped at --to. They are modified: run on a copy")
 		toHeight    = fs.Int64("to", 0, "last height to replay (default: source tip)")
 		stopOnFirst = fs.Bool("stop-on-first", false, "stop at the first block with a result or app hash divergence")
 		maxDiffs    = fs.Int("max-diffs", 1000, "maximum number of diffs listed in the report (counts stay exact); 0 for no limit")
@@ -61,6 +64,7 @@ func main() {
 		ToHeight:    *toHeight,
 		StopOnFirst: *stopOnFirst,
 		MaxDiffs:    *maxDiffs,
+		Resume:      *resume,
 		Logger:      logger,
 	}
 	if *progress != "" {
@@ -108,16 +112,24 @@ func writeProgress(path string, height, tip int64, blocksPerSecond float64, logg
 }
 
 func run(logger *slog.Logger, dataDir, genesisFile, workDir string, opts replayOptions) (*Report, error) {
-	if workDir == "" {
-		tmp, err := os.MkdirTemp("", "gnoreplay-")
-		if err != nil {
+	if opts.Resume {
+		// The DBs are the checkpoint: opening a missing one would make an
+		// empty one, and the error would come from somewhere unrelated.
+		if err := checkCheckpointDir(workDir); err != nil {
 			return nil, err
 		}
-		defer os.RemoveAll(tmp)
-		workDir = tmp
-	}
-	if err := prepareWorkDir(workDir); err != nil {
-		return nil, err
+	} else {
+		if workDir == "" {
+			tmp, err := os.MkdirTemp("", "gnoreplay-")
+			if err != nil {
+				return nil, err
+			}
+			defer os.RemoveAll(tmp)
+			workDir = tmp
+		}
+		if err := prepareWorkDir(workDir); err != nil {
+			return nil, err
+		}
 	}
 
 	srcDBDir := filepath.Join(dataDir, "db")
@@ -132,26 +144,37 @@ func run(logger *slog.Logger, dataDir, genesisFile, workDir string, opts replayO
 	}
 	defer stateDB.Close()
 
-	genDoc, err := gnoland.LoadStreamingGenesisDoc(genesisFile, filepath.Join(workDir, "genesis-cache"), logger)
-	if err != nil {
-		return nil, fmt.Errorf("load genesis: %w", err)
+	if !opts.Resume {
+		genDoc, err := gnoland.LoadStreamingGenesisDoc(genesisFile, filepath.Join(workDir, "genesis-cache"), logger)
+		if err != nil {
+			return nil, fmt.Errorf("load genesis: %w", err)
+		}
+		opts.Genesis = genDoc
 	}
-	opts.Genesis = genDoc
 
-	appDB, err := pebbledb.NewPebbleDBWithOpts("gnolang", workDir, &pebble.Options{FS: noSyncFS{vfs.Default}})
-	if err != nil {
-		return nil, fmt.Errorf("open app db: %w", err)
-	}
-	app, err := newApp(appDB, logger)
-	if err != nil {
-		return nil, err
-	}
-	defer app.Close()
 	replayStateDB, err := pebbledb.NewPebbleDBWithOpts("state", workDir, &pebble.Options{FS: noSyncFS{vfs.Default}})
 	if err != nil {
 		return nil, fmt.Errorf("open replay state db: %w", err)
 	}
 	defer replayStateDB.Close()
+	appDB, err := pebbledb.NewPebbleDBWithOpts("gnolang", workDir, &pebble.Options{FS: noSyncFS{vfs.Default}})
+	if err != nil {
+		return nil, fmt.Errorf("open app db: %w", err)
+	}
+	var skipUpgradeHeight int64
+	if opts.Resume {
+		// The checkpoint is at a governance halt height, where the state
+		// holds the halt_min_version of the release that continues the chain.
+		// A tool built from a tree has no release version to meet it: skip
+		// the check at that height, as a node's operator does with
+		// skip_upgrade_height.
+		skipUpgradeHeight = sm.LoadState(replayStateDB).LastBlockHeight
+	}
+	app, err := newApp(appDB, logger, skipUpgradeHeight)
+	if err != nil {
+		return nil, err
+	}
+	defer app.Close()
 
 	r, err := replay(Source{Blocks: store.NewBlockStore(bsDB), StateDB: stateDB}, app, replayStateDB, opts)
 	if err != nil {
@@ -176,6 +199,19 @@ func prepareWorkDir(workDir string) error {
 	return nil
 }
 
+// checkCheckpointDir rejects a work dir that holds no checkpoint to resume.
+func checkCheckpointDir(workDir string) error {
+	if workDir == "" {
+		return errors.New("--resume needs the --work-dir that holds the checkpoint")
+	}
+	for _, name := range []string{"gnolang", "state"} {
+		if _, err := os.Stat(filepath.Join(workDir, name+".db")); err != nil {
+			return fmt.Errorf("no checkpoint to resume in %s: %w", workDir, err)
+		}
+	}
+	return nil
+}
+
 // checkReplayCoverage rejects a report that compared nothing: an empty
 // blockstore, or a state DB with no recorded responses, would otherwise be
 // published as a clean pass.
@@ -191,12 +227,14 @@ func checkReplayCoverage(r *Report, dataDir string) error {
 }
 
 // newApp builds the application the way `gnoland start` does (see
-// gnoland.NewApp), on a fresh DB.
-func newApp(db dbm.DB, logger *slog.Logger) (abci.Application, error) {
+// gnoland.NewApp), on a fresh DB, or on a checkpoint's (then skipUpgradeHeight
+// is its height).
+func newApp(db dbm.DB, logger *slog.Logger, skipUpgradeHeight int64) (abci.Application, error) {
 	return gnoland.NewAppWithOptions(&gnoland.AppOptions{
-		DB:          db,
-		Logger:      logger.With("module", "app"),
-		EventSwitch: events.NewEventSwitch(),
+		DB:                db,
+		Logger:            logger.With("module", "app"),
+		EventSwitch:       events.NewEventSwitch(),
+		SkipUpgradeHeight: skipUpgradeHeight,
 		InitChainerConfig: gnoland.InitChainerConfig{
 			// Genesis tx failures are reported as diffs, not fatal.
 			GenesisTxResultHandler: gnoland.NoopGenesisTxResultHandler,

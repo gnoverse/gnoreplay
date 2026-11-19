@@ -50,7 +50,11 @@ type replayOptions struct {
 	ToHeight    int64 // last height to replay; 0 means the source tip
 	StopOnFirst bool  // stop after the first block with a result or app hash divergence
 	MaxDiffs    int   // diffs kept in the report; counts stay exact
-	Logger      *slog.Logger
+	// Resume continues from the app's and tm2's state as an earlier replay of
+	// this source left them (stopped at ToHeight): no genesis, and the first
+	// block replayed is the one after it.
+	Resume bool
+	Logger *slog.Logger
 	// Progress, if set, is told the last height replayed (0 once genesis is),
 	// with the blocks per second so far, whenever the replay logs it.
 	Progress func(height, tip int64, blocksPerSecond float64)
@@ -70,9 +74,23 @@ func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions
 	genDoc := opts.Genesis
 	start := time.Now()
 
-	firstHeight := genDoc.InitialHeight
-	if firstHeight == 0 {
-		firstHeight = 1
+	var firstHeight int64
+	if opts.Resume {
+		saved := sm.LoadState(stateDB)
+		if saved.IsEmpty() {
+			return nil, errors.New("no checkpoint to resume from: the state DB is empty")
+		}
+		if err := checkCheckpoint(src, saved); err != nil {
+			return nil, err
+		}
+		// Past genesis, the handshake needs nothing else of the genesis doc.
+		genDoc = &bft.GenesisDoc{ChainID: saved.ChainID}
+		firstHeight = saved.LastBlockHeight + 1
+	} else {
+		firstHeight = genDoc.InitialHeight
+		if firstHeight == 0 {
+			firstHeight = 1
+		}
 	}
 	tip := src.Blocks.Height()
 	if opts.ToHeight > 0 && opts.ToHeight < tip {
@@ -99,7 +117,8 @@ func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions
 
 	// Genesis, as a node's first start does it: the handshake, on an empty
 	// block store, sends InitChain and stores the genesis tx results at
-	// height 0.
+	// height 0. Resumed, the app is past it: the handshake only checks that
+	// its hash is the one tm2's state holds.
 	state, err := sm.LoadStateFromDBOrGenesisDoc(stateDB, genDoc)
 	if err != nil {
 		return nil, err
@@ -113,17 +132,21 @@ func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions
 		return nil, fmt.Errorf("InitChain: %v", genesis.err)
 	}
 	state = sm.LoadState(stateDB)
-	gotGenesis, err := sm.LoadABCIResponses(stateDB, 0)
-	if err != nil {
-		return nil, err
-	}
-	if want, err := loadResponses(src.StateDB, 0); err != nil {
-		return nil, err
-	} else if want != nil {
-		r.compareTxs(0, nil, want.DeliverTxs, gotGenesis.DeliverTxs)
+	if opts.Resume {
+		logger.Info("checkpoint resumed", "height", state.LastBlockHeight, "elapsed", time.Since(start))
+	} else {
+		gotGenesis, err := sm.LoadABCIResponses(stateDB, 0)
+		if err != nil {
+			return nil, err
+		}
+		if want, err := loadResponses(src.StateDB, 0); err != nil {
+			return nil, err
+		} else if want != nil {
+			r.compareTxs(0, nil, want.DeliverTxs, gotGenesis.DeliverTxs)
+		}
+		logger.Info("genesis replayed", "txs", len(gotGenesis.DeliverTxs), "elapsed", time.Since(start))
 	}
 	r.Timing.GenesisSeconds = time.Since(start).Seconds()
-	logger.Info("genesis replayed", "txs", len(gotGenesis.DeliverTxs), "elapsed", time.Since(start))
 	if opts.Progress != nil {
 		opts.Progress(firstHeight-1, tip, 0)
 	}
@@ -202,6 +225,7 @@ func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions
 		}
 		r.Blocks++
 		r.Txs += int64(len(block.Txs))
+		r.AppHash = fmt.Sprintf("%X", next.AppHash) // the app's own, before a divergence is overridden below
 
 		if opts.StopOnFirst && (resultsDiverged || valsDiverged || paramsDiverged || hashDiverged) {
 			r.ToHeight = height
@@ -263,6 +287,28 @@ func replay(src Source, app abci.Application, stateDB dbm.DB, opts replayOptions
 	}
 	r.Timing.TotalSeconds = time.Since(start).Seconds()
 	return r, nil
+}
+
+// checkCheckpoint rejects a state to resume from that is not this source
+// chain's at its height (another chain's, or a fork's): its last block must be
+// the source's, and so must the app hash the source's next block carries.
+// Without it the next block would be refused for a header mismatch that says
+// nothing of the cause.
+func checkCheckpoint(src Source, state sm.State) error {
+	height := state.LastBlockHeight
+	meta := src.Blocks.LoadBlockMeta(height)
+	if meta == nil {
+		return fmt.Errorf("the checkpoint is at height %d, which the source's blockstore doesn't have", height)
+	}
+	if !meta.BlockID.Equals(state.LastBlockID) {
+		return fmt.Errorf("the checkpoint at height %d is not of this chain: its last block is %v, the source's %v",
+			height, state.LastBlockID, meta.BlockID)
+	}
+	if want := recordedAppHash(src, height); want != nil && !bytes.Equal(want, state.AppHash) {
+		return fmt.Errorf("the checkpoint at height %d is not of this chain: its app hash is %X, the source's %X",
+			height, state.AppHash, want)
+	}
+	return nil
 }
 
 // applyBlock is blockExec.ApplyBlock, with a panic returned as an error: the

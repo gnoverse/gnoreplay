@@ -28,8 +28,9 @@ gnoreplay --data-dir <node data dir> --genesis genesis.json --out report.json
 | Flag | Description |
 |---|---|
 | `--data-dir` | Source node data directory. Its `db/blockstore.db` and `db/state.db` are opened read-only; the node must be stopped (or use a copy/snapshot). |
-| `--genesis` | The source chain's `genesis.json`. |
+| `--genesis` | The source chain's `genesis.json`. Not read with `--resume`. |
 | `--work-dir` | Where the replay's app and state DBs and genesis cache live (default: a temporary directory, removed on exit). The app and state DBs of an earlier run are removed at start, keeping the genesis cache, so a reused directory is safe. |
+| `--resume` | Continue from the checkpoint in `--work-dir` instead of replaying genesis (see [Checkpoints](#checkpoints)). |
 | `--to` | Last height to replay (default: the source tip). |
 | `--stop-on-first` | Stop at the first block with a result or app hash divergence. |
 | `--max-diffs` | Diffs listed in the report (default 1000; counts stay exact). |
@@ -41,6 +42,22 @@ Exit status: `0` no consensus-relevant diffs, `1` error (a bad flag included), `
 The stdlibs are read from `GNOROOT` at runtime (not embedded in the binary), so run it from — or with `GNOROOT` pointing at — the checkout it was built from.
 
 Memory: the first commit writes the whole genesis state at once. For mainnet (3.26M genesis accounts) it peaks above 8 GB with Go's default GC settings; with `GOMEMLIMIT=7GiB` it completes within 9 GB.
+
+## Checkpoints
+
+A replay stopped at a height (`--to`) leaves its app DB and tm2 state DB in `--work-dir`: that is a checkpoint, and the report's `app_hash` is the app hash it holds. `--resume` continues from it, with the tree under test: it skips genesis (and does not read `--genesis`) and replays from the next height.
+
+```bash
+gnoreplay --data-dir <data> --genesis genesis.json --work-dir checkpoint --to <height> --stop-on-first --out report.json   # built from the release that ran up to <height>
+cp -a checkpoint run && gnoreplay --data-dir <data> --work-dir run --resume --out report.json                              # built from the tree under test
+```
+
+It exists for a hardfork whose new release cannot replay the history before it (gno.land mainnet's v1.8.0 refuses transactions that earlier blocks hold): the checkpoint is made at the halt height with the release that ran the chain up to it, run with its own `GNOROOT`, and every later replay starts there.
+
+- The DBs are modified by the replay: run on a copy.
+- A checkpoint that is not the source chain's is refused before any block is applied: its last block and its app hash must be the source's at that height.
+- The version check of a node that starts on a state with a governance halt (`halt_min_version`) is skipped at the checkpoint's height, as an operator does with `skip_upgrade_height`: a tool built from a tree has no release version to meet it. So a checkpoint must be at a halt height.
+- A checkpoint is only as good as the replay that made it: make it with `--stop-on-first`, and check that the report reached the height with no result or block diffs.
 
 ## What is compared
 
