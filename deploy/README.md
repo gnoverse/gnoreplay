@@ -56,12 +56,10 @@ git clone https://github.com/gnoverse/gnoreplay /opt/gnoreplay/src && ln -s src/
 (cd /opt/gnoreplay/server && /usr/local/go/bin/go build -o /opt/gnoreplay/bin/gnoreplay-server .)
 ```
 
-**Chain data.** Replays run the blocks a mainnet node stores in its `blockstore.db`, and compare against the tx results in its `state.db`. `gnoreplay-golden` ([`fetch-golden.sh`](../server/scripts/fetch-golden.sh)) downloads them from the newest snapshot on snapshots.gno.land every 12 hours: each snapshot is ~2 GB, served by the gno.land team, so not more often. If the download fails, replays keep the last copy. Both refresh scripts then run [`golden-prune.sh`](../server/scripts/golden-prune.sh), which keeps the current snapshot, the one before it (a running job may still be copying from it) and anything younger than an hour (a refresh in flight, or one killed before it could clean up), and removes the rest.
+**Chain data.** Replays run the blocks a mainnet node stores in its `blockstore.db`, and compare against the tx results in its `state.db`. `gnoreplay-golden` ([`fetch-golden.sh`](../server/scripts/fetch-golden.sh)) downloads them from the newest snapshot on snapshots.gno.land every 12 hours: each snapshot is ~3.7 GB (November 2026), served by the gno.land team, so not more often. If the download fails, replays keep the last copy. Both refresh scripts then run [`golden-prune.sh`](../server/scripts/golden-prune.sh), which keeps the current snapshot, the one before it (a running job may still be copying from it) and anything younger than an hour (a refresh in flight, or one killed before it could clean up), and removes the rest.
 
 ```bash
 cd /var/lib/gnoreplay
-curl -fsS -O https://snapshots.gno.land/genesis.json -O https://snapshots.gno.land/genesis.json.sha256
-sha256sum -c genesis.json.sha256
 chown -R gnoreplay: /var/lib/gnoreplay
 cp /opt/gnoreplay/src/deploy/systemd/* /etc/systemd/system/
 systemctl daemon-reload
@@ -82,6 +80,17 @@ systemctl daemon-reload
 # Once the node has caught up with mainnet:
 systemctl start gnoreplay-golden
 ```
+
+**Checkpoint.** Replays resume from the state the chain had at its last hardfork, which [`make-checkpoint.sh`](../server/scripts/make-checkpoint.sh) makes once, with the release that ran the chain up to it: for gnoland-1, v1.7.1 up to the v1.8.0 halt at height 1651500 (v1.8.0 cannot replay the blocks before it). It replays the whole history, so it needs a machine with 16 GB of RAM, Go, git and jq (not the coordinator): it took 1h53m on 4 dedicated vCPUs. It takes a data dir of a snapshot past the halt (what `fetch-golden.sh` leaves in `golden/`, with `GOLDEN_ROOT` set to a directory on that machine) and the chain's genesis, and writes a directory of ~1.8 GB:
+
+```bash
+curl -fsS -O https://snapshots.gno.land/genesis.json -O https://snapshots.gno.land/genesis.json.sha256
+sha256sum -c genesis.json.sha256
+CONTINUE=v1.8.0 server/scripts/make-checkpoint.sh v1.7.1 1651500 <data dir with db/blockstore.db and db/state.db> genesis.json checkpoint
+rsync -a checkpoint/ root@<coordinator>:/var/lib/gnoreplay/checkpoint/
+```
+
+`CONTINUE` also resumes the checkpoint with v1.8.0 over the blocks after the halt, and requires them to replay with no diff. `chain.checkpoint_dir` is that directory, and the server refuses to start without a valid one. To move a coordinator from replays of genesis: install the checkpoint, replace `genesis` by `checkpoint_dir` in `/etc/gnoreplay/config.toml` (unknown keys are refused), and deploy the new binary when no job is running (`/queue`): a job that started from genesis fails on a server that no longer serves it. Pages of earlier jobs keep their baselines: a replay is only compared with one that covered the same heights.
 
 **Server.** `/etc/gnoreplay/config.toml` from [`config.hetzner.example.toml`](../server/config.hetzner.example.toml) (the worker server type, the network and SSH key IDs, the coordinator's private address for `[hetzner] listen/url`: `hcloud server describe gnoreplay`), then the secrets, readable by `gnoreplay` only:
 

@@ -80,7 +80,7 @@ footer { border-top: 1px solid var(--border); color: var(--muted); font-size: .8
 {{define "foot"}}
 </main>
 <footer><div class="wrap">
-gnoreplay replays gno.land mainnet's history with each change. Results are advisory, and only published here. <span id="tz"></span> <a href="{{source}}">Source on GitHub</a>
+gnoreplay replays gno.land mainnet's blocks since its last hardfork with each change. Results are advisory, and only published here. <span id="tz"></span> <a href="{{source}}">Source on GitHub</a>
 </div></footer>
 <script>
 (function () {
@@ -118,7 +118,7 @@ gnoreplay replays gno.land mainnet's history with each change. Results are advis
 
 {{define "index"}}{{template "head" .}}
 <h1>Mainnet replay checks</h1>
-<p class="lead">Would this change alter the outcome of a transaction already on gno.land mainnet? For every push to a tracked branch and every PR into one, gnoreplay builds the commit's node and replays the entire history of <strong>gnoland-1</strong> with it, every block from genesis to a recent height, comparing each transaction's result (error, returned data, events) and gas with what the chain recorded.</p>
+<p class="lead">Would this change alter the outcome of a transaction already on gno.land mainnet? For every push to a tracked branch and every PR into one, gnoreplay builds the commit's node and replays <strong>gnoland-1</strong> with it, from the state the chain had at its last hardfork (the history before it can no longer be replayed by newer releases) to a recent height, comparing each transaction's result (error, returned data, events) and gas with what the chain recorded.</p>
 <details><summary>How it works, and how to read a result</summary>
 <ul>
 <li><span class="badge pass">pass</span> no transaction's result changes. Gas-only differences are listed, but pass: on their own, they change no outcome.</li>
