@@ -34,6 +34,9 @@ func TestPrepareWorkDir(t *testing.T) {
 // A replay that compared nothing must not read as a clean pass.
 func TestCheckReplayCoverage(t *testing.T) {
 	assert.ErrorContains(t, checkReplayCoverage(&Report{Blocks: 0}, "/d"), "no blocks")
+	// A source that ends where the checkpoint it is resumed from does.
+	assert.ErrorContains(t, checkReplayCoverage(&Report{FromHeight: 1651501, ToHeight: 1651500}, "/d"),
+		"it ends at height 1651500, before the first to replay, 1651501")
 	assert.ErrorContains(t, checkReplayCoverage(&Report{Blocks: 3, MissingResponses: 3}, "/d"), "nothing to compare")
 	assert.NoError(t, checkReplayCoverage(&Report{Blocks: 3, MissingResponses: 1}, "/d"))
 	assert.NoError(t, checkReplayCoverage(&Report{Blocks: 3}, "/d"))

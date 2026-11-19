@@ -217,6 +217,11 @@ func checkCheckpointDir(workDir string) error {
 // published as a clean pass.
 func checkReplayCoverage(r *Report, dataDir string) error {
 	if r.Blocks == 0 {
+		// E.g. a source that ends at the checkpoint it is resumed from.
+		if r.ToHeight < r.FromHeight {
+			return fmt.Errorf("no blocks to replay in %s: it ends at height %d, before the first to replay, %d",
+				filepath.Join(dataDir, "db"), r.ToHeight, r.FromHeight)
+		}
 		return fmt.Errorf("no blocks to replay in %s", filepath.Join(dataDir, "db"))
 	}
 	if r.MissingResponses == r.Blocks {
