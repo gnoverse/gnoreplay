@@ -49,6 +49,10 @@ type Job struct {
 	// parent for a PR. The comparison baseline is its replay when it has
 	// one, not whatever the base branch's latest replay happens to be.
 	BaseSHA string
+	// FromHeight is the first height the replay covered, as its report says:
+	// results are only compared with a baseline that covered the same range.
+	// 1 for jobs from before checkpoints, which replayed from genesis.
+	FromHeight int64
 	// Outcome is set when the job is done: outcomePass or outcomeDiverges,
 	// with a one-line Summary.
 	Outcome string
@@ -65,7 +69,10 @@ type Job struct {
 
 // Progress is how far a running replay got.
 type Progress struct {
-	Height          int64     `json:"height"` // the last one replayed; 0 once genesis is
+	Height int64 `json:"height"` // the last one replayed; Start before the first
+	// Start is the height the replay started from: its checkpoint's, or 0 from
+	// genesis. The server sets it, as the tool's progress does not say.
+	Start           int64     `json:"start_height"`
 	Tip             int64     `json:"tip"`
 	BlocksPerSecond float64   `json:"blocks_per_second"` // since the first block
 	At              time.Time `json:"at"`                // when the server got it
@@ -145,7 +152,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 	base_sha    TEXT    NOT NULL DEFAULT '',
 	progress    TEXT    NOT NULL DEFAULT '', -- JSON Progress
 	machine     TEXT    NOT NULL DEFAULT '',
-	machine_info TEXT   NOT NULL DEFAULT '' -- JSON MachineInfo
+	machine_info TEXT   NOT NULL DEFAULT '', -- JSON MachineInfo
+	from_height INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state, priority, enqueued_at);
 CREATE INDEX IF NOT EXISTS jobs_key ON jobs (key, state);
@@ -183,6 +191,8 @@ var addedColumns = []struct{ table, column, decl string }{
 	{"jobs", "progress", "TEXT NOT NULL DEFAULT ''"},
 	{"jobs", "machine", "TEXT NOT NULL DEFAULT ''"},
 	{"jobs", "machine_info", "TEXT NOT NULL DEFAULT ''"},
+	// Jobs from before checkpoints replayed everything, from height 1.
+	{"jobs", "from_height", "INTEGER NOT NULL DEFAULT 1"},
 }
 
 func migrate(db *sql.DB) error {
@@ -323,13 +333,14 @@ func (q *Queue) Claim() (*Job, error) {
 }
 
 // Finish records how a running job ended, from the fields of done: State
-// (stateDone or stateFailed), ReportPath, Outcome, Summary, BaseID and Error.
-// It is a no-op if the job was superseded meanwhile, and reports whether the
-// result was recorded.
+// (stateDone or stateFailed), ReportPath, Outcome, Summary, BaseID, Error and
+// FromHeight (kept as it was when 0). It is a no-op if the job was superseded
+// meanwhile, and reports whether the result was recorded.
 func (q *Queue) Finish(id int64, done Job) (bool, error) {
-	res, err := q.db.Exec(`UPDATE jobs SET state = ?, report_path = ?, outcome = ?, summary = ?, base_id = ?, error = ?, finished_at = ?
+	res, err := q.db.Exec(`UPDATE jobs SET state = ?, report_path = ?, outcome = ?, summary = ?, base_id = ?, error = ?, finished_at = ?,
+		from_height = COALESCE(NULLIF(?, 0), from_height)
 		WHERE id = ? AND state = ?`, done.State, done.ReportPath, done.Outcome, done.Summary, done.BaseID, done.Error,
-		time.Now().UnixNano(), id, stateRunning)
+		time.Now().UnixNano(), done.FromHeight, id, stateRunning)
 	if err != nil {
 		return false, err
 	}
@@ -337,12 +348,15 @@ func (q *Queue) Finish(id int64, done Job) (bool, error) {
 	return n == 1, err
 }
 
-// Baseline returns the latest successful push job on repo/branch finished
-// before t, or nil.
-func (q *Queue) Baseline(repo, branch string, t time.Time) (*Job, error) {
+// Baseline returns the latest successful push job on repo/branch that
+// covered heights from fromHeight and finished before t, or nil. A replay
+// that covered other heights (one from genesis, against one from a
+// checkpoint) is no comparison: its diffs at heights the other did not
+// replay would read as fixed or new.
+func (q *Queue) Baseline(repo, branch string, fromHeight int64, t time.Time) (*Job, error) {
 	jobs, err := scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs
-		WHERE repo = ? AND event = ? AND branch = ? AND state = ? AND finished_at < ?
-		ORDER BY finished_at DESC LIMIT 1`, repo, eventPush, branch, stateDone, t.UnixNano()))
+		WHERE repo = ? AND event = ? AND branch = ? AND state = ? AND from_height = ? AND finished_at < ?
+		ORDER BY finished_at DESC LIMIT 1`, repo, eventPush, branch, stateDone, fromHeight, t.UnixNano()))
 	if err != nil || len(jobs) == 0 {
 		return nil, err
 	}
@@ -350,11 +364,12 @@ func (q *Queue) Baseline(repo, branch string, t time.Time) (*Job, error) {
 }
 
 // BaselineSHA returns the completed replay of the push commit sha on
-// repo/branch, or nil: the comparison a PR merged into sha should use.
-func (q *Queue) BaselineSHA(repo, branch, sha string) (*Job, error) {
+// repo/branch that covered heights from fromHeight, or nil: the comparison a
+// PR merged into sha should use.
+func (q *Queue) BaselineSHA(repo, branch, sha string, fromHeight int64) (*Job, error) {
 	jobs, err := scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs
-		WHERE repo = ? AND event = ? AND branch = ? AND sha = ? AND state = ?
-		ORDER BY finished_at DESC LIMIT 1`, repo, eventPush, branch, sha, stateDone))
+		WHERE repo = ? AND event = ? AND branch = ? AND sha = ? AND state = ? AND from_height = ?
+		ORDER BY finished_at DESC LIMIT 1`, repo, eventPush, branch, sha, stateDone, fromHeight))
 	if err != nil || len(jobs) == 0 {
 		return nil, err
 	}
@@ -362,12 +377,12 @@ func (q *Queue) BaselineSHA(repo, branch, sha string) (*Job, error) {
 }
 
 // DependentsOnBase lists the done PR replays merged into the push commit sha
-// of repo/branch: they are compared again once its replay finishes. (See
-// Job.BaseSHA.)
-func (q *Queue) DependentsOnBase(repo, branch, sha string) ([]*Job, error) {
+// of repo/branch that covered heights from fromHeight: they are compared
+// again once its replay finishes. (See Job.BaseSHA.)
+func (q *Queue) DependentsOnBase(repo, branch, sha string, fromHeight int64) ([]*Job, error) {
 	return scanJobs(q.db.Query(`SELECT `+jobColumns+` FROM jobs
-		WHERE repo = ? AND event = ? AND branch = ? AND base_sha = ? AND state = ?`,
-		repo, eventPullRequest, branch, sha, stateDone))
+		WHERE repo = ? AND event = ? AND branch = ? AND base_sha = ? AND state = ? AND from_height = ?`,
+		repo, eventPullRequest, branch, sha, stateDone, fromHeight))
 }
 
 // RequeueJob puts one running job back in the queue: its worker machine is
@@ -630,7 +645,7 @@ func (q *Queue) MarkSynced(repo string) error {
 
 const jobColumns = `id, key, repo, event, branch, pr, sha, priority, state, enqueued_at, started_at, finished_at,
 	report_path, outcome, summary, base_id, error, title, author, replay_sha, replay_note, base_sha, progress,
-	machine, machine_info`
+	machine, machine_info, from_height`
 
 func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 	if err != nil {
@@ -644,7 +659,7 @@ func scanJobs(rows *sql.Rows, err error) ([]*Job, error) {
 		var progress, machineInfo string
 		if err := rows.Scan(&j.ID, &j.Key, &j.Repo, &j.Event, &j.Branch, &j.PR, &j.SHA, &j.Priority, &j.State,
 			&enq, &start, &fin, &j.ReportPath, &j.Outcome, &j.Summary, &j.BaseID, &j.Error, &j.Title, &j.Author,
-			&j.ReplaySHA, &j.ReplayNote, &j.BaseSHA, &progress, &j.Machine, &machineInfo); err != nil {
+			&j.ReplaySHA, &j.ReplayNote, &j.BaseSHA, &progress, &j.Machine, &machineInfo, &j.FromHeight); err != nil {
 			return nil, err
 		}
 		if progress != "" {

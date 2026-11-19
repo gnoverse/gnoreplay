@@ -43,6 +43,7 @@ func TestMigrate(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "abc", j.SHA)
 		assert.True(t, j.StartedAt.IsZero())
+		assert.EqualValues(t, 1, j.FromHeight, "jobs from before checkpoints replayed from genesis")
 		require.NoError(t, q.SetPRInfo(j.Key, "title", "author"))
 		require.NoError(t, q.Close())
 	}
@@ -221,12 +222,12 @@ func TestRequeueAndBaseline(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, n)
 
-	base, err := q.Baseline("gnolang/gno", "master", time.Now())
+	base, err := q.Baseline("gnolang/gno", "master", 1, time.Now())
 	require.NoError(t, err)
 	require.NotNil(t, base)
 	assert.Equal(t, "base1", base.SHA)
 	// Or the last one completed before a time (a job's own excluded).
-	none, err := q.Baseline("gnolang/gno", "master", base.FinishedAt)
+	none, err := q.Baseline("gnolang/gno", "master", 1, base.FinishedAt)
 	require.NoError(t, err)
 	assert.Nil(t, none)
 
@@ -234,7 +235,7 @@ func TestRequeueAndBaseline(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "base2", again.SHA)
 
-	none, err = q.Baseline("gnolang/gno", "chain/mainnet", time.Now())
+	none, err = q.Baseline("gnolang/gno", "chain/mainnet", 1, time.Now())
 	require.NoError(t, err)
 	assert.Nil(t, none)
 }
@@ -286,4 +287,72 @@ func TestPriorityIgnoresUnknown(t *testing.T) {
 	assert.Equal(t, len(cfg.Rules), prio)
 	_, ok = cfg.priority("gnolang/gno-fixes", eventPush, "master")
 	assert.False(t, ok)
+}
+
+// A replay that covered other heights is no baseline: the diffs of a replay
+// from genesis at heights a replay from a checkpoint never ran would read as
+// fixed, and its own as new.
+func TestBaselineFromHeight(t *testing.T) {
+	cfg := &Config{}
+	cfg.setDefaults()
+	q := newTestQueue(t)
+	const from = 1651501
+
+	finish := func(event string, pr int, sha, baseSHA string, fromHeight int64) *Job {
+		t.Helper()
+		_, err := q.Enqueue(testJob(t, cfg, "gnolang/gno", event, "master", pr, sha, time.Now()))
+		require.NoError(t, err)
+		j, err := q.Claim()
+		require.NoError(t, err)
+		if baseSHA != "" {
+			require.NoError(t, q.SetReplay(j.ID, sha, "", baseSHA))
+		}
+		ok, err := q.Finish(j.ID, Job{State: stateDone, ReportPath: "r.json", FromHeight: fromHeight})
+		require.NoError(t, err)
+		require.True(t, ok)
+		done, err := q.Get(j.ID)
+		require.NoError(t, err)
+		return done
+	}
+
+	// The replay from a checkpoint finished first: the one from genesis is the
+	// newer, so only the range can tell them apart.
+	fresh := finish(eventPush, 0, "base", "", from)
+	legacy := finish(eventPush, 0, "base", "", 0) // 0 keeps the default: from block 1
+	assert.EqualValues(t, from, fresh.FromHeight)
+	assert.EqualValues(t, 1, legacy.FromHeight)
+
+	got, err := q.Baseline("gnolang/gno", "master", from, time.Now())
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, fresh.ID, got.ID)
+	got, err = q.Baseline("gnolang/gno", "master", 1, time.Now())
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, legacy.ID, got.ID)
+	got, err = q.Baseline("gnolang/gno", "master", 5, time.Now())
+	require.NoError(t, err)
+	assert.Nil(t, got, "no replay covered these heights")
+
+	got, err = q.BaselineSHA("gnolang/gno", "master", "base", from)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, fresh.ID, got.ID)
+	got, err = q.BaselineSHA("gnolang/gno", "master", "base", 1)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, legacy.ID, got.ID)
+
+	// PRs merged into that commit are compared again with the baseline of
+	// their own range only.
+	prFresh := finish(eventPullRequest, 7, "pr-fresh", "base", from)
+	prLegacy := finish(eventPullRequest, 8, "pr-legacy", "base", 0)
+	deps, err := q.DependentsOnBase("gnolang/gno", "master", "base", from)
+	require.NoError(t, err)
+	require.Len(t, deps, 1)
+	assert.Equal(t, prFresh.ID, deps[0].ID)
+	deps, err = q.DependentsOnBase("gnolang/gno", "master", "base", 1)
+	require.NoError(t, err)
+	require.Len(t, deps, 1)
+	assert.Equal(t, prLegacy.ID, deps[0].ID)
 }

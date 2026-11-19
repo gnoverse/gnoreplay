@@ -102,8 +102,11 @@ type ChainConfig struct {
 	// db/blockstore.db and db/state.db). It is refreshed out of band; each
 	// job takes its own copy of it.
 	GoldenDir string `toml:"golden_dir"`
-	// Genesis is the chain's genesis.json.
-	Genesis string `toml:"genesis"`
+	// CheckpointDir holds the state every replay starts from (see
+	// checkpoint.go): the DBs of a replay stopped at the height of the chain's
+	// last hardfork, and a checkpoint.json describing them. Replays resume
+	// from it and replay the golden copy's blocks after its height.
+	CheckpointDir string `toml:"checkpoint_dir"`
 }
 
 type JobConfig struct {
@@ -250,8 +253,8 @@ func (c *Config) validate() error {
 		return fmt.Errorf("data_dir is required")
 	case c.Chain.GoldenDir == "":
 		return fmt.Errorf("chain.golden_dir is required")
-	case c.Chain.Genesis == "":
-		return fmt.Errorf("chain.genesis is required")
+	case c.Chain.CheckpointDir == "":
+		return fmt.Errorf("chain.checkpoint_dir is required")
 	case c.GitHub.TokenFile == "":
 		return fmt.Errorf("github.token_file is required")
 	case c.Job.GnoreplayOverlay == "":

@@ -92,8 +92,8 @@ import (
 func main() {
 	dataDir := flag.String("data-dir", "", "")
 	out := flag.String("out", "", "")
-	flag.String("genesis", "", "")
-	flag.String("work-dir", "", "")
+	resume := flag.Bool("resume", false, "")
+	workDir := flag.String("work-dir", "", "")
 	flag.String("max-diffs", "", "")
 	flag.String("log-level", "", "")
 	progress := flag.String("progress", "", "")
@@ -103,6 +103,15 @@ func main() {
 	}
 	if _, err := os.Stat(filepath.Join(*dataDir, "db", "state.db", "MARKER")); err != nil {
 		panic(err)
+	}
+	// Resumed from the checkpoint, which the job copied into the work dir.
+	if !*resume {
+		panic("--resume missing")
+	}
+	for _, db := range []string{"gnolang.db", "state.db"} {
+		if _, err := os.Stat(filepath.Join(*workDir, db, "MARKER")); err != nil {
+			panic(err)
+		}
 	}
 	root := os.Getenv("GNOROOT")
 	if root == "" {
@@ -201,8 +210,8 @@ func TestServerEndToEnd(t *testing.T) {
 	}
 	gno, fixes := newRemote("gnolang/gno"), newRemote("gnolang/gno-fixes")
 
-	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
-	broken := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, FirstAppHashMismatch: 12}
+	clean := &Report{ChainID: "gnoland-1", FromHeight: 11, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
+	broken := &Report{ChainID: "gnoland-1", FromHeight: 11, ToHeight: 50, Blocks: 50, Txs: 10, FirstAppHashMismatch: 12}
 	broken.Diffs = []Diff{{
 		Kind: "result", Height: 12, Index: 0, TxHash: "AB12", Msgs: []string{"vm/exec gno.land/r/demo/foo.Bar"},
 		Recorded: &Result{GasUsed: 100}, Replayed: &Result{Error: "vm.VMError: <script>unexpected</script>", GasUsed: 90},
@@ -227,7 +236,7 @@ func TestServerEndToEnd(t *testing.T) {
 	cfg := &Config{
 		DataDir: filepath.Join(root, "data"),
 		// Fake tool, fake chain: nothing but paths.
-		Chain:     ChainConfig{GoldenDir: golden, Genesis: filepath.Join(root, "genesis.json")},
+		Chain:     ChainConfig{GoldenDir: golden, CheckpointDir: writeCheckpoint(t, filepath.Join(root, "checkpoint"), 10)},
 		GitHub:    GitHubConfig{GitURL: "file://" + filepath.Join(root, "remote") + "/"},
 		PublicURL: "https://replay.example",
 		Repos: map[string]RepoConfig{
@@ -305,6 +314,7 @@ func TestServerEndToEnd(t *testing.T) {
 	assert.Equal(t, "gnolang/gno-fixes#branch/develop", fixesJob.Key)
 	assert.Equal(t, outcomePass, masterJob.Outcome)
 	assert.Contains(t, masterJob.Summary, "replays identically")
+	assert.EqualValues(t, 11, masterJob.FromHeight, "recorded from the report, for comparing only replays of the same heights")
 
 	// A PR is opened, then pushed to before its replay starts: the newer
 	// head supersedes the first.
@@ -561,9 +571,9 @@ func TestPullTestMerge(t *testing.T) {
 
 	// The PR branches off before master's fix: its head alone diverges, its
 	// merge into master doesn't.
-	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
+	clean := &Report{ChainID: "gnoland-1", FromHeight: 11, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
 	broken := &Report{
-		ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10,
+		ChainID: "gnoland-1", FromHeight: 11, ToHeight: 50, Blocks: 50, Txs: 10,
 		Diffs: []Diff{{Kind: "result", Height: 3, Index: 0, Recorded: &Result{}, Replayed: &Result{Error: "boom"}}},
 	}
 	fork := commitReport(t, remote, clean, 0)
@@ -582,7 +592,7 @@ func TestPullTestMerge(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(overlay, "main.go"), []byte(fakeTool), 0o644))
 	cfg := &Config{
 		DataDir: filepath.Join(root, "data"),
-		Chain:   ChainConfig{GoldenDir: golden, Genesis: filepath.Join(root, "genesis.json")},
+		Chain:   ChainConfig{GoldenDir: golden, CheckpointDir: writeCheckpoint(t, filepath.Join(root, "checkpoint"), 10)},
 		GitHub:  GitHubConfig{GitURL: "file://" + filepath.Join(root, "remote") + "/"},
 		Job:     JobConfig{GnoreplayOverlay: overlay},
 	}
@@ -644,8 +654,8 @@ func TestPullBaselineIsTheMergeBase(t *testing.T) {
 	git(t, remote, "init", "-q")
 	git(t, remote, "config", "uploadpack.allowAnySHA1InWant", "true")
 
-	clean := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
-	broken := &Report{ChainID: "gnoland-1", FromHeight: 1, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{{
+	clean := &Report{ChainID: "gnoland-1", FromHeight: 11, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{}}
+	broken := &Report{ChainID: "gnoland-1", FromHeight: 11, ToHeight: 50, Blocks: 50, Txs: 10, Diffs: []Diff{{
 		Kind: "result", Height: 3, Index: 0, Recorded: &Result{}, Replayed: &Result{Error: "boom"},
 	}}}
 	m1 := commitReport(t, remote, clean, 0)
@@ -664,7 +674,7 @@ func TestPullBaselineIsTheMergeBase(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(overlay, "main.go"), []byte(fakeTool), 0o644))
 	cfg := &Config{
 		DataDir: filepath.Join(root, "data"),
-		Chain:   ChainConfig{GoldenDir: golden, Genesis: filepath.Join(root, "genesis.json")},
+		Chain:   ChainConfig{GoldenDir: golden, CheckpointDir: writeCheckpoint(t, filepath.Join(root, "checkpoint"), 10)},
 		GitHub:  GitHubConfig{GitURL: "file://" + filepath.Join(root, "remote") + "/"},
 		Job:     JobConfig{GnoreplayOverlay: overlay},
 	}

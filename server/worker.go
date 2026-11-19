@@ -32,6 +32,8 @@ type Server struct {
 	// prov, when set, runs replays on worker machines (see remote.go);
 	// otherwise they run locally in the job sandboxes.
 	prov Provisioner
+	// checkpoint is what every replay resumes from (see checkpoint.go).
+	checkpoint Checkpoint
 
 	// wake is signaled when a job is enqueued.
 	wake chan struct{}
@@ -46,11 +48,15 @@ type Server struct {
 }
 
 func newServer(cfg *Config, q *Queue, gh GitHub, logger *slog.Logger) *Server {
-	return &Server{
+	s := &Server{
 		cfg: cfg, queue: q, gh: gh, logger: logger, oauth: githubOAuth,
 		wake: make(chan struct{}, 1), running: map[int64]context.CancelCauseFunc{}, sessions: map[int64]*session{},
 		machines: map[string]*workerMachine{},
 	}
+	// setup refuses a bad checkpoint before this: without one (tests), the
+	// zero Checkpoint makes progress count from the first block.
+	s.checkpoint, _ = loadCheckpoint(cfg.Chain.CheckpointDir)
+	return s
 }
 
 func (s *Server) reportsDir() string { return filepath.Join(s.cfg.DataDir, "reports") }
@@ -182,6 +188,7 @@ func (s *Server) track(ctx context.Context, j *Job, replay func(context.Context,
 	// replay of the commit a PR was merged into (j.BaseSHA) has finished if it
 	// is ever going to, and this job's own row is still running, so neither it
 	// nor a newer push job (which supersedes it) can be picked.
+	j.FromHeight = max(report.FromHeight, 1) // a report without one replayed from genesis
 	base, err := s.baselineFor(j, time.Now())
 	if err != nil {
 		logger.Error("load baseline", "err", err)
@@ -192,6 +199,7 @@ func (s *Server) track(ctx context.Context, j *Job, replay func(context.Context,
 	}
 	recorded, err := s.queue.Finish(j.ID, Job{
 		State: stateDone, ReportPath: reportPath, Outcome: out.Outcome, Summary: out.Summary, BaseID: baseID(base),
+		FromHeight: j.FromHeight,
 	})
 	if err != nil || !recorded {
 		logger.Info("result discarded", "recorded", recorded, "err", err)
@@ -206,16 +214,17 @@ func (s *Server) track(ctx context.Context, j *Job, replay func(context.Context,
 
 // baselineFor returns the job to classify j against: the replay of the commit
 // j was based on (j.BaseSHA, the test merge's base) when it has one, else the
-// latest completed replay of j's branch before at.
+// latest completed replay of j's branch before at; either way one that
+// covered the heights j did (j.FromHeight).
 func (s *Server) baselineFor(j *Job, at time.Time) (*Job, error) {
 	if j.BaseSHA != "" {
-		if base, err := s.queue.BaselineSHA(j.Repo, j.Branch, j.BaseSHA); err != nil {
+		if base, err := s.queue.BaselineSHA(j.Repo, j.Branch, j.BaseSHA, j.FromHeight); err != nil {
 			return nil, err
 		} else if base != nil {
 			return base, nil
 		}
 	}
-	return s.queue.Baseline(j.Repo, j.Branch, at)
+	return s.queue.Baseline(j.Repo, j.Branch, j.FromHeight, at)
 }
 
 // reclassifyAgainst compares the done PR replays merged into the base commit
@@ -227,7 +236,7 @@ func (s *Server) reclassifyAgainst(baseID int64) {
 		s.logger.Error("load base of replays to reclassify", "base", baseID, "err", err)
 		return
 	}
-	jobs, err := s.queue.DependentsOnBase(base.Repo, base.Branch, base.SHA)
+	jobs, err := s.queue.DependentsOnBase(base.Repo, base.Branch, base.SHA, base.FromHeight)
 	if err != nil {
 		s.logger.Error("list replays to reclassify", "base", base.ID, "err", err)
 		return
@@ -412,11 +421,25 @@ func (s *Server) replayLocal(ctx context.Context, j *Job, jobDir, src, reportFil
 		}
 	}
 
+	// The replay modifies the checkpoint it resumes from: a copy of its own.
+	step("copy checkpoint")
+	workDir := filepath.Join(jobDir, "work")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return err
+	}
+	for _, name := range checkpointDBs {
+		args := substitute(s.cfg.Job.CopyCommand,
+			"{src}", filepath.Join(s.cfg.Chain.CheckpointDir, name),
+			"{dst}", filepath.Join(workDir, name))
+		if err := s.run(ctx, nil, jobDir, nil, logFile, args[0], args[1:]...); err != nil {
+			return fmt.Errorf("copy %s: %w", name, err)
+		}
+	}
+
 	step("replay")
 	runCtx, cancelRun := context.WithTimeout(ctx, s.cfg.Job.RunTimeout.Duration)
 	defer cancelRun()
-	workDir := filepath.Join(jobDir, "work")
-	args := append([]string{bin}, replayToolArgs(dataDir, s.cfg.Chain.Genesis, workDir, reportFile, "", "warn")...)
+	args := append([]string{bin}, replayToolArgs(dataDir, workDir, reportFile, "", "warn")...)
 	err = s.run(runCtx, s.sandbox(s.cfg.Job.RunSandbox, j, src), jobDir, []string{"GNOROOT=" + src}, logFile, args[0], args[1:]...)
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 {
@@ -618,9 +641,10 @@ func (s *Server) sandbox(prefix []string, j *Job, src string) []string {
 // worker script (rendered into it as ReplayArgs), so a flag cannot be added
 // to one runner and not the other. progress is where the tool writes its
 // progress JSON (empty: none), logLevel its log level (empty: its default).
-func replayToolArgs(dataDir, genesis, workDir, out, progress, logLevel string) []string {
+// workDir holds the checkpoint the replay resumes from (see checkpoint.go).
+func replayToolArgs(dataDir, workDir, out, progress, logLevel string) []string {
 	args := []string{
-		"--data-dir", dataDir, "--genesis", genesis, "--work-dir", workDir,
+		"--data-dir", dataDir, "--work-dir", workDir, "--resume",
 		"--max-diffs", "0", "--out", out,
 	}
 	if progress != "" {

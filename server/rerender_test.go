@@ -39,7 +39,7 @@ data_dir = "`+dataDir+`"
 token_file = "`+write("gh-token", "t")+`"
 [chain]
 golden_dir = "`+golden+`"
-genesis = "`+write("genesis.json", "{}")+`"
+checkpoint_dir = "`+writeCheckpoint(t, filepath.Join(root, "checkpoint"), 10)+`"
 [job]
 gnoreplay_overlay = "`+overlay+`"
 `)

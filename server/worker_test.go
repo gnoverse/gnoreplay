@@ -150,7 +150,7 @@ import (
 
 func main() {
 	dataDir := flag.String("data-dir", "", "")
-	flag.String("genesis", "", "")
+	flag.Bool("resume", false, "")
 	flag.String("work-dir", "", "")
 	flag.String("max-diffs", "", "")
 	flag.String("log-level", "", "")
@@ -174,7 +174,7 @@ func main() {
 
 	cfg := &Config{
 		DataDir: filepath.Join(root, "data"),
-		Chain:   ChainConfig{GoldenDir: golden, Genesis: filepath.Join(root, "genesis.json")},
+		Chain:   ChainConfig{GoldenDir: golden, CheckpointDir: writeCheckpoint(t, filepath.Join(root, "checkpoint"), 10)},
 		GitHub:  GitHubConfig{GitURL: "file://" + filepath.Join(root, "remote") + "/"},
 		Job: JobConfig{
 			GnoreplayOverlay: overlay,
@@ -182,7 +182,6 @@ func main() {
 		},
 	}
 	cfg.setDefaults()
-	require.NoError(t, os.WriteFile(cfg.Chain.Genesis, []byte("{}"), 0o644))
 	q := newTestQueue(t)
 	srv := newServer(cfg, q, newFakeGitHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 
@@ -208,11 +207,11 @@ func main() {
 // the other (see worker.sh).
 func TestReplayToolArgs(t *testing.T) {
 	assert.Equal(t,
-		[]string{"--data-dir", "/d", "--genesis", "/g.json", "--work-dir", "/w", "--max-diffs", "0", "--out", "/r.json", "--log-level", "warn"},
-		replayToolArgs("/d", "/g.json", "/w", "/r.json", "", "warn"))
-	worker := replayToolArgs("data", "genesis.json", "work", "report.json", "progress.json", "")
+		[]string{"--data-dir", "/d", "--work-dir", "/w", "--resume", "--max-diffs", "0", "--out", "/r.json", "--log-level", "warn"},
+		replayToolArgs("/d", "/w", "/r.json", "", "warn"))
+	worker := replayToolArgs("data", "work", "report.json", "progress.json", "")
 	assert.Equal(t,
-		[]string{"--data-dir", "data", "--genesis", "genesis.json", "--work-dir", "work", "--max-diffs", "0", "--out", "report.json", "--progress", "progress.json"},
+		[]string{"--data-dir", "data", "--work-dir", "work", "--resume", "--max-diffs", "0", "--out", "report.json", "--progress", "progress.json"},
 		worker)
 
 	var b strings.Builder

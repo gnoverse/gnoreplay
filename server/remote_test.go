@@ -256,8 +256,7 @@ func newRemoteEnv(t *testing.T) *remoteEnv {
 		require.NoError(t, os.MkdirAll(filepath.Join(golden, "db", name), 0o755))
 		require.NoError(t, os.WriteFile(filepath.Join(golden, "db", name, "MARKER"), nil, 0o644))
 	}
-	genesis := filepath.Join(root, "genesis.json")
-	require.NoError(t, os.WriteFile(genesis, []byte(`{"chain_id":"gnoland-1"}`), 0o644))
+	checkpoint := writeCheckpoint(t, filepath.Join(root, "checkpoint"), 10)
 	overlay := filepath.Join(root, "overlay")
 	require.NoError(t, os.MkdirAll(overlay, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(overlay, "go.mod"), []byte("module fake\n\ngo 1.22\n"), 0o644))
@@ -265,7 +264,7 @@ func newRemoteEnv(t *testing.T) *remoteEnv {
 
 	e.cfg = &Config{
 		DataDir: filepath.Join(root, "data"),
-		Chain:   ChainConfig{GoldenDir: golden, Genesis: genesis},
+		Chain:   ChainConfig{GoldenDir: golden, CheckpointDir: checkpoint},
 		GitHub:  GitHubConfig{GitURL: "file://" + filepath.Join(root, "remote") + "/"},
 		Repos:   map[string]RepoConfig{"gnolang/gno": {PublicReports: true}},
 		Job:     JobConfig{GnoreplayOverlay: overlay},
@@ -419,11 +418,13 @@ func TestRemoteReplay(t *testing.T) {
 	}, 30*time.Second, 50*time.Millisecond)
 	got, err := q.Get(slow.ID)
 	require.NoError(t, err)
-	assert.Equal(t, "replaying: block 25 of 50 (50%), about 5s left", result(got))
+	// Counted from the checkpoint (at height 10), not from block 1.
+	assert.Equal(t, "replaying: block 25 of 50 (37%), about 5s left", result(got))
+	assert.EqualValues(t, 10, got.Progress.Start)
 	assert.WithinDuration(t, time.Now(), got.Progress.At, time.Minute)
 	rec := httptest.NewRecorder()
 	srv.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/queue", nil))
-	assert.Contains(t, rec.Body.String(), `"progress":{"height":25,"tip":50,"blocks_per_second":5,`)
+	assert.Contains(t, rec.Body.String(), `"progress":{"height":25,"start_height":10,"tip":50,"blocks_per_second":5,`)
 
 	// The reaper spares a busy machine at the end of its billing hour, and
 	// takes one it doesn't know for an idle one...

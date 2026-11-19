@@ -158,8 +158,11 @@ func progress(p *Progress) string {
 		return ""
 	case p.Height == 0:
 		return ": genesis done"
+	case p.Height <= p.Start:
+		return ": checkpoint loaded"
 	}
-	s := fmt.Sprintf(": block %d of %d (%d%%)", p.Height, p.Tip, p.Height*100/p.Tip)
+	// Of the blocks after the checkpoint, if it has one: p.Tip > p.Start here.
+	s := fmt.Sprintf(": block %d of %d (%d%%)", p.Height, p.Tip, (p.Height-p.Start)*100/(p.Tip-p.Start))
 	if p.BlocksPerSecond > 0 && p.Height < p.Tip {
 		// At the pace so far, which history's busier stretches vary.
 		s += ", about " + formatDuration(time.Duration(float64(p.Tip-p.Height)/p.BlocksPerSecond*float64(time.Second))) + " left"

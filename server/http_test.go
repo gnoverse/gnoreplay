@@ -95,3 +95,18 @@ func TestRecentFilteredByVisibleRepos(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "the public result", "the public result is in the newest 50 rows of the repos the request may see")
 	assert.NotContains(t, rec.Body.String(), "a private result")
 }
+
+// A replay resumed from a checkpoint counts its progress from it, not from
+// block 1: it is at 99.7% of the whole chain before its first block.
+func TestProgressFromCheckpoint(t *testing.T) {
+	assert.Equal(t, ": checkpoint loaded", progress(&Progress{Height: 1651500, Start: 1651500, Tip: 1657321}))
+	assert.Equal(t, ": block 1654411 of 1657321 (50%), about 29s left",
+		progress(&Progress{Height: 1654411, Start: 1651500, Tip: 1657321, BlocksPerSecond: 100}))
+	assert.Equal(t, ": block 1657321 of 1657321 (100%)",
+		progress(&Progress{Height: 1657321, Start: 1651500, Tip: 1657321, BlocksPerSecond: 100}))
+	// The tool's progress at a source that ends at the checkpoint.
+	assert.Equal(t, ": checkpoint loaded", progress(&Progress{Height: 1651500, Start: 1651500, Tip: 1651500}))
+	// From genesis, as before.
+	assert.Equal(t, ": genesis done", progress(&Progress{Height: 0, Tip: 50}))
+	assert.Equal(t, ": block 25 of 50 (50%), about 5s left", progress(&Progress{Height: 25, Tip: 50, BlocksPerSecond: 5}))
+}

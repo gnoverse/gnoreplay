@@ -29,7 +29,10 @@ client_secret_file = "/etc/gnoreplay/github-oauth-secret"
 # Copy of a mainnet node's data dir, refreshed by scripts/fetch-golden.sh
 # (or refresh-golden.sh). Jobs copy db/blockstore.db and db/state.db.
 golden_dir = "/var/lib/gnoreplay/golden"
-genesis = "/var/lib/gnoreplay/genesis.json"
+# The state every replay resumes from, at the chain's last hardfork height:
+# checkpoint.json, gnolang.db and state.db (see scripts/make-checkpoint.sh).
+# Jobs copy the two DBs, and replay the golden copy's blocks after its height.
+checkpoint_dir = "/var/lib/gnoreplay/checkpoint"
 
 [job]
 # The gnoreplay/ directory of this repo: copied into each checkout at
@@ -50,9 +53,10 @@ build_sandbox = ["msb", "run", "-q", "-n", "gnoreplay-build-{job}", "--replace",
   "--mount-dir", "{data}/gocache:{data}/gocache:uid=1000,gid=1000",
   "-e", "HOME=/tmp", "-e", "GOMODCACHE={data}/gomod", "-e", "GOCACHE={data}/gocache",
   "golang:1.26", "--"]
-# The replay needs no network. Measured on mainnet: the first commit (all
-# 3.26M genesis accounts) peaks above 8G with Go's default GC; GOMEMLIMIT=7GiB
-# in a 9G VM completes. Budget 9G per worker.
+# The replay needs no network. Measured on mainnet when replays started from
+# genesis: the first commit (all 3.26M genesis accounts) peaked above 8G with
+# Go's default GC, and GOMEMLIMIT=7GiB in a 9G VM completed. Replays resumed
+# from a checkpoint have no such commit; this budget was not measured for them.
 run_sandbox = ["msb", "run", "-q", "-n", "gnoreplay-run-{job}", "--replace",
   "-m", "9G", "-c", "4", "-u", "1000:1000", "--no-net",
   "--mount-dir", "{jobdir}:{jobdir}:uid=1000,gid=1000",

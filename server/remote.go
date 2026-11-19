@@ -139,7 +139,7 @@ func (s *Server) replayRemote(ctx context.Context, j *Job, dir string, log io.Wr
 		"GoVersion": h.GoVersion, "GoMemLimit": h.GoMemLimit,
 		"PowerOffMinutes": strconv.Itoa(powerOff),
 		"ProgressSeconds": strconv.FormatFloat(workerProgressInterval.Seconds(), 'f', -1, 64),
-		"ReplayArgs":      shellJoin(replayToolArgs("data", "genesis.json", "work", "report.json", "progress.json", "")),
+		"ReplayArgs":      shellJoin(replayToolArgs("data", "work", "report.json", "progress.json", "")),
 	}); err != nil {
 		return err
 	}
@@ -603,8 +603,13 @@ func (s *Server) workerRoutes() http.Handler {
 			"db/state.db":      filepath.Join(golden, "db", "state.db"),
 		})
 	}))
-	mux.HandleFunc("GET /worker/{id}/genesis", s.withSession(func(w http.ResponseWriter, r *http.Request, _ *session, _ int64) {
-		http.ServeFile(w, r, s.cfg.Chain.Genesis)
+	// The checkpoint the replay resumes from, as the tool's work dir.
+	mux.HandleFunc("GET /worker/{id}/checkpoint", s.withSession(func(w http.ResponseWriter, _ *http.Request, _ *session, _ int64) {
+		files := map[string]string{}
+		for _, name := range checkpointDBs {
+			files[name] = filepath.Join(s.cfg.Chain.CheckpointDir, name)
+		}
+		writeTar(w, files)
 	}))
 	// Results are saved in the job dir before they are acknowledged, so a
 	// restart in between loses nothing.
@@ -622,7 +627,9 @@ func (s *Server) workerRoutes() http.Handler {
 			http.Error(w, "invalid progress", http.StatusBadRequest)
 			return
 		}
-		p.At = time.Now()
+		// The worker's replay resumes from the checkpoint, which the tool's
+		// progress does not say: counting from it, not from block 1.
+		p.Start, p.At = s.checkpoint.Height, time.Now()
 		if err := s.queue.SetProgress(id, p); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

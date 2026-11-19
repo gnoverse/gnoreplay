@@ -58,6 +58,12 @@ func setup(configPath string, logger *slog.Logger) (*Server, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	// Every job resumes from it: better to fail now than in each of them.
+	checkpoint, err := loadCheckpoint(cfg.Chain.CheckpointDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	logger.Info("checkpoint", "chain", checkpoint.ChainID, "height", checkpoint.Height, "app_hash", checkpoint.AppHash)
 	token, err := os.ReadFile(cfg.GitHub.TokenFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read token: %w", err)
@@ -236,7 +242,7 @@ func (s *Server) rerenderBase(j *Job) (*Job, error) {
 	// A PR's merge base, when its replay has finished since: the job was
 	// classified against an older baseline only because it had not.
 	if j.BaseSHA != "" {
-		if b, err := s.queue.BaselineSHA(j.Repo, j.Branch, j.BaseSHA); err != nil {
+		if b, err := s.queue.BaselineSHA(j.Repo, j.Branch, j.BaseSHA, j.FromHeight); err != nil {
 			return nil, err
 		} else if b != nil {
 			return b, nil
@@ -252,7 +258,7 @@ func (s *Server) rerenderBase(j *Job) (*Job, error) {
 	if j.BaseSHA == "" && !j.StartedAt.IsZero() {
 		at = j.StartedAt
 	}
-	return s.queue.Baseline(j.Repo, j.Branch, at)
+	return s.queue.Baseline(j.Repo, j.Branch, j.FromHeight, at)
 }
 
 // enqueueOne queues a replay of a PR's or a branch's current head. A running

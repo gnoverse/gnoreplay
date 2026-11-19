@@ -28,7 +28,7 @@ data_dir = "/d"
 token_file = "/t"
 [chain]
 golden_dir = "/g"
-genesis = "/g.json"
+checkpoint_dir = "/c"
 [job]
 gnoreplay_overlay = "/o"
 [hetzners]

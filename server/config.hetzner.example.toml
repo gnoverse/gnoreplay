@@ -22,7 +22,9 @@ client_secret_file = "/etc/gnoreplay/github-oauth-secret"
 
 [chain]
 golden_dir = "/var/lib/gnoreplay/golden"
-genesis = "/var/lib/gnoreplay/genesis.json"
+# The state every replay resumes from, at the chain's last hardfork height:
+# checkpoint.json, gnolang.db and state.db (see scripts/make-checkpoint.sh).
+checkpoint_dir = "/var/lib/gnoreplay/checkpoint"
 
 [job]
 gnoreplay_overlay = "/opt/gnoreplay/gnoreplay"
@@ -33,9 +35,10 @@ run_timeout = "3h30m"
 # An API token (read & write) of the project the workers are created in.
 token_file = "/etc/gnoreplay/hetzner-token"
 location = "hel1"
-# 2 dedicated vCPUs and 8 GB: a full replay takes about an hour (~$0.08), as
-# on 8 shared vCPUs (cpx42) at 62% of the price. With 8 GB, go_mem_limit must
-# be 6GiB (the genesis commit peaks above 8 GB without a limit).
+# 2 dedicated vCPUs and 8 GB: a replay from genesis took about an hour (~$0.08),
+# as on 8 shared vCPUs (cpx42) at 62% of the price. go_mem_limit is 6GiB with
+# 8 GB: the genesis commit peaked above 8 GB without a limit. Replays resumed
+# from a checkpoint have no such commit; this was not measured for them.
 server_type = "ccx13"
 image = "ubuntu-24.04"
 # The ID of the private network the coordinator and workers share, used by
